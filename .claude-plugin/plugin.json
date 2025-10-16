@@ -1,0 +1,60 @@
+{
+  "name": "chris-claude-toolkit",
+  "version": "1.0.0",
+  "description": "Chris's comprehensive Claude Code toolkit with custom agents and workflow commands",
+  "author": {
+    "name": "Chris",
+    "url": "https://github.com/chughes-feedbackloopai"
+  },
+  "repository": "https://github.com/chughes-feedbackloopai/optivai-claude-plugin",
+  "keywords": [
+    "agents",
+    "commands",
+    "workflow",
+    "development",
+    "code-quality",
+    "devops",
+    "testing"
+  ],
+  "components": {
+    "agents": {
+      "path": "agents",
+      "description": "9 specialized agents for various development tasks"
+    },
+    "commands": {
+      "path": "commands",
+      "description": "19 workflow automation commands"
+    }
+  },
+  "agents": [
+    "code-quality-reviewer",
+    "devops-deployment-specialist",
+    "docs-scraper",
+    "implementation-developer",
+    "prompt-engineer-optimizer",
+    "solution-architect-planner",
+    "technical-writer",
+    "test-engineer-qa",
+    "ui-ux-frontend-engineer"
+  ],
+  "commands": [
+    "act",
+    "add-to-changelog",
+    "background",
+    "commit",
+    "config-logs",
+    "context-check",
+    "create-jtbd",
+    "create-pr",
+    "create-prd",
+    "create-prp",
+    "export-context",
+    "history",
+    "load-context",
+    "new-session",
+    "prime-agent",
+    "quick-context",
+    "search-context",
+    "summary"
+  ]
+}
