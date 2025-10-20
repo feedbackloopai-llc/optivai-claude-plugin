@@ -4,9 +4,9 @@
   "description": "Chris's comprehensive Claude Code toolkit with custom agents and workflow commands",
   "author": {
     "name": "Chris",
-    "url": "https://github.com/chughes-feedbackloopai"
+    "url": "https://github.com/feedbackloopai-llc"
   },
-  "repository": "https://github.com/chughes-feedbackloopai/optivai-claude-plugin",
+  "repository": "https://github.com/feedbackloopai-llc/optivai-claude-plugin",
   "keywords": [
     "agents",
     "commands",

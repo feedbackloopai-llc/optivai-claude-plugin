@@ -54,7 +54,7 @@ If this plugin is in a marketplace you've added:
 ### Option 2: Direct from GitHub
 
 ```bash
-/plugin install github:chughes-feedbackloopai/optivai-claude-plugin
+/plugin install github:feedbackloopai-llc/optivai-claude-plugin
 ```
 
 ### Option 3: Local Development
