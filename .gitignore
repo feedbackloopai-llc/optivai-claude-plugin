@@ -10,8 +10,8 @@ desktop.ini
 *.swo
 *~
 
-# Local test files
-test-*
+# Local test files (but not test scripts in scripts/)
+/test-*
 tmp/
 temp/
 
