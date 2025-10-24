@@ -23,3 +23,8 @@ logs/
 .env
 .env.local
 ClaudeCode_Login.sh
+
+# FBLAI sync
+.optivai-github-token
+.fblai-manifest-cache.json
+instructions/

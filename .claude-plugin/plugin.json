@@ -1,7 +1,7 @@
 {
   "name": "chris-claude-toolkit",
-  "version": "1.0.0",
-  "description": "Chris's comprehensive Claude Code toolkit with custom agents and workflow commands",
+  "version": "1.1.0",
+  "description": "Comprehensive AI agent toolkit with 40 specialized agents, 23+ workflow commands, and enterprise business artifact generation",
   "author": {
     "name": "Chris",
     "url": "https://github.com/feedbackloopai-llc"
@@ -14,32 +14,74 @@
     "development",
     "code-quality",
     "devops",
-    "testing"
+    "testing",
+    "data-quality",
+    "business-analysis",
+    "compliance",
+    "strategic-planning",
+    "gensi",
+    "fblai",
+    "enterprise",
+    "architecture",
+    "documentation"
   ],
   "components": {
     "agents": {
       "path": "agents",
-      "description": "9 specialized agents for various development tasks"
+      "description": "40 specialized agents for various development tasks"
     },
     "commands": {
       "path": "commands",
-      "description": "19 workflow automation commands"
+      "description": "23 workflow automation commands"
     }
   },
   "agents": [
+    "business-analyst",
+    "change-management-specialist",
     "code-quality-reviewer",
+    "compliance-officer",
+    "data-architect",
+    "data-engineer",
+    "data-governance-lead",
+    "data-quality-analyst",
+    "data-quality-manager",
+    "data-scientist",
+    "data-steward",
+    "database-administrator",
     "devops-deployment-specialist",
     "docs-scraper",
+    "financial-analyst",
+    "gensi-phase0-executor",
+    "gensi-phase1-initiative-executor",
+    "gensi-phase1-initiative-planner",
+    "gensi-phase2-initiative-worker",
+    "gensi-phase3-initiative-worker",
+    "gensi-phase4-initiative-worker",
+    "gensi-phase5-initiative-worker",
+    "gensi-phase6-initiative-worker",
+    "immigration-law-sme",
     "implementation-developer",
+    "machine-learning-engineer",
+    "market-analysis-mgr",
+    "product-manager",
+    "product-owner",
+    "program-manager",
     "prompt-engineer-optimizer",
+    "senior-engineer",
+    "solution-architect",
     "solution-architect-planner",
+    "strategic-planning-manager",
+    "subject-matter-expert",
     "technical-writer",
-    "test-engineer-qa",
-    "ui-ux-frontend-engineer"
+    "ui-ux-frontend-engineer",
+    "user-research-expert",
+    "ux-ui-design-manager"
   ],
   "commands": [
+    "Testing Configuration",
     "act",
     "add-to-changelog",
+    "ai-role",
     "background",
     "commit",
     "config-logs",
@@ -49,12 +91,15 @@
     "create-prd",
     "create-prp",
     "export-context",
+    "gensi",
+    "gensi-nbc-full",
     "history",
     "load-context",
     "new-session",
     "prime-agent",
     "quick-context",
     "search-context",
-    "summary"
+    "summary",
+    "sync-fblai"
   ]
 }
