@@ -29,7 +29,7 @@
     "min_operation_interval": 1,
     "deduplicate_similar": true
   },
-  "log_directory": ".claude/logs",
+  "log_directory": "logs",
   "log_format": "json",
   "max_prompt_length": 500,
   "session_tracking": true
