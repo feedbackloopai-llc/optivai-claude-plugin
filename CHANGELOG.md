@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-12-09
+
+### Added
+
+#### Automatic Activity Logging System
+- **Hook-based logging infrastructure** - Comprehensive automatic activity tracking for Claude Code
+- **PreToolUse hook** (`pre-tool-use.py`) - Captures all tool operations (Read, Write, Edit, Bash, Task, Grep, Glob, WebFetch, WebSearch, TodoWrite, SlashCommand)
+- **UserPromptSubmit hook** (`user-prompt-submit.py`) - Captures user prompts for operation context
+- **Core logging engine** (`log-writer.py`) - JSON Lines format with session tracking and daily rotation
+- **Configuration system** (`auto-logger-config.json`) - Flexible control over logging behavior
+- **Comprehensive documentation** (`.claude/hooks/README.md`) - 500+ line user guide
+
+#### Logging Management Commands (6 new commands)
+- `/install-logging-hooks` - One-command installation of logging system in any project
+- `/enable-logging` - Enable automatic activity logging
+- `/disable-logging` - Disable logging while preserving all existing logs
+- `/view-logs [N]` - View recent activity logs with filtering options (default 20 entries)
+- `/logging-config [--set KEY VALUE]` - View and update logging configuration
+- `/export-logs [format]` - Export logs in JSON, CSV, or Markdown formats
+
+#### Features
+- **Automatic capture** - All Claude Code operations logged transparently (< 5ms overhead)
+- **Session tracking** - Unique session IDs link all operations in a session
+- **Daily log rotation** - Organized by date in `.claude/logs/agent-activity-YYYY-MM-DD.log`
+- **Smart filtering** - Configurable ignore patterns for sensitive files
+- **Multiple export formats** - JSON (analysis), CSV (spreadsheet), Markdown (reports)
+- **Privacy-first** - All data stays local, no external network requests
+- **Zero setup** - Install once per project, runs automatically
+
+#### Documentation
+- `HOOK-LOGGING-IMPLEMENTATION.md` - Complete implementation summary
+- Updated `README.md` - Added Automatic Activity Logging section with quick start
+- `.claude/hooks/README.md` - Comprehensive technical documentation and user guide
+
+### Changed
+
+- **Plugin version** - Updated from 1.1.0 to 1.2.0
+- **Plugin manifest** - Auto-updated to include 6 new logging commands (23 → 29 total)
+- **README.md** - Added comprehensive logging documentation section
+
+### Technical Details
+
+- **New files**: 12 (6 hook scripts/configs + 6 command files + documentation)
+- **New lines of code**: ~2,500
+- **Commands**: 23 → 29 (+26% increase)
+- **Agents**: 40 (unchanged)
+
+### Architecture
+
+The logging system uses Claude Code's native hook system:
+- Hooks configured in `.claude/settings.local.json`
+- Hook scripts in `.claude/hooks/` (project-specific)
+- Logs written to `.claude/logs/` (daily rotation)
+- JSON Lines format for easy parsing and analysis
+
+### Use Cases
+
+- **Debugging**: Trace exact operations when troubleshooting
+- **Auditing**: Maintain records of all Claude Code activities
+- **Learning**: Understand usage patterns and workflows
+- **Analytics**: Analyze tool usage, session duration, and patterns
+- **Documentation**: Export session logs as documentation
+
 ## [1.1.0] - 2025-10-24
 
 ### Added

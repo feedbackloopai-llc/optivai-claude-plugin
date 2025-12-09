@@ -1,0 +1,36 @@
+{
+  "enabled": true,
+  "log_file_operations": true,
+  "log_command_executions": true,
+  "log_agent_responses": true,
+  "log_user_prompts": true,
+  "log_tool_operations": true,
+  "watch_directories": [".", "src", "lib", "tests", "docs"],
+  "ignore_patterns": [
+    "*.log",
+    "*.tmp",
+    "*.cache",
+    "*.pyc",
+    ".git/*",
+    "node_modules/*",
+    "__pycache__/*",
+    ".claude/logs/*",
+    "*.swp",
+    "*.swo",
+    ".DS_Store",
+    "*.jsonl"
+  ],
+  "context_bundle_auto_refresh": false,
+  "log_level": "info",
+  "batch_log_interval": 5,
+  "smart_filtering": {
+    "enabled": true,
+    "ignore_rapid_changes": true,
+    "min_operation_interval": 1,
+    "deduplicate_similar": true
+  },
+  "log_directory": ".claude/logs",
+  "log_format": "json",
+  "max_prompt_length": 500,
+  "session_tracking": true
+}

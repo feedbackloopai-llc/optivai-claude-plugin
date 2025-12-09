@@ -1,7 +1,7 @@
 {
   "name": "chris-claude-toolkit",
-  "version": "1.1.0",
-  "description": "Comprehensive AI agent toolkit with 40 specialized agents, 23+ workflow commands, and enterprise business artifact generation",
+  "version": "1.2.0",
+  "description": "Comprehensive AI agent toolkit with 40 specialized agents, 29+ workflow commands, and enterprise business artifact generation",
   "author": {
     "name": "Chris",
     "url": "https://github.com/feedbackloopai-llc"
@@ -32,7 +32,7 @@
     },
     "commands": {
       "path": "commands",
-      "description": "23 workflow automation commands"
+      "description": "29 workflow automation commands"
     }
   },
   "agents": [
@@ -90,16 +90,22 @@
     "create-pr",
     "create-prd",
     "create-prp",
+    "disable-logging",
+    "enable-logging",
     "export-context",
+    "export-logs",
     "gensi",
     "gensi-nbc-full",
     "history",
+    "install-logging-hooks",
     "load-context",
+    "logging-config",
     "new-session",
     "prime-agent",
     "quick-context",
     "search-context",
     "summary",
-    "sync-fblai"
+    "sync-fblai",
+    "view-logs"
   ]
 }

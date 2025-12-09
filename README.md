@@ -59,7 +59,7 @@ A comprehensive enterprise-grade AI agent toolkit integrating OptivAI developmen
 - **gensi-phase5-initiative-worker** - Program planning and resource allocation
 - **gensi-phase6-initiative-worker** - Execution planning and implementation roadmaps
 
-### ⚡ Commands (23)
+### ⚡ Commands (29)
 
 #### Development Workflow Commands (19)
 - **act** - GitHub Actions workflow runner
@@ -82,11 +82,109 @@ A comprehensive enterprise-grade AI agent toolkit integrating OptivAI developmen
 - **summary** - Generate conversation summary
 - **Testing Configuration** - Reference for testing configuration
 
+#### Automatic Activity Logging Commands (6)
+- **install-logging-hooks** - Install automatic activity logging hooks in current project
+- **enable-logging** - Enable automatic Claude Code activity logging
+- **disable-logging** - Disable logging (preserves all logs)
+- **view-logs** - View recent activity logs with filtering
+- **logging-config** - Configure logging settings
+- **export-logs** - Export logs to JSON, CSV, or Markdown formats
+
 #### FBLAI Business & Strategy Commands (4)
 - **ai-role** - Activate specialized AI expert roles from registry
 - **gensi** - GenSI strategic planning with Autonomous Agentic Pipeline (AAP)
 - **gensi-nbc-full** - Legacy GenSI full execution workflow
 - **sync-fblai** - Sync business artifacts and standards from FBLAI repository
+
+## 🔍 Automatic Activity Logging
+
+**New in v1.2.0**: Hook-based automatic activity logging system for comprehensive activity tracking.
+
+### What It Does
+
+The automatic activity logging system uses Claude Code hooks to capture:
+
+- ✅ **All tool operations**: Read, Write, Edit, Bash, Task, Grep, Glob, WebFetch, etc.
+- ✅ **User prompts**: Your inputs for context
+- ✅ **Session tracking**: Links all operations together
+- ✅ **Daily rotation**: Organized by date in JSON Lines format
+- ✅ **Zero overhead**: < 5ms per operation
+
+### Quick Start
+
+```bash
+# Install hooks in your project
+/install-logging-hooks
+
+# Enable logging
+/enable-logging
+
+# Work normally - everything is automatically logged
+# ... use Claude Code ...
+
+# View what happened
+/view-logs
+
+# Export for analysis
+/export-logs markdown
+```
+
+### Features
+
+**Automatic Capture**
+- No manual logging calls needed
+- Hooks capture operations transparently
+- Context preservation across operations
+- Session-based organization
+
+**Flexible Export**
+- JSON: Machine-readable, programmatic analysis
+- CSV: Spreadsheet analysis, data science
+- Markdown: Human-readable reports with statistics
+
+**Smart Configuration**
+- Enable/disable specific log types
+- Ignore patterns for sensitive files
+- Adjust verbosity and truncation
+- Session tracking on/off
+
+**Zero Setup After Installation**
+- Install once per project
+- Runs automatically
+- Minimal performance impact
+- All data stays local
+
+### Example Log Entry
+
+```json
+{
+  "timestamp": "2025-12-09T20:15:30.123Z",
+  "operation": "read",
+  "prompt": "read: src/app.ts",
+  "session_id": "session-20251209-201530-a1b2c3d4",
+  "time": "20:15:30"
+}
+```
+
+### Use Cases
+
+- **Debugging**: Trace exactly what happened when something went wrong
+- **Auditing**: Maintain records of all Claude Code activities
+- **Learning**: Understand patterns in how you use Claude Code
+- **Analytics**: Analyze tool usage, session duration, patterns
+- **Documentation**: Export session logs as documentation
+
+### Architecture
+
+The logging system consists of:
+
+- **Hooks**: `PreToolUse` and `UserPromptSubmit` hooks in `.claude/settings.local.json`
+- **Scripts**: Python hook handlers in `.claude/hooks/`
+- **Logger**: Core logging engine (`log-writer.py`)
+- **Config**: Behavior configuration (`auto-logger-config.json`)
+- **Logs**: Daily log files in `.claude/logs/`
+
+For complete documentation, see [.claude/hooks/README.md](.claude/hooks/README.md)
 
 ## FBLAI Integration
 
