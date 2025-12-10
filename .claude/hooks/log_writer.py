@@ -145,7 +145,10 @@ class AgentActivityLogger:
         if not self.config.get("enabled", True):
             return
 
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        import time as time_module
+        now = datetime.utcnow()
+        now_local = datetime.now()
+
         log_file = self._get_log_file()
 
         # Truncate long prompts
@@ -156,11 +159,19 @@ class AgentActivityLogger:
 
         # Create clean log entry with core fields
         log_entry = {
-            "timestamp": timestamp,
+            # Precomputed time fields for easy querying (v1.3.1)
+            "epoch": int(time_module.time()),
+            "date": now_local.strftime('%Y-%m-%d'),
+            "year": now_local.year,
+            "month": now_local.month,
+            "day": now_local.day,
+            "hour": now_local.hour,
+            # Original fields
+            "timestamp": now.isoformat() + "Z",
+            "time": activity_data.get("timestamp", now_local.strftime('%H:%M:%S')),
             "operation": activity_data.get("operation", "unknown"),
             "prompt": prompt,
-            "session_id": activity_data.get("session_id", self.session_id),
-            "time": activity_data.get("timestamp", datetime.now().strftime('%H:%M:%S'))
+            "session_id": activity_data.get("session_id", self.session_id)
         }
 
         # Add project context fields (v1.3.0)
