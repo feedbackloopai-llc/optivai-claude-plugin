@@ -1,0 +1,8 @@
+# Requirements for Snowflake sync service
+# Install with: pip install -r requirements-snowflake.txt
+
+# Snowflake connector
+snowflake-connector-python>=3.6.0
+
+# Cryptography for key-pair authentication
+cryptography>=41.0.0

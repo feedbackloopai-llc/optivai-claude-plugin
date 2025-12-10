@@ -32,9 +32,15 @@ class AgentActivityLogger:
         # Load configuration
         self.config = self._load_config(config_path)
 
-        # Setup log directory
+        # Setup log directory from destinations.local.path
         if log_dir is None:
-            log_dir = self.base_dir / self.config.get("log_directory", "logs")
+            local_config = self.config.get("destinations", {}).get("local", {})
+            log_path = local_config.get("path", "logs")
+            # Support absolute or relative paths
+            if Path(log_path).is_absolute():
+                log_dir = Path(log_path)
+            else:
+                log_dir = self.base_dir / log_path
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -50,17 +56,35 @@ class AgentActivityLogger:
         default_config = {
             "enabled": True,
             "log_level": "info",
-            "log_format": "json",
             "max_prompt_length": 500,
             "session_tracking": True,
-            "log_directory": "logs"
+            "destinations": {
+                "local": {
+                    "enabled": True,
+                    "path": "logs"
+                },
+                "snowflake": {
+                    "enabled": False
+                }
+            }
         }
 
         if Path(config_path).exists():
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     user_config = json.load(f)
+                    # Deep merge for destinations
+                    if "destinations" in user_config:
+                        for dest, dest_config in user_config["destinations"].items():
+                            if dest in default_config["destinations"]:
+                                default_config["destinations"][dest].update(dest_config)
+                            else:
+                                default_config["destinations"][dest] = dest_config
+                        del user_config["destinations"]
                     default_config.update(user_config)
+                    # Backward compatibility: if old log_directory exists, use it
+                    if "log_directory" in user_config:
+                        default_config["destinations"]["local"]["path"] = user_config["log_directory"]
             except Exception as e:
                 self._log_error(f"Failed to load config: {e}")
 
