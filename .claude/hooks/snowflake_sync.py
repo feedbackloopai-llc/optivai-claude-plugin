@@ -83,6 +83,12 @@ class LogTailer:
         log_file = self.logs_dir / f"agent-activity-{date}.log"
         return log_file if log_file.exists() else None
 
+    def _normalize_path(self, path) -> str:
+        """Normalize path for consistent comparison across platforms"""
+        if path is None:
+            return ""
+        return str(Path(path).resolve())
+
     def read_new_entries(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Read new entries since last sync"""
         entries = []
@@ -91,8 +97,11 @@ class LogTailer:
         if not log_file:
             return entries
 
-        # Determine starting position
-        if str(log_file) == self.state.last_file:
+        # Determine starting position (normalize paths for cross-platform comparison)
+        current_path = self._normalize_path(log_file)
+        state_path = self._normalize_path(self.state.last_file) if self.state.last_file else ""
+
+        if current_path == state_path:
             start_pos = self.state.last_position
         else:
             # New file (day rolled over) - start from beginning
@@ -103,8 +112,10 @@ class LogTailer:
             with open(log_file, 'r', encoding='utf-8') as f:
                 f.seek(start_pos)
 
-                for line in f:
-                    if len(entries) >= limit:
+                # Use readline() instead of iteration to allow tell() to work
+                while len(entries) < limit:
+                    line = f.readline()
+                    if not line:  # EOF
                         break
 
                     line = line.strip()
@@ -129,7 +140,7 @@ class LogTailer:
     def get_position(self) -> tuple:
         """Get current file and position for state update"""
         return (
-            str(self._current_file) if self._current_file else "",
+            self._normalize_path(self._current_file) if self._current_file else "",
             self._current_position
         )
 
