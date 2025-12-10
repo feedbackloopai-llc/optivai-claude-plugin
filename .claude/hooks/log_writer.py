@@ -74,21 +74,32 @@ class AgentActivityLogger:
         return f"session-{timestamp}-{short_uuid}"
 
     def _write_session_metadata(self):
-        """Write session metadata file"""
+        """Append session metadata to single sessions.jsonl file"""
         if not self.config.get("session_tracking", True):
             return
 
-        metadata_file = self.log_dir / f"{self.session_id}.metadata.json"
+        sessions_file = self.log_dir / "sessions.jsonl"
+
+        # Check if this session already logged (avoid duplicates)
+        if sessions_file.exists():
+            try:
+                with open(sessions_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if self.session_id in line:
+                            return  # Already logged
+            except:
+                pass
+
         metadata = {
             "session_id": self.session_id,
             "start_time": datetime.utcnow().isoformat() + "Z",
             "cwd": str(Path.cwd()),
-            "log_dir": str(self.log_dir)
+            "project": Path.cwd().name
         }
 
         try:
-            with open(metadata_file, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2)
+            with open(sessions_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(metadata) + "\n")
         except Exception as e:
             self._log_error(f"Failed to write session metadata: {e}")
 
