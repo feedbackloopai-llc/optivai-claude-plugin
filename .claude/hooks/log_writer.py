@@ -140,7 +140,7 @@ class AgentActivityLogger:
         Args:
             activity_data: Dictionary containing activity information
                 Required keys: operation, prompt
-                Optional keys: result, context, timestamp, session_id
+                Optional keys: result, context, timestamp, session_id, cwd, project, details
         """
         if not self.config.get("enabled", True):
             return
@@ -154,7 +154,7 @@ class AgentActivityLogger:
         if len(prompt) > max_length:
             prompt = prompt[:max_length] + "..."
 
-        # Create clean log entry
+        # Create clean log entry with core fields
         log_entry = {
             "timestamp": timestamp,
             "operation": activity_data.get("operation", "unknown"),
@@ -163,10 +163,21 @@ class AgentActivityLogger:
             "time": activity_data.get("timestamp", datetime.now().strftime('%H:%M:%S'))
         }
 
-        # Add optional fields if present
+        # Add project context fields (v1.3.0)
+        if "cwd" in activity_data:
+            log_entry["cwd"] = activity_data["cwd"]
+        if "project" in activity_data:
+            log_entry["project"] = activity_data["project"]
+
+        # Add details object with tool-specific metadata (v1.3.0)
+        if "details" in activity_data and activity_data["details"]:
+            log_entry["details"] = activity_data["details"]
+
+        # Legacy: Add result if present
         if "result" in activity_data and activity_data["result"]:
             log_entry["result"] = str(activity_data["result"])[:200]
 
+        # Legacy: Add context if present (for backwards compatibility)
         if "context" in activity_data:
             log_entry["context"] = activity_data["context"]
 

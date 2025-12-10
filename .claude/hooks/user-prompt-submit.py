@@ -2,6 +2,8 @@
 """
 UserPromptSubmit hook for Claude Code - captures user prompts for context
 Logs user inputs to provide context for subsequent tool operations
+
+v1.3.0 - Enhanced metadata for agent context priming
 """
 
 import sys
@@ -9,10 +11,31 @@ import os
 import time
 import json
 from pathlib import Path
+from datetime import datetime
 
 # Add hooks directory to path
 hooks_dir = Path(__file__).parent
 sys.path.insert(0, str(hooks_dir))
+
+# Session ID management - persist across hook invocations
+SESSION_ENV_VAR = 'CLAUDE_CODE_SESSION_ID'
+
+def get_or_create_session_id():
+    """Get existing session ID or create a new one"""
+    session_id = os.environ.get(SESSION_ENV_VAR)
+    if not session_id:
+        from uuid import uuid4
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        short_uuid = str(uuid4())[:8]
+        session_id = f"session-{timestamp}-{short_uuid}"
+        os.environ[SESSION_ENV_VAR] = session_id
+    return session_id
+
+def get_project_context():
+    """Get current working directory and project name"""
+    cwd = str(Path.cwd())
+    project = Path.cwd().name
+    return cwd, project
 
 try:
     # Import log writer
@@ -28,6 +51,12 @@ try:
                     return  # Logging disabled
                 if not config.get("log_user_prompts", True):
                     return  # User prompt logging disabled
+
+        # Get consistent session ID (creates new one if first interaction)
+        session_id = get_or_create_session_id()
+
+        # Get project context
+        cwd, project = get_project_context()
 
         # Get user prompt from stdin (Claude Code passes it as JSON)
         user_prompt = "Empty prompt"
@@ -54,6 +83,9 @@ try:
         if user_prompt == "Empty prompt" and len(sys.argv) > 1:
             user_prompt = " ".join(sys.argv[1:])
 
+        # Store original length before truncation
+        original_length = len(user_prompt)
+
         # Truncate very long prompts
         max_length = 500
         if len(user_prompt) > max_length:
@@ -61,15 +93,18 @@ try:
 
         timestamp = time.strftime('%H:%M:%S')
 
-        # Log the user prompt
+        # Log the user prompt with enhanced metadata
         logger = AgentActivityLogger()
         activity_data = {
             "operation": "user_prompt",
             "prompt": user_prompt,
-            "session_id": logger.session_id,
+            "session_id": session_id,
             "timestamp": timestamp,
-            "context": {
-                "prompt_length": len(user_prompt),
+            "cwd": cwd,
+            "project": project,
+            "details": {
+                "prompt_length": original_length,
+                "truncated": original_length > max_length,
                 "interaction_type": "user_input"
             }
         }
