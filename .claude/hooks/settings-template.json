@@ -3,20 +3,22 @@
   "hooks": {
     "PreToolUse": [
       {
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/pre-tool-use.py"
+            "command": "python3 .claude/hooks/pre_tool_use.py"
           }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/user-prompt-submit.py"
+            "command": "python3 .claude/hooks/user_prompt_submit.py"
           }
         ]
       }

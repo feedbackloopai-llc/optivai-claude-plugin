@@ -24,6 +24,8 @@ temp/
 # Logs
 *.log
 logs/
+.claude/logs/
+*/.claude/logs/
 
 # Environment files
 .env
