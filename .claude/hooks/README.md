@@ -20,13 +20,26 @@ This system uses **Claude Code hooks** to automatically log every interaction wi
 .claude/hooks/
 ├── pre-tool-use.py          # Captures tool operations (Read, Write, Bash, etc.)
 ├── user-prompt-submit.py    # Captures user prompts for context
-├── log-writer.py            # Core logging engine
+├── log-writer.py            # Core logging engine (activity logging)
+├── memory_writer.py         # Enhanced memory system with backup/recovery
+├── aggregate_hook_logs.py   # Recovery script for work_log.yaml
+├── setup-ralph-loop.sh      # Ralph Wiggum Loop setup script
+├── stop-hook.sh             # Ralph Wiggum Loop stop hook
 ├── auto-logger-config.json  # Configuration file
 ├── settings-template.json   # Template for project settings
 └── README.md                # This file
 
 .claude/logs/
 └── agent-activity-YYYY-MM-DD.log  # Daily log files (JSON Lines format)
+
+~/.claude/gz-observability-memory/  # Global memory system
+├── session_state.yaml       # Current session context
+├── planned_tasks.yaml       # Tasks synced from TodoWrite
+├── work_log.yaml            # Chronological action history (500 max)
+├── recovery_checkpoint.yaml # Crash recovery state
+├── backups/                 # Timestamped backups before overwrites
+├── archive/                 # Quarterly rolloff of old entries
+└── corrupt/                 # Quarantined corrupt files
 ```
 
 ### How It Works
@@ -422,6 +435,147 @@ A: Yes, use `/logging-config` to enable/disable specific log types.
 
 **Q: How do I share logs?**
 A: Export to markdown format and review before sharing to remove sensitive data.
+
+## Enhanced Memory System
+
+The memory system provides persistent storage across sessions with automatic backup and recovery.
+
+### Memory System Features
+
+- **Backup Before Write**: Critical files are backed up before modification
+- **Automatic Recovery**: Corrupt files are quarantined and recovered from backups
+- **Project Context**: Every entry includes project name and working directory
+- **90-Day Lookback**: Extended history search for comprehensive context
+- **File History Tracking**: Track which files were modified across sessions
+
+### Memory Files
+
+| File | Purpose |
+|------|---------|
+| `session_state.yaml` | Current session context, focus, operation count |
+| `planned_tasks.yaml` | Tasks synced from TodoWrite (pending/in_progress/completed) |
+| `work_log.yaml` | Chronological history of significant operations (last 500) |
+| `recovery_checkpoint.yaml` | Crash recovery state |
+
+### Recovery from Corruption
+
+If the work_log.yaml becomes corrupted:
+
+```bash
+# Show statistics about available logs
+python .claude/hooks/aggregate_hook_logs.py --stats
+
+# Preview what would be imported
+python .claude/hooks/aggregate_hook_logs.py --recover --dry-run
+
+# Recover all available logs (creates backup first)
+python .claude/hooks/aggregate_hook_logs.py --recover
+
+# Recover specific date range
+python .claude/hooks/aggregate_hook_logs.py --from-date 2026-01-05 --to-date 2026-01-06 --recover
+```
+
+### Getting Project Context
+
+```python
+from memory_writer import get_comprehensive_project_context
+
+# Get 90 days of context for a project
+context = get_comprehensive_project_context("/path/to/project")
+
+# Includes:
+# - Direct project hook log search
+# - Memory system data filtered to project
+# - File history tracking
+# - Summary statistics
+```
+
+---
+
+## Ralph Wiggum Loop
+
+The Ralph Wiggum Loop is a self-referential AI development methodology for iterative tasks.
+
+### What is Ralph?
+
+Named after a development methodology pioneered by Geoffrey Huntley, the Ralph loop creates iterative feedback loops where:
+
+1. You provide a task prompt with clear completion criteria
+2. Claude works on the task
+3. When Claude tries to exit, the Stop hook intercepts
+4. The SAME prompt is fed back
+5. Claude sees previous work in files and iterates
+6. Loop continues until completion or max iterations
+
+### Usage
+
+```bash
+# Start a loop with iteration limit
+/ralph-loop Build a REST API --max-iterations 20
+
+# With completion promise (recommended)
+/ralph-loop Fix all tests --completion-promise 'ALL TESTS PASS' --max-iterations 30
+
+# Cancel an active loop
+/cancel-ralph
+```
+
+### When to Use Ralph
+
+- Test-driven development (make all tests pass)
+- Iterative refinement tasks (fix linting errors)
+- Complex multi-step implementations
+- Bug fixing loops
+- Autonomous work sessions
+
+### Completion Promise
+
+To signal completion, output in your response:
+
+```
+<promise>YOUR_COMPLETION_PHRASE</promise>
+```
+
+**Rule**: Only output a promise when the statement is completely TRUE.
+
+### State File
+
+Ralph creates `.claude/ralph-loop.local.md` in your project:
+
+```yaml
+---
+active: true
+iteration: 5
+max_iterations: 20
+completion_promise: "ALL TESTS PASS"
+started_at: "2026-01-09T10:00:00Z"
+---
+
+Fix all failing tests. Output <promise>ALL TESTS PASS</promise> when done.
+```
+
+### Settings Configuration
+
+The Stop hook must be configured in `settings.local.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/stop-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
 
 ## Contributing
 

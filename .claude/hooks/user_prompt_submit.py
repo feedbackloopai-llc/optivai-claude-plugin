@@ -90,6 +90,11 @@ def main():
         if len(user_prompt) > max_length:
             user_prompt = user_prompt[:max_length] + "..."
 
+        # Get project context for memory system
+        project_dir = Path.cwd()
+        project_name = project_dir.name
+        cwd = str(project_dir)
+
         logger = AgentActivityLogger(config_path=config_path)
         logger.log_activity({
             "operation": "user_prompt",
@@ -102,6 +107,25 @@ def main():
                 "interaction_type": "user_input"
             }
         })
+
+        # Log to enhanced memory system (Priority 2: Project Context)
+        try:
+            from memory_writer import get_memory_writer
+            memory_writer = get_memory_writer()
+            memory_writer.on_user_prompt(
+                prompt=user_prompt,
+                details={
+                    "prompt_length": original_length,
+                    "truncated": original_length > max_length,
+                    "interaction_type": "user_input"
+                },
+                project=project_name,
+                cwd=cwd
+            )
+        except ImportError:
+            pass  # memory_writer not available
+        except Exception:
+            pass  # Don't fail the hook if memory system has issues
 
         # Store in environment for tool hooks
         os.environ['CLAUDE_LAST_USER_PROMPT'] = user_prompt

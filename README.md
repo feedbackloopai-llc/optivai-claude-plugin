@@ -59,7 +59,7 @@ A comprehensive enterprise-grade AI agent toolkit integrating OptivAI developmen
 - **gensi-phase5-initiative-worker** - Program planning and resource allocation
 - **gensi-phase6-initiative-worker** - Execution planning and implementation roadmaps
 
-### ⚡ Commands (29)
+### ⚡ Commands (31)
 
 #### Development Workflow Commands (19)
 - **act** - GitHub Actions workflow runner
@@ -81,6 +81,10 @@ A comprehensive enterprise-grade AI agent toolkit integrating OptivAI developmen
 - **search-context** - Search through saved contexts
 - **summary** - Generate conversation summary
 - **Testing Configuration** - Reference for testing configuration
+
+#### Ralph Wiggum Loop Commands (2)
+- **ralph-loop** - Start a self-referential AI development loop for iterative tasks
+- **cancel-ralph** - Cancel an active Ralph loop
 
 #### Automatic Activity Logging Commands (6)
 - **install-logging-hooks** - Install automatic activity logging hooks in current project
@@ -185,6 +189,62 @@ The logging system consists of:
 - **Logs**: Daily log files in `.claude/logs/`
 
 For complete documentation, see [.claude/hooks/README.md](.claude/hooks/README.md)
+
+## Ralph Wiggum Loop
+
+**New**: Self-referential AI development methodology for iterative tasks.
+
+### What It Does
+
+The Ralph loop creates iterative feedback loops where Claude works on a task repeatedly until completion:
+
+1. You provide a task prompt with clear completion criteria
+2. Claude works on the task
+3. When Claude tries to exit, the Stop hook intercepts
+4. The SAME prompt is fed back
+5. Claude sees previous work in files and iterates
+6. Loop continues until completion or max iterations
+
+### Quick Start
+
+```bash
+# Start a loop with iteration limit
+/ralph-loop Fix all tests --completion-promise 'ALL TESTS PASS' --max-iterations 30
+
+# Cancel an active loop
+/cancel-ralph
+```
+
+### Use Cases
+
+- Test-driven development (make all tests pass)
+- Iterative refinement tasks (fix linting errors)
+- Complex multi-step implementations
+- Bug fixing loops
+- Autonomous work sessions
+
+Origin: Pioneered by Geoffrey Huntley. For complete documentation, see the [ralph-loop.md](commands/ralph-loop.md) command.
+
+## Enhanced Memory System
+
+The activity logging system now includes a comprehensive memory system with:
+
+- **Backup Before Write**: Critical files are backed up before modification
+- **Automatic Recovery**: Corrupt files are quarantined and recovered from backups
+- **Project Context**: Every entry includes project name and working directory
+- **90-Day Lookback**: Extended history search for comprehensive context
+- **Recovery Script**: Rebuild work_log.yaml from hook logs after corruption
+
+### Memory Files
+
+| File | Purpose |
+|------|---------|
+| `session_state.yaml` | Current session context and focus |
+| `planned_tasks.yaml` | Tasks synced from TodoWrite |
+| `work_log.yaml` | Chronological action history (last 500) |
+| `recovery_checkpoint.yaml` | Crash recovery state |
+
+Location: `~/.claude/gz-observability-memory/`
 
 ## FBLAI Integration
 

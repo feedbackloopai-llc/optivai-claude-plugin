@@ -361,6 +361,11 @@ def main():
                 # Keep context alive
                 update_subagent_activity()
 
+        # Get project context for memory system
+        project_dir = Path.cwd()
+        project_name = project_dir.name
+        cwd = str(project_dir)
+
         logger = AgentActivityLogger(config_path=config_path)
         logger.log_activity({
             "operation": operation,
@@ -369,6 +374,22 @@ def main():
             "timestamp": time.strftime('%H:%M:%S'),
             "details": details
         })
+
+        # Log to enhanced memory system (Priority 2: Project Context)
+        try:
+            from memory_writer import get_memory_writer
+            memory_writer = get_memory_writer()
+            memory_writer.on_tool_use(
+                operation=operation,
+                prompt=prompt,
+                details=details,
+                project=project_name,
+                cwd=cwd
+            )
+        except ImportError:
+            pass  # memory_writer not available
+        except Exception:
+            pass  # Don't fail the hook if memory system has issues
 
     except Exception as e:
         try:
