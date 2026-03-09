@@ -1,0 +1,25 @@
+{
+  "commands": [
+    {
+      "name": "log-activity",
+      "aliases": ["log", "activity"],
+      "completions": {
+        "operation": [
+          "create_file", "modify_file", "delete_file",
+          "run_command", "analyze_code", "debug_issue",
+          "test_feature", "deploy_code", "refactor_code"
+        ]
+      }
+    },
+    {
+      "name": "show-history", 
+      "aliases": ["hist", "history"],
+      "completions": {
+        "session": ["current", "all"],
+        "operation": [
+          "create_file", "modify_file", "run_command", "analyze_code"
+        ]
+      }
+    }
+  ]
+}

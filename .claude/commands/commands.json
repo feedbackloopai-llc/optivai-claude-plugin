@@ -1,0 +1,204 @@
+{
+  "commands": {
+    "log-activity": {
+      "handler": "commands.activity_commands:log_activity",
+      "description": "Log a new agent activity with operation and prompt",
+      "aliases": ["log", "activity"],
+      "parameters": {
+        "operation": {
+          "type": "string",
+          "required": true,
+          "description": "The operation being performed"
+        },
+        "prompt": {
+          "type": "string",
+          "required": false,
+          "description": "The prompt or description"
+        },
+        "result": {
+          "type": "string",
+          "required": false,
+          "description": "The result or outcome"
+        }
+      }
+    },
+    "show-history": {
+      "handler": "commands.activity_commands:show_history",
+      "description": "Display recent agent activities",
+      "aliases": ["hist", "history"],
+      "parameters": {
+        "hours": {
+          "type": "int",
+          "default": 24,
+          "description": "Time window in hours"
+        },
+        "max": {
+          "type": "int",
+          "default": 20,
+          "description": "Maximum entries to show"
+        },
+        "session": {
+          "type": "string",
+          "default": "current",
+          "description": "Session filter: current, all, or session-id"
+        },
+        "operation": {
+          "type": "string",
+          "required": false,
+          "description": "Filter by operation type"
+        }
+      }
+    },
+    "session-summary": {
+      "handler": "commands.activity_commands:session_summary",
+      "description": "Get summary of current session activities",
+      "aliases": ["summary", "sum"]
+    },
+    "search-logs": {
+      "handler": "commands.activity_commands:search_logs",
+      "description": "Search through activity logs",
+      "aliases": ["search", "find"],
+      "parameters": {
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "Search query"
+        },
+        "days": {
+          "type": "int",
+          "default": 7,
+          "description": "Days to search back"
+        }
+      }
+    },
+    "clear-session": {
+      "handler": "commands.activity_commands:clear_session",
+      "description": "Start a new session with new session ID",
+      "aliases": ["new-session", "reset"]
+    },
+    "export-session": {
+      "handler": "commands.activity_commands:export_session",
+      "description": "Export current session logs",
+      "aliases": ["export"],
+      "parameters": {
+        "format": {
+          "type": "string",
+          "default": "json",
+          "description": "Export format: json, csv, or markdown"
+        },
+        "output": {
+          "type": "string",
+          "required": false,
+          "description": "Output file path"
+        }
+      }
+    },
+    "log-config": {
+      "handler": "commands.activity_commands:log_config",
+      "description": "Configure logging settings",
+      "aliases": ["config"],
+      "parameters": {
+        "key": {
+          "type": "string",
+          "required": false,
+          "description": "Configuration key to set"
+        },
+        "value": {
+          "type": "string",
+          "required": false,
+          "description": "Configuration value"
+        }
+      }
+    },
+    "memory-status": {
+      "handler": "commands.activity_commands:memory_status",
+      "description": "Show status of all memory system files",
+      "aliases": ["mem-status", "mstat"]
+    },
+    "memory-read": {
+      "handler": "commands.activity_commands:memory_read",
+      "description": "Read a specific memory file or all files",
+      "aliases": ["mem-read", "mread"],
+      "parameters": {
+        "file": {
+          "type": "string",
+          "required": false,
+          "description": "Memory file to read: session_state.yaml, planned_tasks.yaml, work_log.yaml, recovery_checkpoint.yaml"
+        }
+      }
+    },
+    "memory-checkpoint": {
+      "handler": "commands.activity_commands:memory_checkpoint",
+      "description": "Create a recovery checkpoint for session continuity",
+      "aliases": ["checkpoint", "mcp"],
+      "parameters": {
+        "description": {
+          "type": "string",
+          "required": false,
+          "description": "Description of current work state"
+        },
+        "status": {
+          "type": "string",
+          "default": "in_progress",
+          "description": "Status: in_progress, completed, blocked"
+        },
+        "project": {
+          "type": "string",
+          "required": false,
+          "description": "Project name (defaults to current directory)"
+        }
+      }
+    },
+    "memory-add-task": {
+      "handler": "commands.activity_commands:memory_add_task",
+      "description": "Add a task to planned tasks for tracking",
+      "aliases": ["add-task", "mtask"],
+      "parameters": {
+        "description": {
+          "type": "string",
+          "required": true,
+          "description": "Task description"
+        },
+        "priority": {
+          "type": "string",
+          "default": "medium",
+          "description": "Priority: low, medium, high, critical"
+        }
+      }
+    },
+    "memory-complete-task": {
+      "handler": "commands.activity_commands:memory_complete_task",
+      "description": "Mark a task as complete (removes from planned tasks)",
+      "aliases": ["complete-task", "mdone"],
+      "parameters": {
+        "task_id": {
+          "type": "string",
+          "required": true,
+          "description": "Task ID to mark as complete"
+        }
+      }
+    },
+    "memory-log": {
+      "handler": "commands.activity_commands:memory_log",
+      "description": "Add an entry to the work log",
+      "aliases": ["work-log", "mlog"],
+      "parameters": {
+        "action": {
+          "type": "string",
+          "required": true,
+          "description": "Action performed"
+        },
+        "details": {
+          "type": "string",
+          "required": false,
+          "description": "Additional details"
+        }
+      }
+    },
+    "memory-prime": {
+      "handler": "commands.activity_commands:memory_prime",
+      "description": "Get full memory system context for agent priming",
+      "aliases": ["prime", "mprime"]
+    }
+  }
+}

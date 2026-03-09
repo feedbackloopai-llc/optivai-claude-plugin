@@ -1,0 +1,55 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/pre-tool-use.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/till_done.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/user-prompt-submit.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/stop-hook.sh\""
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "gz-reporting": {
+      "command": "/Users/christopherhughesgz/Documents/optivai/gz-reporting-mcp1/.venv/bin/gz-reporting-mcp",
+      "args": []
+    },
+    "atlassian": {
+      "command": "npx",
+      "args": [
+        "atlassian-mcp@latest"
+      ]
+    }
+  }
+}

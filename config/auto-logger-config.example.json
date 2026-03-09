@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "log_tool_operations": true,
+  "log_user_prompts": true,
+  "log_level": "info",
+  "max_prompt_length": 500,
+  "session_tracking": true,
+
+  "_comment_log_mode": "Use 'global' to avoid macOS Full Disk Access issues with ~/Documents",
+  "log_directory_mode": "global",
+  "global_log_path": "~/.claude/logs",
+  "project_log_subdir": ".claude/logs",
+
+  "destinations": {
+    "local": {
+      "enabled": true
+    },
+    "postgresql": {
+      "enabled": true,
+      "connection_string": "postgresql://user:password@host/dbname?sslmode=require",
+      "sync": {
+        "batch_size": 100,
+        "flush_interval_seconds": 60,
+        "retry_attempts": 3,
+        "retry_delay_seconds": 5
+      }
+    }
+  }
+}

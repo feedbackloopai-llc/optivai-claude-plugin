@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+  "log_tool_operations": true,
+  "log_user_prompts": true,
+  "max_prompt_length": 500,
+  "session_tracking": true,
+  "log_level": "info",
+
+  "log_directory_mode": "global",
+  "global_log_path": "~/.claude/logs",
+  "project_log_subdir": ".claude/logs",
+
+  "destinations": {
+    "local": {
+      "enabled": true
+    },
+    "postgresql": {
+      "enabled": true,
+      "account": "WRA18224.us-east-1",
+      "warehouse": "COMPUTE_WH",
+      "role": "ACCOUNTADMIN",
+      "target_table": "DW_DEV_STREAM.LANDING.RAW_EVENTS",
+      "tenant_id": "CLAUDE_CODE",
+      "source_system": "CLAUDE_CODE",
+      "auth": {
+        "type": "key_pair",
+        "user": "CHRIS_HUGHES",
+        "private_key_path": "~/.postgresql/chris_hughes_key.pem",
+        "private_key_passphrase_env": ""
+      },
+      "sync": {
+        "batch_size": 100,
+        "flush_interval_seconds": 60,
+        "retry_attempts": 3,
+        "retry_delay_seconds": 5
+      },
+      "_comment": "PostgreSQL activity log"
+    }
+  }
+}

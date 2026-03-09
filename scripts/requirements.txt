@@ -1,0 +1,16 @@
+# Core dependencies for OptivAI Claude PostgreSQL Plugin
+
+# PostgreSQL connector
+psycopg2-binary>=2.9.0
+
+# pgvector support for PostgreSQL
+pgvector>=0.2.0
+
+# Local embeddings (all-mpnet-base-v2, 768-dim)
+sentence-transformers>=2.2.0
+
+# Claude API for metadata extraction
+anthropic>=0.30.0
+
+# YAML support for Memory System (optional but recommended)
+PyYAML>=6.0

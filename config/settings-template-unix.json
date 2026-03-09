@@ -1,0 +1,48 @@
+{
+  "_comment": "Unix (macOS/Linux) settings template - uses tilde expansion for home directory",
+  "_teams_note": "Agent teams enabled via env var. Launch with: claude --teammate-mode tmux (split-pane) or claude --teammate-mode auto (auto-detect)",
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_USER_EMAIL": "your.name@feedbackloopai.com",
+    "CLAUDE_ORG_NAME": "FeedbackLoopAI"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/pre-tool-use.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/user-prompt-submit.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/session_summary.py"
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/stop-hook.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

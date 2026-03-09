@@ -1,0 +1,61 @@
+# Configuration (contains credentials)
+config/auto-logger-config.json
+
+# Local Claude logs
+.claude/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sync state (machine-specific)
+.sync_state.json
+
+# Beads local state (machine-specific)
+.beads/
+
+# Logs (except examples)
+*.log
+!docs/*.log
+
+# Keys and credentials
+*.pem
+*.p8
+*.key
+credentials.json
+secrets.json
