@@ -13,7 +13,7 @@
           },
           {
             "type": "command",
-            "command": "python3 scripts/hooks/till_done.py"
+            "command": "python3 ~/.claude/hooks/till_done.py"
           }
         ]
       }
