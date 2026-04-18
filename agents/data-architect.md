@@ -83,7 +83,7 @@ Refer to `~/.claude/CLAUDE.md` for credentials, connection patterns, and core ru
 
 ### The Well Event Schema
 ```
-DW_DEV_STREAM.LANDING.RAW_EVENTS
+YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 ├── EVENT_ID, TENANT_ID, SOURCE_SYSTEM
 ├── EVENT_TYPE (ACTOR.CATEGORY.OPERATION)
 ├── EVENT_AT, ACTOR_ID, SUBJECT_ID

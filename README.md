@@ -71,14 +71,14 @@ This plugin adds **automatic activity logging** to Claude Code:
                                     ▼
                     ┌───────────────────────────────┐
                     │   PostgreSQL Database        │
-                    │   DW_DEV_STREAM.LANDING       │
+                    │   YOUR_DW_SCHEMA.LANDING       │
                     │   .RAW_EVENTS (instant)       │
                     └───────────────────────────────┘
                                     │
                                     ▼ (15-minute refresh)
                     ┌───────────────────────────────┐
                     │   Activity Stream             │
-                    │   DW_DEV_STREAM.ACTIVITY      │
+                    │   YOUR_DW_SCHEMA.ACTIVITY      │
                     │   .ACTIVITY_STREAM            │
                     └───────────────────────────────┘
 ```
@@ -210,7 +210,7 @@ Edit `~/.claude/hooks/auto-logger-config.json` with your PostgreSQL credentials:
       "account": "YOUR_ACCOUNT.us-east-1",
       "warehouse": "COMPUTE_WH",
       "role": "YOUR_ROLE",
-      "target_table": "DW_DEV_STREAM.LANDING.RAW_EVENTS",
+      "target_table": "YOUR_DW_SCHEMA.LANDING.RAW_EVENTS",
       "tenant_id": "CLAUDE_CODE",
       "source_system": "CLAUDE_CODE",
       "auth": {
@@ -381,7 +381,7 @@ for p in projects:
 4. Check sync status: `python3 scripts/pg_sync.py --status`
 5. Query PostgreSQL:
    ```sql
-   SELECT * FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+   SELECT * FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
    WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
    ORDER BY EVENT_AT DESC
    LIMIT 10;
@@ -431,7 +431,7 @@ This plugin includes slash commands for Claude Code. These are shortcuts you can
 
 | Command | Description |
 |---------|-------------|
-| `/report` | Query DW_DEV_REPORT.RPT views |
+| `/report` | Query YOUR_RPT_SCHEMA.RPT views |
 | `/report jira` | Query JIRA data from PostgreSQL |
 | `/report costs` | View Claude Code cost estimates |
 
@@ -810,7 +810,7 @@ Bead events sync to The Well with these event types:
 
 Query bead events in PostgreSQL:
 ```sql
-SELECT * FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+SELECT * FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 WHERE EVENT_TYPE LIKE 'BEAD_%' OR EVENT_TYPE LIKE 'DEPENDENCY_%'
 ORDER BY EVENT_AT DESC LIMIT 20;
 ```
@@ -849,7 +849,7 @@ You say: "Decided to use ROW_NUMBER for CertApp dedup because..."
    │
    ▼
 ┌──────────────────────────────────┐
-│  DW_DEV_STREAM.BRAIN.THOUGHTS   │  ← Stored with your USER_ID
+│  YOUR_DW_SCHEMA.BRAIN.THOUGHTS   │  ← Stored with your USER_ID
 └──────────────────────────────────┘
 
 Later: "what was the dedup strategy for CertApp?"
@@ -914,7 +914,7 @@ Metadata is **auto-extracted** by Cortex LLM — no manual tagging needed:
 ### Schema Reference
 
 ```sql
--- Table: DW_DEV_STREAM.BRAIN.THOUGHTS
+-- Table: YOUR_DW_SCHEMA.BRAIN.THOUGHTS
 -- DDL: sql/BRAIN_SCHEMA.sql
 -- Views: V_RECENT_THOUGHTS, V_USER_STATS, V_USER_TOPICS, V_USER_PEOPLE
 ```
@@ -1577,8 +1577,8 @@ There are **two tables** you can query for Claude Code activity:
 
 | Table | Use Case | Latency |
 |-------|----------|---------|
-| `DW_DEV_STREAM.LANDING.RAW_EVENTS` | Real-time debugging, immediate verification | ~60 seconds |
-| `DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM` | Analytics, reporting, unified view | ~15 minutes |
+| `YOUR_DW_SCHEMA.LANDING.RAW_EVENTS` | Real-time debugging, immediate verification | ~60 seconds |
+| `YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM` | Analytics, reporting, unified view | ~15 minutes |
 
 ### Activity Stream Queries (Recommended for Analytics)
 
@@ -1591,7 +1591,7 @@ SELECT
     SUBJECT_ID AS PROJECT,
     METADATA:operation::STRING AS OPERATION,
     METADATA:prompt::STRING AS PROMPT
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(hour, -24, CURRENT_TIMESTAMP())
 ORDER BY EVENT_AT DESC
@@ -1606,7 +1606,7 @@ SELECT
     SUBJECT_ID AS PROJECT,
     METADATA:operation::STRING AS OPERATION,
     LEFT(METADATA:prompt::STRING, 100) AS PROMPT_PREVIEW
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND ACTOR_ID LIKE '%your_username%'  -- Replace with your username
   AND EVENT_AT > DATEADD(day, -7, CURRENT_TIMESTAMP())
@@ -1624,7 +1624,7 @@ SELECT
     COUNT(CASE WHEN EVENT_TYPE LIKE '%PROMPT%' THEN 1 END) AS USER_PROMPTS,
     MIN(EVENT_AT) AS FIRST_ACTIVITY,
     MAX(EVENT_AT) AS LAST_ACTIVITY
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(day, -30, CURRENT_TIMESTAMP())
 GROUP BY 1
@@ -1638,7 +1638,7 @@ SELECT
     COUNT(*) AS TOTAL_EVENTS,
     COUNT(DISTINCT SUBJECT_ID) AS PROJECTS_WORKED,
     COUNT(DISTINCT ACTOR_ID) AS UNIQUE_USERS
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(day, -30, CURRENT_TIMESTAMP())
 GROUP BY 1
@@ -1651,7 +1651,7 @@ SELECT
     METADATA:operation::STRING AS OPERATION,
     COUNT(*) AS COUNT,
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS PERCENTAGE
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(day, -7, CURRENT_TIMESTAMP())
 GROUP BY 1
@@ -1665,7 +1665,7 @@ SELECT
     ACTOR_ID AS USER,
     SUBJECT_ID AS PROJECT,
     METADATA:prompt::STRING AS PROMPT
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND LOWER(METADATA:prompt::STRING) LIKE '%search term%'
   AND EVENT_AT > DATEADD(day, -30, CURRENT_TIMESTAMP())
@@ -1683,7 +1683,7 @@ SELECT
     EVENT_TYPE,
     ACTOR_ID,
     SUBJECT_ID AS PROJECT
-FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
 ORDER BY EVENT_AT DESC
 LIMIT 10;
@@ -1695,7 +1695,7 @@ SELECT
     COUNT(*) AS events_today,
     MIN(EVENT_AT) AS first_event,
     MAX(EVENT_AT) AS last_event
-FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND DATE(EVENT_AT) = CURRENT_DATE();
 ```
@@ -1711,7 +1711,7 @@ The Activity Stream includes these columns for Claude Code events:
 | `SOURCE_SYSTEM` | VARCHAR | Always `CLAUDE_CODE` | `CLAUDE_CODE` |
 | `EVENT_TYPE` | VARCHAR | Operation type | `BOT.BASH`, `USER.PROMPT.PROMPT` |
 | `EVENT_AT` | TIMESTAMP_LTZ | When event occurred | `2026-01-12 14:02:18` |
-| `ACTOR_ID` | VARCHAR | User identifier | `claude-code-christopherhughesgz` |
+| `ACTOR_ID` | VARCHAR | User identifier | `claude-code-optivai-user` |
 | `ACTOR_TYPE` | VARCHAR | Actor type | `BOT` |
 | `SUBJECT_ID` | VARCHAR | Project name | `optivai-claude-plugin` |
 | `SUBJECT_TYPE` | VARCHAR | Subject type | `PROJECT` |
@@ -1725,10 +1725,10 @@ The Activity Stream includes these columns for Claude Code events:
   "operation": "bash",
   "prompt": "Check sync status",
   "session_id": "session-20260112-140218-abc123",
-  "agent_id": "optivai-claude-plugin/crew/christopherhughesgz",
-  "user": "christopherhughesgz",
+  "agent_id": "optivai-claude-plugin/crew/optivai-user",
+  "user": "optivai-user",
   "project": "optivai-claude-plugin",
-  "cwd": "/Users/christopherhughesgz/project",
+  "cwd": "/Users/optivai-user/project",
   "timestamp": "2026-01-12T14:02:18+00:00",
   "git_repo": "feedbackloopai/optivai-claude-plugin",
   "git_org": "feedbackloopai",
@@ -1762,7 +1762,7 @@ SELECT
     COALESCE(METADATA:provider.model::STRING, METADATA:bedrock.model::STRING) AS model,
     METADATA:details:tool_name::STRING AS tool_name,
     METADATA:details:command::STRING AS command
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
 LIMIT 5;
 ```
@@ -1785,7 +1785,7 @@ SELECT
     METADATA:git_repo_name::STRING AS repo,
     COUNT(*) AS operations,
     COUNT(DISTINCT DATE(EVENT_AT)) AS days_active
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND METADATA:git_repo_name IS NOT NULL
   AND EVENT_AT > DATEADD(day, -30, CURRENT_TIMESTAMP())
@@ -1799,7 +1799,7 @@ SELECT
     METADATA:git_org::STRING AS organization,
     COUNT(*) AS total_operations,
     COUNT(DISTINCT METADATA:git_repo_name::STRING) AS repos_worked
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND METADATA:git_org IS NOT NULL
   AND EVENT_AT > DATEADD(day, -30, CURRENT_TIMESTAMP())
@@ -1845,7 +1845,7 @@ The `session_summary.py` Stop hook parses Claude Code transcript JSONL files at 
 
 ### Token Usage Views
 
-Three views in `DW_DEV_REPORT.RPT` provide token analytics from `SESSION.SUMMARY` events:
+Three views in `YOUR_RPT_SCHEMA.RPT` provide token analytics from `SESSION.SUMMARY` events:
 
 | View | Purpose |
 |------|---------|
@@ -1866,7 +1866,7 @@ SELECT
     TOTAL_TOKENS,
     ESTIMATED_COST_USD AS API_EQUIV_COST_USD,
     SESSION_DURATION_MINUTES
-FROM DW_DEV_REPORT.RPT.VW_CLAUDE_CODE_SESSION_TOKENS
+FROM YOUR_RPT_SCHEMA.RPT.VW_CLAUDE_CODE_SESSION_TOKENS
 WHERE SESSION_DATE >= DATEADD(day, -7, CURRENT_DATE())
 ORDER BY SESSION_END_AT DESC;
 ```
@@ -1881,7 +1881,7 @@ SELECT
     TOTAL_ESTIMATED_COST_USD,
     TOTAL_ACTIVE_HOURS,
     AVG_TOKENS_PER_SESSION
-FROM DW_DEV_REPORT.RPT.VW_CLAUDE_CODE_DEVELOPER_USAGE
+FROM YOUR_RPT_SCHEMA.RPT.VW_CLAUDE_CODE_DEVELOPER_USAGE
 ORDER BY USAGE_DATE DESC;
 ```
 
@@ -1896,7 +1896,7 @@ SELECT
     API_EQUIV_COST_USD,
     TOTAL_ACTIVE_HOURS,
     AVG_SESSIONS_PER_DAY
-FROM DW_DEV_REPORT.RPT.VW_CLAUDE_CODE_MONTHLY_REPORT
+FROM YOUR_RPT_SCHEMA.RPT.VW_CLAUDE_CODE_MONTHLY_REPORT
 ORDER BY REPORT_MONTH DESC;
 ```
 
@@ -1971,7 +1971,7 @@ SELECT
     LAUNCH_DIRS_USED,  -- Shows work from multiple launch directories
     UNIQUE_FILES,
     EST_COST_USD
-FROM DW_DEV_REPORT.RPT.VW_CLAUDE_CODE_PROJECT_SUMMARY_DERIVED
+FROM YOUR_RPT_SCHEMA.RPT.VW_CLAUDE_CODE_PROJECT_SUMMARY_DERIVED
 ORDER BY TOTAL_OPERATIONS DESC;
 ```
 
@@ -1997,7 +1997,7 @@ SELECT
     PROJECTS_TOUCHED,
     PRIMARY_PROJECT,
     PROJECTS_LIST
-FROM DW_DEV_REPORT.RPT.VW_CLAUDE_CODE_CROSS_PROJECT_WORK
+FROM YOUR_RPT_SCHEMA.RPT.VW_CLAUDE_CODE_CROSS_PROJECT_WORK
 WHERE PROJECTS_TOUCHED > 1
 ORDER BY SESSION_DATE DESC;
 ```
@@ -2022,7 +2022,7 @@ SELECT
     TOTAL_OPS,          -- FILE_OPS + ALLOCATED_OPS
     EST_COST_USD,
     PCT_OF_TOTAL
-FROM DW_DEV_REPORT.RPT.VW_CLAUDE_CODE_WEIGHTED_PROJECT_COST
+FROM YOUR_RPT_SCHEMA.RPT.VW_CLAUDE_CODE_WEIGHTED_PROJECT_COST
 ORDER BY TOTAL_OPS DESC;
 ```
 

@@ -101,7 +101,7 @@ Refer to `~/.claude/CLAUDE.md` for credentials and connection patterns.
 ### The Well Queries (PostgreSQL)
 ```sql
 SELECT EVENT_AT, EVENT_TYPE, METADATA:operation::STRING as operation
-FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(hour, -24, CURRENT_TIMESTAMP());
 ```

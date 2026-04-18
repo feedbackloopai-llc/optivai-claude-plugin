@@ -70,7 +70,7 @@ conn = psycopg2.connect(
     role=sf_config.get('role', 'ACCOUNTADMIN')
 )
 
-table = sf_config.get('target_table', 'DW_DEV_STREAM.LANDING.RAW_EVENTS')
+table = sf_config.get('target_table', 'YOUR_DW_SCHEMA.LANDING.RAW_EVENTS')
 tenant_id = sf_config.get('tenant_id', 'CLAUDE_CODE')
 
 query = f"""
@@ -138,7 +138,7 @@ For more complex queries, connect directly to PostgreSQL:
 SELECT
     METADATA:operation::STRING as operation,
     COUNT(*) as count
-FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(day, -7, CURRENT_TIMESTAMP())
 GROUP BY 1
@@ -150,7 +150,7 @@ SELECT
     COUNT(*) as event_count,
     MIN(EVENT_AT) as first_event,
     MAX(EVENT_AT) as last_event
-FROM DW_DEV_STREAM.LANDING.RAW_EVENTS
+FROM YOUR_DW_SCHEMA.LANDING.RAW_EVENTS
 WHERE SOURCE_SYSTEM = 'CLAUDE_CODE'
   AND EVENT_AT > DATEADD(day, -7, CURRENT_TIMESTAMP())
 GROUP BY 1

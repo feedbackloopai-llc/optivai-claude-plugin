@@ -70,7 +70,7 @@ SELECT
     'Well' AS source,
     COUNT(*) AS record_count,
     COUNT(DISTINCT EVENT_NK_HASH) AS unique_events
-FROM DW_DEV_STREAM.LANDING.CORE_S00_RAW_EVENTS
+FROM YOUR_DW_SCHEMA.LANDING.CORE_S00_RAW_EVENTS
 WHERE INGESTED_AT >= :load_start_time
 
 UNION ALL
@@ -79,7 +79,7 @@ SELECT
     'Activity Stream' AS source,
     COUNT(*) AS record_count,
     COUNT(DISTINCT EVENT_NK_HASH) AS unique_events
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 WHERE INGESTED_AT >= :load_start_time;
 ```
 
@@ -91,7 +91,7 @@ SELECT
     MAX(EVENT_AT) AS latest_event,
     MAX(INGESTED_AT) AS latest_ingestion,
     DATEDIFF('hour', MAX(EVENT_AT), CURRENT_TIMESTAMP()) AS lag_hours
-FROM DW_DEV_STREAM.ACTIVITY.ACTIVITY_STREAM
+FROM YOUR_DW_SCHEMA.ACTIVITY.ACTIVITY_STREAM
 GROUP BY SOURCE_SYSTEM
 ORDER BY lag_hours DESC;
 ```
@@ -106,28 +106,28 @@ Built-in monitoring views - query these for system health.
 
 ```sql
 -- Lag hours by API source
-SELECT * FROM DW_DEV_REPORT.RPT.ETL_S40_RPT_FRESHNESS;
+SELECT * FROM YOUR_RPT_SCHEMA.RPT.ETL_S40_RPT_FRESHNESS;
 ```
 
 ### Volume Monitoring
 
 ```sql
 -- Daily row counts by source system
-SELECT * FROM DW_DEV_REPORT.RPT.ETL_S42_RPT_VOLUME_DAILY;
+SELECT * FROM YOUR_RPT_SCHEMA.RPT.ETL_S42_RPT_VOLUME_DAILY;
 ```
 
 ### Job Run History
 
 ```sql
 -- Success/failure history of ETL jobs
-SELECT * FROM DW_DEV_REPORT.RPT.ETL_S41_RPT_JOB_RUNS;
+SELECT * FROM YOUR_RPT_SCHEMA.RPT.ETL_S41_RPT_JOB_RUNS;
 ```
 
 ### Health Dashboard
 
 ```sql
 -- Overall system health
-SELECT * FROM DW_DEV_REPORT.RPT.ETL_S90_GOV_HEALTH_DASHBOARD;
+SELECT * FROM YOUR_RPT_SCHEMA.RPT.ETL_S90_GOV_HEALTH_DASHBOARD;
 ```
 
 ---
@@ -157,4 +157,4 @@ After load:
 
 - `/activity-stream-guide` - Full schema, implementation rules, JSON template
 - `/event-patterns` - System-specific metadata templates
-- `/report` - Query DW_DEV_REPORT.RPT views
+- `/report` - Query YOUR_RPT_SCHEMA.RPT views

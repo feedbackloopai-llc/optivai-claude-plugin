@@ -41,10 +41,6 @@
     ]
   },
   "mcpServers": {
-    "gz-reporting": {
-      "command": "/Users/christopherhughesgz/Documents/optivai/gz-reporting-mcp1/.venv/bin/gz-reporting-mcp",
-      "args": []
-    },
     "atlassian": {
       "command": "npx",
       "args": [

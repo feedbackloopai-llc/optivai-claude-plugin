@@ -110,7 +110,7 @@ PYTHON_EOF
 | `logging.log_dir` | Root | Directory for local logs |
 | `destinations.postgresql.enabled` | PostgreSQL | Enable sync to PostgreSQL |
 | `destinations.postgresql.account` | PostgreSQL | PostgreSQL account identifier |
-| `destinations.postgresql.target_table` | PostgreSQL | Target table (e.g., DW_DEV_STREAM.LANDING.RAW_EVENTS) |
+| `destinations.postgresql.target_table` | PostgreSQL | Target table (e.g., YOUR_DW_SCHEMA.LANDING.RAW_EVENTS) |
 | `destinations.postgresql.tenant_id` | PostgreSQL | Tenant identifier in The Well |
 | `destinations.postgresql.sync.batch_size` | Sync | Events per batch |
 | `destinations.postgresql.sync.flush_interval_seconds` | Sync | Seconds between sync passes |

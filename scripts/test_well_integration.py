@@ -77,7 +77,7 @@ def main():
     event_type = "BOT.TOOL.TEST"
     actor_id = "claude-code-test"
     subject_id = "test-integration"
-    target_table = sf_config.get("target_table", "DW_DEV_STREAM.LANDING.RAW_EVENTS")
+    target_table = sf_config.get("target_table", "YOUR_DW_SCHEMA.LANDING.RAW_EVENTS")
 
     metadata = {
         "test": True,

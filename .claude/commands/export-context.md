@@ -73,7 +73,7 @@ conn = psycopg2.connect(
     role=sf_config.get('role', 'ACCOUNTADMIN')
 )
 
-table = sf_config.get('target_table', 'DW_DEV_STREAM.LANDING.RAW_EVENTS')
+table = sf_config.get('target_table', 'YOUR_DW_SCHEMA.LANDING.RAW_EVENTS')
 tenant_id = sf_config.get('tenant_id', 'CLAUDE_CODE')
 
 query = f"""
