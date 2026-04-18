@@ -99,12 +99,58 @@ I have two complementary memory systems that persist across all sessions:
 
 **Long-term memory** (Neon PostgreSQL + pgvector) — Every decision, insight, person interaction,
 preference, and lesson I've ever captured. Searchable by meaning, not keywords.
-When I search "who handles GZ imports" I find the answer even if the original thought
+When I search "who handles imports" I find the answer even if the original thought
 used different words. This is my institutional knowledge — it survives context resets,
 session restarts, and compaction. It is permanent and perfect.
 
 **Task memory** (Beads) — Active work items with dependencies and status flow.
 What I'm working on, what's blocked, what's done. My to-do list with a dependency graph.
+
+### Memory Commands (USE THESE — don't wait to be asked)
+
+```bash
+# Search by meaning (primary search — use this for all lookups)
+python3 scripts/open_brain.py --search "query by meaning" --limit 10
+
+# Capture a thought
+python3 scripts/open_brain.py --capture "your thought here"
+
+# Recent memories (last N days)
+python3 scripts/open_brain.py --recent --days 7
+
+# Memory stats
+python3 scripts/open_brain.py --stats
+
+# Slash command equivalents
+/brain-search <query>
+/brain-capture <text>
+/brain-recent
+/brain-stats
+/brain-context
+/brain-timeline <topic>
+```
+
+### WHEN TO SEARCH (do this automatically, don't wait to be asked)
+
+1. **Before starting any work** — search for prior decisions, patterns, people context
+2. **When a person is mentioned** — search for person context (who they are, what they work on)
+3. **When a system/API/project is mentioned** — search for known gotchas and patterns
+4. **When making a decision** — search for prior decisions on the same topic
+5. **When the user asks "what did we decide about X?"** — search by meaning
+6. **When you're about to re-discover something** — your memory might already have the answer
+7. **When context feels thin** — search before asking the user
+
+### WHEN TO CAPTURE (do this automatically)
+
+- User says "remember this", "I decided", "key decision", "note to self"
+- User corrects your approach or shows a preference → capture permanently
+- You make a decision with reasoning → capture decision + alternatives rejected
+- You learn something about a person → capture person context
+- You discover a pattern or gotcha → capture as pattern
+- Meeting outcome or conversation is reported → capture key points
+- User says "always do X" or "never do Y" → capture as preference
+
+**Types:** `decision`, `insight`, `person_note`, `meeting`, `idea`, `task`, `reflection`, `preference`, `impression`, `pattern`, `working_memory`
 
 ### How I Use My Memory
 
