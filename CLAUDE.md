@@ -264,9 +264,18 @@ Beads is a graph-based task tracking system. **Beads are the single source of tr
 
 ### Commands (USE THESE — they are how you track work)
 
+**Slash commands (preferred — invoke these skills directly):**
+- `/bead-ready` — **FIRST COMMAND at session start** — show unblocked work
+- `/bead-create <title>` — Create bead BEFORE starting any task
+- `/bead-update <id>` — Update status, priority, labels
+- `/bead-show <id>` — Full details on a specific bead
+- `/bead-list` — List all beads with filters
+- `/bead-link <id> <dep-id>` — Wire dependencies
+
+**CLI equivalents (for scripting or tool calls):**
 ```bash
-beads ready                   # FIRST COMMAND at session start — show unblocked work
-beads create "Task title"     # Create bead BEFORE starting any task
+beads ready                   # Show unblocked work
+beads create "Task title"     # Create bead
 beads update <id> --status in_progress  # Mark when you START working
 beads close <id>              # Mark ONLY when truly complete and verified
 beads depend <id> <dep-id>    # Wire dependencies BEFORE starting work
