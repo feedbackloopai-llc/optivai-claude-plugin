@@ -254,69 +254,92 @@ Low-confidence memories (inferences, impressions) are held more lightly.
 
 ---
 
-## Beads: Task & Dependency Management
+## Beads: Task & Dependency Management — THE SOURCE OF TRUTH
 
-Graph-based task tracking with dependencies, hierarchies, and workflows.
+Beads is a graph-based task tracking system. **Beads are the single source of truth for all task-driven work.** If a bead isn't closed, the task isn't done. Dependencies must be embedded. Status must be kept current. This is non-negotiable.
 
-### Storage Locations
+### Core Principle
 
-- **Global beads:** `~/.claude/beads/` (cross-project, migrated data) - prefix `gzg-`
-- **Project beads:** `.beads/` in project directory - custom prefix via `beads init`
+**A task exists only when it has a bead. A task is complete only when its bead is closed.** No bead = no task. Open bead = work in progress. This is absolute.
 
-### CLI Commands
+### Commands (USE THESE — they are how you track work)
 
 ```bash
-# Project-level beads
-beads init --prefix myproj    # Initialize in current project
-beads create "Task title"     # Create new bead
-beads list                    # List project beads
-beads list --status open      # Filter by status
-beads list --label bugfix     # Filter by label
-beads show <id>               # Show bead details
-beads update <id> --status in_progress
-beads close <id>              # Close completed bead
-beads ready                   # Show unblocked work (key command!)
-beads depend <id> <dep-id>    # Add dependency
-beads label <id> <label>      # Add label
-
-# Global beads (use -g or --global flag)
-beads list -g                 # List global beads
-beads list -g --label migrated # View migrated data
-beads show -g <id>            # Show global bead
-
-# Migration from legacy YAML
-beads migrate --dry-run       # Preview migration
-beads migrate                 # Run migration
+beads ready                   # FIRST COMMAND at session start — show unblocked work
+beads create "Task title"     # Create bead BEFORE starting any task
+beads update <id> --status in_progress  # Mark when you START working
+beads close <id>              # Mark ONLY when truly complete and verified
+beads depend <id> <dep-id>    # Wire dependencies BEFORE starting work
+beads list --status open      # See all open work
+beads show <id>               # Full details on a specific bead
+beads list -g                 # Cross-project global beads
 ```
 
-### Status Flow
+### Status Flow (STRICTLY ENFORCED)
 
 `OPEN` → `IN_PROGRESS` → `DONE` / `CLOSED`
 
-**Ready beads** = `OPEN` + all dependencies `DONE`/`CLOSED`
+- **OPEN**: Created, not yet started
+- **IN_PROGRESS**: Actively being worked on (mark this when you begin)
+- **DONE**: Work complete, pending verification
+- **CLOSED**: Verified complete — the ONLY state that means "finished"
 
-### Automatic Logging (Hooks)
+**Ready beads** = `OPEN` + all dependencies `DONE`/`CLOSED`. Only work on ready beads.
 
-| Hook | Script | What It Logs |
-|------|--------|--------------|
-| `PreToolUse` | `pre-tool-use.py` | Every tool call + auto-creates beads |
-| `UserPromptSubmit` | `user-prompt-submit.py` | Every user message + auto-creates beads |
-| `Stop` | `stop-hook.sh` | Session end cleanup |
+### WHEN TO CREATE BEADS (do this automatically)
 
-**Log Location:** `~/.claude/logs/agent-activity-YYYY-MM-DD.log` (JSONL)
+1. **User gives you a task** → create a bead immediately, before starting work
+2. **Multi-step work** → create a bead for each step with dependencies wired between them
+3. **Bug reported** → create a bead with type=bug
+4. **Feature requested** → create a bead with type=feature
+5. **Subtasks emerge** → create child beads with parent set
+6. **Work is blocked** → create the blocking bead as a dependency
 
-### Auto-Created Beads (beads_writer.py)
+### WHEN TO UPDATE BEADS (do this automatically)
+
+1. **Starting a task** → `beads update <id> --status in_progress`
+2. **Task complete** → `beads close <id>` — ONLY after verification
+3. **New dependency discovered** → `beads depend <id> <dep-id>`
+4. **Task scope changes** → update the bead description
+
+### WHEN TO CHECK BEADS (do this automatically)
+
+1. **Session start** → `beads ready` to see unblocked work
+2. **Before claiming "done"** → verify all related beads are closed
+3. **Before starting new work** → check if there are open beads first
+4. **User asks "what's left?"** → `beads list --status open`
+
+### Dependency Graph Rules
+
+- **Never start a bead whose dependencies are still open** — check `beads ready` first
+- **Wire dependencies BEFORE starting work** — not after
+- **Cross-cutting work gets its own bead** — don't hide subtasks inside a parent
+- **Epics contain children** — use parent/child for hierarchical breakdown
+- **Circular dependencies are impossible** — the system validates and rejects cycles
+
+### Molecules (Workflow Templates)
+
+Molecules are reusable workflow templates that instantiate as dependency-wired bead graphs. Define steps with `## Step: ref`, `Needs: dep1, dep2`, `Tier: sonnet`. When instantiated, each step becomes a bead with dependencies auto-wired.
+
+### Storage
+
+- **Project beads:** `.beads/` in project directory
+- **Global beads:** `~/.claude/beads/` (cross-project)
+- **Format:** JSONL (append-only, git-friendly)
+- **Locking:** FileLock for concurrent safety
+
+### Auto-Created Beads (beads_writer.py hook)
+
+The hook auto-creates beads for significant operations:
 
 | Operation | Auto-Bead? | Notes |
 |-----------|------------|-------|
-| `write` | ✅ Always | File creation |
-| `edit` | ✅ Always | File modification |
-| `task` | ✅ Always | Subagent launches |
-| `bash` | ✅ Filtered | Excludes ls, pwd, git status/diff/log |
-| `user_prompt` | ✅ Filtered | Only prompts > 20 chars |
-| `read/glob/grep` | ❌ Never | Too noisy |
-
-**View auto-created beads:** `beads list -g --label auto`
+| `write` | Always | File creation |
+| `edit` | Always | File modification |
+| `task` | Always | Subagent launches |
+| `bash` | Filtered | Excludes ls, pwd, git status/diff/log |
+| `user_prompt` | Filtered | Only prompts > 20 chars |
+| `read/glob/grep` | Never | Too noisy |
 
 ---
 
