@@ -264,25 +264,20 @@ Beads is a graph-based task tracking system. **Beads are the single source of tr
 
 ### Commands (USE THESE — they are how you track work)
 
-**Slash commands (preferred — invoke these skills directly):**
-- `/bead-ready` — **FIRST COMMAND at session start** — show unblocked work
-- `/bead-create <title>` — Create bead BEFORE starting any task
-- `/bead-update <id>` — Update status, priority, labels
-- `/bead-show <id>` — Full details on a specific bead
-- `/bead-list` — List all beads with filters
-- `/bead-link <id> <dep-id>` — Wire dependencies
-
-**CLI equivalents (for scripting or tool calls):**
+**CLI via Bash tool (use automatically — no user prompt needed):**
+Call these via Bash tool in your tool loop. They execute automatically.
 ```bash
-beads ready                   # Show unblocked work
-beads create "Task title"     # Create bead
-beads update <id> --status in_progress  # Mark when you START working
-beads close <id>              # Mark ONLY when truly complete and verified
-beads depend <id> <dep-id>    # Wire dependencies BEFORE starting work
-beads list --status open      # See all open work
-beads show <id>               # Full details on a specific bead
-beads list -g                 # Cross-project global beads
+beads ready                   # CALL AT SESSION START automatically
+beads create "Task title"     # CALL BEFORE starting any task automatically
+beads update <id> --status in_progress  # CALL when you begin work
+beads close <id>              # CALL when task is verified complete
+beads depend <id> <dep-id>    # CALL when you discover dependencies
+beads list --status open      # CALL when checking open work
+beads show <id>               # CALL for full details on a bead
 ```
+
+**User-facing slash commands (when the user wants manual control):**
+`/bead-ready`, `/bead-create`, `/bead-update`, `/bead-show`, `/bead-list`, `/bead-link`
 
 ### Status Flow (STRICTLY ENFORCED)
 
