@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-04-18
+
+### Changed — OptivAI Rebrand & Consolidation
+- **Complete GrowthZone IP removal** — stripped all GZ credentials, infrastructure refs, branding
+- **Beads prefix** — `gz`/`gzg` → `optivai`/`optivai-g`
+- **Plugin manifest** — renamed to `optivai-claude-plugin` v2.0.0
+- **Settings.json** — removed GZ MCP server, fixed till_done.py hook path
+- **Auto-logger config** — sanitized, uses DATABASE_URL env var (Neon PostgreSQL)
+
+### Added
+- **37 commands** (up from 24) — added brain-*, bead-*, tana, db-connect, connect-jira, and more
+- **Deterministic brain instructions** — concrete auto-search/capture triggers in CLAUDE.md
+- **Beads source-of-truth doctrine** — "a task exists only when it has a bead" instructions
+- **Keychain-based secrets** — ZAI_API_KEY, DATABASE_URL, ANTHROPIC_API_KEY all via macOS Keychain
+
+### Security
+- **IP scrub** — removed WRA18224, CHRIS_HUGHES, micronetonline, PartitionKey=36495, DW_DEV_STREAM, christopherhughesgz from all files
+- **No plaintext secrets** in any committed files
+
+---
+
 ## [1.2.0] - 2025-12-09
 
 ### Added

@@ -7,7 +7,7 @@ Beads is the next-generation knowledge management system for Claude Code, replac
 - **Graph-based tracking**: Issues (beads) with dependencies, hierarchies, and relationships
 - **Molecule workflows**: Reusable workflow templates that instantiate as issue graphs
 - **Hybrid storage**: Project-level + global beads for flexible organization
-- **PostgreSQL sync**: All bead events flow to The Well for analytics
+- **PostgreSQL sync**: All bead events flow to PostgreSQL for analytics
 - **Better deduplication**: Content hashing prevents duplicate entries
 
 ## Prerequisites
