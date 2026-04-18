@@ -30,11 +30,11 @@ class BeadsManager:
         # Initialize databases
         self.project_db = BeadsDatabase(
             self.project_dir / ".beads",
-            prefix="gz"
+            prefix="optivai"
         )
         self.global_db = BeadsDatabase(
             self.global_beads_dir,
-            prefix="gzg"  # gz-global
+            prefix="optivai-g"  # optivai-global
         )
 
         # Cross-database links stored in global
