@@ -443,6 +443,37 @@ def capture(
     }
 
 
+STOP_WORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to",
+    "for", "of", "with", "by", "and", "or", "but", "not", "this", "that",
+    "it", "i", "we", "they", "my", "our",
+})
+
+
+def _extract_keywords(query: str, max_keywords: int = 5) -> List[str]:
+    """Extract meaningful keywords from a query string.
+
+    Splits the query into words, removes stop words and short tokens,
+    and returns up to max_keywords unique lowercased keywords.
+    """
+    words = query.lower().split()
+    seen: set = set()
+    keywords: List[str] = []
+    for word in words:
+        # Strip punctuation from edges
+        cleaned = word.strip(".,!?;:\"'()[]{}")
+        if not cleaned or len(cleaned) < 2:
+            continue
+        if cleaned in STOP_WORDS:
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            keywords.append(cleaned)
+        if len(keywords) >= max_keywords:
+            break
+    return keywords
+
+
 def search(
     conn,
     query: str,
@@ -450,35 +481,109 @@ def search(
     limit: int = DEFAULT_SEARCH_LIMIT,
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     sort_by: str = "similarity",
+    thought_type: Optional[str] = None,
+    topics: Optional[List[str]] = None,
+    people: Optional[List[str]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Semantic search across user's thoughts using vector similarity."""
+    """Hybrid search across user's thoughts using vector similarity, keyword boost, and time decay.
+
+    Combines three scoring signals:
+      - vec_similarity (weight 0.85): pgvector cosine similarity
+      - keyword_boost (weight 0.10): fraction of query keywords found in raw_text/summary
+      - time_decay (weight 0.05): recency bonus decaying to 0 over 90 days
+
+    Supports metadata filters: thought_type, topics (OR), people (OR), date_from, date_to.
+    All new parameters are Optional with None defaults for backward compatibility.
+    """
     cur = conn.cursor()
 
     # Generate query embedding locally
     query_embedding = _generate_embedding(query)
 
-    order_clause = "similarity DESC" if sort_by != "time" else "created_at ASC"
+    # Extract keywords for keyword boost scoring
+    keywords = _extract_keywords(query)
+
+    # Build keyword boost SQL expression
+    if keywords:
+        keyword_cases = []
+        keyword_params: List[str] = []
+        for kw in keywords:
+            keyword_cases.append(
+                "CASE WHEN raw_text ILIKE %s OR summary ILIKE %s THEN 1 ELSE 0 END"
+            )
+            pattern = f"%{kw}%"
+            keyword_params.extend([pattern, pattern])
+        keyword_boost_expr = f"({' + '.join(keyword_cases)}) / {float(len(keywords))}"
+    else:
+        keyword_boost_expr = "0.0"
+        keyword_params = []
+
+    # Build dynamic WHERE clauses and params
+    where_clauses = ["user_id = %s", "embedding IS NOT NULL"]
+    where_params: List[Any] = [user_id]
+
+    if thought_type is not None:
+        where_clauses.append("thought_type = %s")
+        where_params.append(thought_type)
+
+    if topics is not None and len(topics) > 0:
+        # JSONB array containment: match if ANY topic is in the array
+        topic_conditions = ["topics @> %s::jsonb" for _ in topics]
+        where_clauses.append("(" + " OR ".join(topic_conditions) + ")")
+        where_params.extend([json.dumps([t]) for t in topics])
+
+    if people is not None and len(people) > 0:
+        people_conditions = ["people @> %s::jsonb" for _ in people]
+        where_clauses.append("(" + " OR ".join(people_conditions) + ")")
+        where_params.extend([json.dumps([p]) for p in people])
+
+    if date_from is not None:
+        where_clauses.append("created_at >= %s::date")
+        where_params.append(date_from)
+
+    if date_to is not None:
+        where_clauses.append("created_at <= (%s::date + INTERVAL '1 day')")
+        where_params.append(date_to)
+
+    where_sql = " AND ".join(where_clauses)
+
+    order_clause = "hybrid_score DESC" if sort_by != "time" else "created_at ASC"
 
     search_sql = f"""
-        SELECT
-            thought_id,
-            raw_text,
-            summary,
-            thought_type,
-            topics,
-            people,
-            action_items,
-            source,
-            project,
-            created_at,
-            1 - (embedding <=> %s::vector) AS similarity
-        FROM {TABLE}
-        WHERE user_id = %s
-          AND embedding IS NOT NULL
+        WITH scored AS (
+            SELECT
+                thought_id,
+                raw_text,
+                summary,
+                thought_type,
+                topics,
+                people,
+                action_items,
+                source,
+                project,
+                created_at,
+                1 - (embedding <=> %s::vector) AS vec_similarity,
+                {keyword_boost_expr} AS keyword_boost,
+                GREATEST(0, 1.0 - EXTRACT(EPOCH FROM (NOW() - GREATEST(created_at, COALESCE(updated_at, created_at)))) / (90 * 86400.0)) AS time_decay
+            FROM {TABLE}
+            WHERE {where_sql}
+        )
+        SELECT *,
+            (vec_similarity * 0.85) + (keyword_boost * 0.10) + (time_decay * 0.05) AS hybrid_score
+        FROM scored
         ORDER BY {order_clause}
         LIMIT %s
     """
-    cur.execute(search_sql, (str(query_embedding), user_id, limit))
+
+    # Assemble all params in order: embedding, keyword patterns, where params, limit
+    params: list = [str(query_embedding)]
+    params.extend(keyword_params)
+    params.extend(where_params)
+    params.append(limit)
+
+    cur.execute(search_sql, params)
     columns = [desc[0] for desc in cur.description]
     rows = cur.fetchall()
     cur.close()
@@ -486,18 +591,102 @@ def search(
     results = []
     for row in rows:
         d = dict(zip(columns, row))
-        sim = d.get("similarity", 0)
-        if sim is not None and float(sim) >= threshold:
+        hybrid = d.get("hybrid_score", 0)
+        vec_sim = d.get("vec_similarity", 0)
+        if vec_sim is not None and float(vec_sim) >= threshold:
             d["created_at"] = str(d["created_at"]) if d.get("created_at") else ""
             d["topics"] = _parse_array(d.get("topics"))
             d["people"] = _parse_array(d.get("people"))
             d["action_items"] = _parse_array(d.get("action_items"))
-            d["similarity"] = round(float(sim), 4)
+            d["similarity"] = round(float(vec_sim), 4)
+            d["hybrid_score"] = round(float(hybrid), 4) if hybrid is not None else 0.0
+            d["keyword_boost"] = round(float(d.get("keyword_boost", 0)), 4)
+            d["time_decay"] = round(float(d.get("time_decay", 0)), 4)
+            # Remove intermediate columns not needed in output
+            d.pop("vec_similarity", None)
             # Normalize to uppercase keys for compatibility with formatters/Pi bridge
             d = {k.upper(): v for k, v in d.items()}
             results.append(d)
 
     return results
+
+
+def graph_search(
+    conn,
+    query: str,
+    user_id: str,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    sort_by: str = "similarity",
+    thought_type: Optional[str] = None,
+    topics: Optional[List[str]] = None,
+    people: Optional[List[str]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Graph-based search across user's thoughts.
+
+    Currently delegates to the hybrid search() function. Will be extended with
+    real graph traversal once the graph tables (brain.edges, brain.clusters) exist.
+    """
+    return search(
+        conn,
+        query=query,
+        user_id=user_id,
+        limit=limit,
+        threshold=threshold,
+        sort_by=sort_by,
+        thought_type=thought_type,
+        topics=topics,
+        people=people,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+def admin_stats(conn) -> Dict[str, Any]:
+    """Return admin-level statistics: total thoughts, user count, and per-user breakdown.
+
+    This function is not user-scoped -- it returns aggregate stats across all users.
+    """
+    cur = conn.cursor()
+
+    # Total thoughts
+    cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
+    total_thoughts = cur.fetchone()[0]
+
+    # Distinct users
+    cur.execute(f"SELECT COUNT(DISTINCT user_id) FROM {TABLE}")
+    user_count = cur.fetchone()[0]
+
+    # Per-user breakdown
+    cur.execute(f"""
+        SELECT
+            user_id,
+            COUNT(*) AS thought_count,
+            COUNT(DISTINCT thought_type) AS distinct_types,
+            MIN(created_at) AS first_thought,
+            MAX(created_at) AS last_thought
+        FROM {TABLE}
+        GROUP BY user_id
+        ORDER BY thought_count DESC
+    """)
+    columns = [desc[0] for desc in cur.description]
+    rows = cur.fetchall()
+    cur.close()
+
+    per_user = []
+    for row in rows:
+        d = dict(zip(columns, row))
+        d["first_thought"] = str(d["first_thought"]) if d.get("first_thought") else ""
+        d["last_thought"] = str(d["last_thought"]) if d.get("last_thought") else ""
+        per_user.append(d)
+
+    return {
+        "total_thoughts": total_thoughts,
+        "user_count": user_count,
+        "per_user": per_user,
+    }
 
 
 def recent(
@@ -676,15 +865,16 @@ def _format_search_results(results: List[Dict], sort_by: str = "similarity") -> 
         return "No matching thoughts found."
     lines = [f"Found {len(results)} matching thought(s):\n"]
     for i, r in enumerate(results, 1):
+        hybrid = r.get("HYBRID_SCORE", 0)
         sim = r.get("SIMILARITY", 0)
         summary = r.get("SUMMARY") or r.get("RAW_TEXT", "")[:100]
         if sort_by == "time":
             date = r.get("CREATED_AT", "")[:19]
             lines.append(f"{i}. [{date}] {summary}")
-            lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  {sim:.0%} match")
+            lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  hybrid={hybrid:.0%}  vec={sim:.0%}")
         else:
-            lines.append(f"{i}. [{sim:.0%} match] {summary}")
-            lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  {r.get('CREATED_AT', '')[:19]}")
+            lines.append(f"{i}. [{hybrid:.0%} hybrid] {summary}")
+            lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  vec={sim:.0%}  |  {r.get('CREATED_AT', '')[:19]}")
         topics = r.get("TOPICS", [])
         if topics:
             lines.append(f"   Topics: {', '.join(str(t) for t in topics)}")
@@ -779,8 +969,31 @@ def _run_from_pi():
                 limit=args.get("limit", DEFAULT_SEARCH_LIMIT),
                 threshold=args.get("threshold", DEFAULT_SIMILARITY_THRESHOLD),
                 sort_by=args.get("sort_by", "similarity"),
+                thought_type=args.get("thought_type"),
+                topics=args.get("topics"),
+                people=args.get("people"),
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
             )
             print(json.dumps(results, default=str))
+        elif op == "graph_search":
+            results = graph_search(
+                conn,
+                query=args.get("query", ""),
+                user_id=user_id,
+                limit=args.get("limit", DEFAULT_SEARCH_LIMIT),
+                threshold=args.get("threshold", DEFAULT_SIMILARITY_THRESHOLD),
+                sort_by=args.get("sort_by", "similarity"),
+                thought_type=args.get("thought_type"),
+                topics=args.get("topics"),
+                people=args.get("people"),
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
+            )
+            print(json.dumps(results, default=str))
+        elif op == "admin_stats":
+            result = admin_stats(conn)
+            print(json.dumps(result, default=str))
         elif op == "timeline":
             results = timeline(
                 conn,
