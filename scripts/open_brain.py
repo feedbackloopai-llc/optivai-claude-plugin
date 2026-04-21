@@ -433,6 +433,11 @@ def capture(
     conn.commit()
     cur.close()
 
+    # Incrementally update knowledge graph with extracted metadata
+    _update_graph_incremental(
+        conn, thought_id, summary, thought_type, topics, people, project, user_id
+    )
+
     return {
         "thought_id": thought_id,
         "summary": summary,
@@ -441,6 +446,131 @@ def capture(
         "people": people,
         "action_items": action_items,
     }
+
+
+def _update_graph_incremental(
+    conn,
+    thought_id: str,
+    summary: str,
+    thought_type: str,
+    topics: List[str],
+    people: List[str],
+    project: str,
+    user_id: str,
+) -> None:
+    """Populate knowledge graph nodes and edges after a thought is captured.
+
+    Creates/upserts nodes for the thought, its topics, people, and project,
+    then wires edges between them. Failures are logged but never raised —
+    graph update must not block the capture path.
+    """
+    try:
+        cur = conn.cursor()
+
+        # ── 1. Thought node ──────────────────────────────────────────────
+        thought_nk = f"thought:{thought_id}"
+        cur.execute(
+            """
+            INSERT INTO brain.knowledge_graph_nodes
+                   (node_nk, node_type, name, user_id, source_thought_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (node_nk, user_id) DO UPDATE SET updated_at = NOW()
+            RETURNING node_id
+            """,
+            (thought_nk, "thought", summary[:200], user_id, thought_id),
+        )
+        thought_node_id = cur.fetchone()[0]
+
+        # ── 2. Topic nodes + TAGGED_WITH edges ──────────────────────────
+        for topic in (topics or []):
+            topic_lower = topic.lower().replace(" ", "_")
+            topic_nk = f"topic:{topic_lower}"
+            cur.execute(
+                """
+                INSERT INTO brain.knowledge_graph_nodes
+                       (node_nk, node_type, name, user_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (node_nk, user_id) DO UPDATE SET updated_at = NOW()
+                RETURNING node_id
+                """,
+                (topic_nk, "topic", topic, user_id),
+            )
+            topic_node_id = cur.fetchone()[0]
+
+            edge_id = f"{user_id}|thought:{thought_id}|TAGGED_WITH|topic:{topic_lower}"
+            cur.execute(
+                """
+                INSERT INTO brain.knowledge_graph_edges
+                       (edge_id, source_node, target_node, edge_type, user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (edge_id) DO NOTHING
+                """,
+                (edge_id, thought_node_id, topic_node_id, "TAGGED_WITH", user_id),
+            )
+
+        # ── 3. Person nodes + MENTIONED_BY edges ────────────────────────
+        for person in (people or []):
+            person_lower = person.lower().replace(" ", "_")
+            person_nk = f"person:{person_lower}"
+            cur.execute(
+                """
+                INSERT INTO brain.knowledge_graph_nodes
+                       (node_nk, node_type, name, user_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (node_nk, user_id) DO UPDATE SET updated_at = NOW()
+                RETURNING node_id
+                """,
+                (person_nk, "person", person, user_id),
+            )
+            person_node_id = cur.fetchone()[0]
+
+            edge_id = f"{user_id}|person:{person_lower}|MENTIONED_BY|thought:{thought_id}"
+            cur.execute(
+                """
+                INSERT INTO brain.knowledge_graph_edges
+                       (edge_id, source_node, target_node, edge_type, user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (edge_id) DO NOTHING
+                """,
+                (edge_id, person_node_id, thought_node_id, "MENTIONED_BY", user_id),
+            )
+
+        # ── 4. Project node + RELATED_TO_PROJECT edge ───────────────────
+        if project:
+            project_lower = project.lower()
+            project_nk = f"project:{project_lower}"
+            cur.execute(
+                """
+                INSERT INTO brain.knowledge_graph_nodes
+                       (node_nk, node_type, name, user_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (node_nk, user_id) DO UPDATE SET updated_at = NOW()
+                RETURNING node_id
+                """,
+                (project_nk, "project", project, user_id),
+            )
+            project_node_id = cur.fetchone()[0]
+
+            edge_id = f"{user_id}|thought:{thought_id}|RELATED_TO_PROJECT|project:{project_lower}"
+            cur.execute(
+                """
+                INSERT INTO brain.knowledge_graph_edges
+                       (edge_id, source_node, target_node, edge_type, user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (edge_id) DO NOTHING
+                """,
+                (edge_id, thought_node_id, project_node_id, "RELATED_TO_PROJECT", user_id),
+            )
+
+        conn.commit()
+        cur.close()
+
+    except Exception as e:
+        logger.warning(f"Knowledge graph update failed for thought {thought_id}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 STOP_WORDS = frozenset({
@@ -608,6 +738,26 @@ def search(
             d = {k.upper(): v for k, v in d.items()}
             results.append(d)
 
+    # ── Memory reinforcement: touch updated_at on accessed thoughts ──
+    # This resets the time_decay clock, making frequently-accessed memories
+    # stay "fresh" longer. The more you recall a memory, the more it persists.
+    if results:
+        try:
+            accessed_ids = [r["THOUGHT_ID"] for r in results]
+            reinforce_cur = conn.cursor()
+            placeholders = ",".join(["%s"] * len(accessed_ids))
+            reinforce_cur.execute(
+                f"UPDATE {TABLE} SET updated_at = NOW() WHERE thought_id IN ({placeholders}) AND user_id = %s",
+                accessed_ids + [user_id],
+            )
+            conn.commit()
+            reinforce_cur.close()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
     return results
 
 
@@ -623,18 +773,30 @@ def graph_search(
     people: Optional[List[str]] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    graph_hops: int = 2,
+    graph_weight: float = 0.15,
 ) -> List[Dict[str, Any]]:
-    """Graph-based search across user's thoughts.
+    """Graph-augmented search: hybrid search seeds expanded via knowledge graph traversal.
 
-    Currently delegates to the hybrid search() function. Will be extended with
-    real graph traversal once the graph tables (brain.edges, brain.clusters) exist.
+    Algorithm:
+      1. Run hybrid search with relaxed parameters to get seed results.
+      2. For the top seed results, look up their graph nodes and find N-hop neighbors.
+      3. Collect thought_ids from neighbor nodes of type 'thought'.
+      4. Fetch those thoughts from the database.
+      5. Merge with seed results, deduplicating by thought_id.
+      6. Re-score: graph-discovered thoughts get a graph_weight boost.
+      7. Sort by final score and return top `limit` results.
+
+    Falls back gracefully to regular search if graph tables are empty or on any
+    graph-related error.
     """
-    return search(
+    # Step 1: Get seed results from hybrid search (fetch more, with lower threshold)
+    seeds = search(
         conn,
         query=query,
         user_id=user_id,
-        limit=limit,
-        threshold=threshold,
+        limit=limit * 3,
+        threshold=threshold * 0.7,
         sort_by=sort_by,
         thought_type=thought_type,
         topics=topics,
@@ -642,6 +804,192 @@ def graph_search(
         date_from=date_from,
         date_to=date_to,
     )
+
+    if not seeds:
+        return seeds
+
+    # Build a lookup of seed results by thought_id for deduplication and merging
+    seed_by_id: Dict[str, Dict[str, Any]] = {}
+    for s in seeds:
+        tid = s.get("THOUGHT_ID")
+        if tid:
+            seed_by_id[tid] = s
+
+    # Step 2-3: Expand top seeds through the knowledge graph
+    graph_thought_ids: Dict[str, int] = {}  # thought_id -> min_depth from any seed
+    try:
+        cur = conn.cursor()
+
+        # Check if the knowledge graph tables exist and have data
+        cur.execute(
+            "SELECT COUNT(*) FROM brain.knowledge_graph_nodes WHERE user_id = %s LIMIT 1",
+            (user_id,),
+        )
+        node_count = cur.fetchone()[0]
+        if node_count == 0:
+            cur.close()
+            return seeds[:limit]
+
+        # Collect node_ids for the top seeds (limit expansion to top 5 for performance)
+        top_seed_ids = list(seed_by_id.keys())[:5]
+        if not top_seed_ids:
+            cur.close()
+            return seeds[:limit]
+
+        # Batch lookup: find graph node_ids for all top seed thoughts at once
+        seed_node_nks = [f"thought:{tid}" for tid in top_seed_ids]
+        nk_placeholders = ",".join(["%s"] * len(seed_node_nks))
+        cur.execute(
+            f"""SELECT node_id, node_nk
+                FROM brain.knowledge_graph_nodes
+                WHERE node_nk IN ({nk_placeholders})
+                  AND user_id = %s
+                  AND lifecycle_status = 'active'""",
+            seed_node_nks + [user_id],
+        )
+        seed_node_rows = cur.fetchall()
+
+        if not seed_node_rows:
+            cur.close()
+            return seeds[:limit]
+
+        # For each seed node, expand neighborhood and collect thought node IDs
+        for graph_node_id, _node_nk in seed_node_rows:
+            cur.execute(
+                "SELECT node_id, node_nk, node_type, name, min_depth "
+                "FROM brain.kg_neighborhood(%s, %s, %s)",
+                (graph_node_id, user_id, graph_hops),
+            )
+            for neighbor_row in cur.fetchall():
+                n_node_id, n_node_nk, n_node_type, n_name, n_min_depth = neighbor_row
+
+                # Extract thought_id from thought-type nodes (node_nk = "thought:<id>")
+                if n_node_type == "thought" and n_node_nk and n_node_nk.startswith("thought:"):
+                    connected_tid = n_node_nk[len("thought:"):]
+                    if connected_tid not in graph_thought_ids or n_min_depth < graph_thought_ids[connected_tid]:
+                        graph_thought_ids[connected_tid] = n_min_depth
+
+                # Non-thought nodes may have source_thought_id linking back to a thought
+                if n_node_type != "thought":
+                    cur.execute(
+                        "SELECT source_thought_id FROM brain.knowledge_graph_nodes "
+                        "WHERE node_id = %s AND source_thought_id IS NOT NULL AND user_id = %s",
+                        (n_node_id, user_id),
+                    )
+                    src_row = cur.fetchone()
+                    if src_row and src_row[0]:
+                        src_tid = src_row[0]
+                        if src_tid not in graph_thought_ids or n_min_depth < graph_thought_ids[src_tid]:
+                            graph_thought_ids[src_tid] = n_min_depth
+
+        # Step 3: Identify graph-discovered thoughts NOT already in seed results
+        new_thought_ids = [tid for tid in graph_thought_ids if tid not in seed_by_id]
+
+        graph_results: List[Dict[str, Any]] = []
+        if new_thought_ids:
+            # Batch fetch new thoughts from the thoughts table
+            id_placeholders = ",".join(["%s"] * len(new_thought_ids))
+
+            # Apply the same metadata filters as the original search
+            extra_where = ""
+            extra_params: List[Any] = []
+            if thought_type is not None:
+                extra_where += " AND thought_type = %s"
+                extra_params.append(thought_type)
+            if date_from is not None:
+                extra_where += " AND created_at >= %s::date"
+                extra_params.append(date_from)
+            if date_to is not None:
+                extra_where += " AND created_at <= (%s::date + INTERVAL '1 day')"
+                extra_params.append(date_to)
+
+            fetch_sql = f"""
+                SELECT
+                    thought_id, raw_text, summary, thought_type,
+                    topics, people, action_items, source, project, created_at
+                FROM {TABLE}
+                WHERE thought_id IN ({id_placeholders})
+                  AND user_id = %s
+                  {extra_where}
+            """
+            fetch_params: list = list(new_thought_ids) + [user_id] + extra_params
+            cur.execute(fetch_sql, fetch_params)
+            columns = [desc[0] for desc in cur.description]
+            for row in cur.fetchall():
+                d = dict(zip(columns, row))
+                tid = d["thought_id"]
+                d["created_at"] = str(d["created_at"]) if d.get("created_at") else ""
+                d["topics"] = _parse_array(d.get("topics"))
+                d["people"] = _parse_array(d.get("people"))
+                d["action_items"] = _parse_array(d.get("action_items"))
+
+                # Apply topic and people filters in-memory (JSONB array checks
+                # are awkward to batch alongside an IN clause)
+                if topics is not None and len(topics) > 0:
+                    thought_topics = [t.lower() for t in d["topics"]]
+                    if not any(t.lower() in thought_topics for t in topics):
+                        continue
+                if people is not None and len(people) > 0:
+                    thought_people = [p.lower() for p in d["people"]]
+                    if not any(p.lower() in thought_people for p in people):
+                        continue
+
+                # Score graph-discovered thoughts by proximity:
+                # closer hops = higher contribution, scaled by graph_weight
+                depth = graph_thought_ids.get(tid, graph_hops)
+                proximity_score = max(0.0, 1.0 - (depth / (graph_hops + 1)))
+                d["similarity"] = 0.0
+                d["hybrid_score"] = round(proximity_score * graph_weight, 4)
+                d["keyword_boost"] = 0.0
+                d["time_decay"] = 0.0
+                d["graph_depth"] = depth
+                d["graph_source"] = True
+
+                d = {k.upper(): v for k, v in d.items()}
+                graph_results.append(d)
+
+        cur.close()
+
+        # Step 4: Merge seed results with graph-discovered results
+        # Seeds that also appear in the graph get a proximity boost
+        merged: List[Dict[str, Any]] = []
+        for s in seeds:
+            tid = s.get("THOUGHT_ID")
+            if tid and tid in graph_thought_ids:
+                depth = graph_thought_ids[tid]
+                proximity_bonus = max(0.0, 1.0 - (depth / (graph_hops + 1))) * graph_weight
+                boosted_score = s.get("HYBRID_SCORE", 0.0) + proximity_bonus
+                s = dict(s)  # copy to avoid mutating the original
+                s["HYBRID_SCORE"] = round(boosted_score, 4)
+                s["GRAPH_DEPTH"] = depth
+                s["GRAPH_SOURCE"] = False  # was already a seed, just boosted
+            merged.append(s)
+
+        # Add graph-only results
+        merged.extend(graph_results)
+
+        # Sort by final hybrid_score descending
+        merged.sort(key=lambda r: r.get("HYBRID_SCORE", 0.0), reverse=True)
+
+        # Apply threshold filter: seed results must meet similarity threshold,
+        # graph-discovered results are kept (they passed proximity threshold)
+        final: List[Dict[str, Any]] = []
+        for r in merged:
+            if r.get("GRAPH_SOURCE"):
+                final.append(r)
+            else:
+                sim = r.get("SIMILARITY", 0.0)
+                if sim >= threshold:
+                    final.append(r)
+            if len(final) >= limit:
+                break
+
+        return final
+
+    except Exception as e:
+        # Graph expansion failed -- fall back gracefully to seed results
+        logger.warning(f"Graph search expansion failed ({e}), falling back to hybrid search")
+        return seeds[:limit]
 
 
 def admin_stats(conn) -> Dict[str, Any]:
@@ -882,6 +1230,59 @@ def _format_search_results(results: List[Dict], sort_by: str = "similarity") -> 
     return "\n".join(lines)
 
 
+def _format_graph_search_results(results: List[Dict], sort_by: str = "similarity") -> str:
+    """Format graph search results, showing graph connection info where present."""
+    if not results:
+        return "No matching thoughts found."
+
+    graph_count = sum(1 for r in results if r.get("GRAPH_SOURCE"))
+    boosted_count = sum(1 for r in results if r.get("GRAPH_DEPTH") is not None and not r.get("GRAPH_SOURCE"))
+    header = f"Found {len(results)} thought(s)"
+    if graph_count > 0 or boosted_count > 0:
+        parts = []
+        if graph_count > 0:
+            parts.append(f"{graph_count} via graph")
+        if boosted_count > 0:
+            parts.append(f"{boosted_count} graph-boosted")
+        header += f" ({', '.join(parts)})"
+    lines = [header + ":\n"]
+
+    for i, r in enumerate(results, 1):
+        hybrid = r.get("HYBRID_SCORE", 0)
+        sim = r.get("SIMILARITY", 0)
+        summary = r.get("SUMMARY") or r.get("RAW_TEXT", "")[:100]
+        is_graph_source = r.get("GRAPH_SOURCE", False)
+        graph_depth = r.get("GRAPH_DEPTH")
+
+        # Build the score tag
+        if is_graph_source:
+            score_tag = f"graph@{graph_depth}hop"
+        elif graph_depth is not None:
+            score_tag = f"{hybrid:.0%} hybrid+graph@{graph_depth}hop"
+        elif sort_by == "time":
+            score_tag = r.get("CREATED_AT", "")[:19]
+        else:
+            score_tag = f"{hybrid:.0%} hybrid"
+
+        lines.append(f"{i}. [{score_tag}] {summary}")
+
+        # Detail line
+        detail_parts = [f"Type: {r.get('THOUGHT_TYPE', '?')}"]
+        if not is_graph_source:
+            detail_parts.append(f"vec={sim:.0%}")
+        if graph_depth is not None:
+            detail_parts.append(f"depth={graph_depth}")
+        detail_parts.append(r.get("CREATED_AT", "")[:19])
+        lines.append(f"   {'  |  '.join(detail_parts)}")
+
+        topics = r.get("TOPICS", [])
+        if topics:
+            lines.append(f"   Topics: {', '.join(str(t) for t in topics)}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _format_timeline_results(results: List[Dict], topic: str) -> str:
     if not results:
         return f"No thoughts found for topic: {topic}"
@@ -989,6 +1390,8 @@ def _run_from_pi():
                 people=args.get("people"),
                 date_from=args.get("date_from"),
                 date_to=args.get("date_to"),
+                graph_hops=args.get("graph_hops", 2),
+                graph_weight=args.get("graph_weight", 0.15),
             )
             print(json.dumps(results, default=str))
         elif op == "admin_stats":
