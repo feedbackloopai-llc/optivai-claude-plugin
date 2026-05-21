@@ -50,6 +50,35 @@ CREATE INDEX IF NOT EXISTS idx_thoughts_generated_by
 -- For small datasets (<10k rows), exact search is fine. Add this later:
 -- CREATE INDEX IF NOT EXISTS idx_thoughts_embedding ON thoughts USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 
+-- ============================================================================
+-- RB primitive (brain-W1-S4): versioning substrate for snapshot/rollback/diff
+-- See sql/migrations/2026-05-21-rb-versions.sql for the migration version.
+-- W3C PROV-DM 1.3 conformant at the version level (per-snapshot PROV event).
+-- ON DELETE CASCADE: forgetting a thought (VF_eps) removes its versions too.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS thought_versions (
+    version_id      BIGSERIAL         NOT NULL PRIMARY KEY,
+    thought_id      VARCHAR(64)       NOT NULL REFERENCES thoughts(thought_id) ON DELETE CASCADE,
+    revision        INTEGER           NOT NULL,
+    raw_text        TEXT              NOT NULL,
+    summary         VARCHAR(1000),
+    thought_type    VARCHAR(50),
+    topics          JSONB,
+    people          JSONB,
+    action_items    JSONB,
+    embedding       vector(768),
+    metadata        JSONB,
+    prov_agent      VARCHAR(100)      NOT NULL,
+    prov_activity   VARCHAR(50)       NOT NULL,
+    parent_version  BIGINT            REFERENCES thought_versions(version_id),
+    diff_json       JSONB,
+    created_at      TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
+    UNIQUE (thought_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_thought_versions_thought ON thought_versions (thought_id, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_thought_versions_created ON thought_versions (created_at DESC);
+
 -- Landing schema for activity logs
 CREATE SCHEMA IF NOT EXISTS landing;
 
