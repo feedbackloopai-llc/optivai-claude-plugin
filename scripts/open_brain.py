@@ -31,6 +31,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
+import jsonpatch
+
 logger = logging.getLogger("open_brain")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -401,6 +403,407 @@ def _generate_activity_id(thought_id: str) -> str:
     a separate ``brain.activities`` row.
     """
     return f"activity-{thought_id}"
+
+
+# ─── RB primitive: snapshot / list_versions / rollback / diff_versions ───────
+#
+# brain-W1-S5. The substrate (brain.thought_versions) was created by S4.
+# These four helpers operate on it.
+#
+# CRITICAL LOAD-BEARING INVARIANT (Lin/Li/Chen 2026 §12.1):
+#
+#     rollback_thought() creates NEW history. It does NOT rewrite.
+#
+# Given a thought with revisions [1, 2, 3], `rollback(tid, to_revision=1)`
+# produces revisions [1, 2, 3, 4] where revision 4 has the content of
+# revision 1, prov_activity='rollback', and parent_version pointing at
+# the version_id of revision 1. Revisions 2 and 3 remain in history.
+#
+# See tests/test_rb_cli.py::TestRollbackCreatesNewHistory for the
+# anchoring assertion.
+
+
+def snapshot_thought(
+    conn,
+    thought_id: str,
+    user_id: str,
+    prov_agent: Optional[str] = None,
+    prov_activity: str = "snapshot",
+) -> Dict[str, Any]:
+    """Create a new ``brain.thought_versions`` row capturing the current state of
+    ``thought_id``.
+
+    Auto-increments revision (highest existing revision + 1, or 1 if no
+    versions yet). Computes an RFC 6902 JSON Patch from the previous version
+    to the current state when one exists (the diff is stored on the new row,
+    representing prev → current). PS scoping is enforced: raises
+    :class:`RuntimeError` if ``thought_id`` is not in ``user_id``'s scope.
+
+    Returns
+    -------
+    dict
+        ``{"version_id": int, "revision": int, "thought_id": str}``
+    """
+    cur = conn.cursor()
+
+    # PS scope check + fetch current thought state
+    cur.execute(
+        """
+        SELECT raw_text, summary, thought_type, topics, people, action_items,
+               embedding, metadata
+        FROM brain.thoughts
+        WHERE thought_id = %s AND user_id = %s
+        """,
+        (thought_id, user_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        raise RuntimeError(
+            f"snapshot_thought: thought {thought_id} not in user scope "
+            f"(user={user_id})"
+        )
+    raw_text, summary, thought_type, topics, people, action_items, embedding, metadata = row
+
+    # Determine next revision + previous version state (for diff).
+    cur.execute(
+        """
+        SELECT version_id, revision, raw_text, summary, thought_type,
+               topics, people, action_items, metadata
+        FROM brain.thought_versions
+        WHERE thought_id = %s
+        ORDER BY revision DESC
+        LIMIT 1
+        """,
+        (thought_id,),
+    )
+    prev = cur.fetchone()
+    next_revision = (prev[1] + 1) if prev else 1
+    parent_version = prev[0] if prev else None
+
+    # Compute RFC 6902 diff from prev to current. Embedding vectors are
+    # not diffed (cosine-similarity noise; vector diff is a no-op).
+    diff_json = None
+    if prev:
+        prev_state = {
+            "raw_text": prev[2],
+            "summary": prev[3],
+            "thought_type": prev[4],
+            "topics": prev[5],
+            "people": prev[6],
+            "action_items": prev[7],
+            "metadata": prev[8],
+        }
+        curr_state = {
+            "raw_text": raw_text,
+            "summary": summary,
+            "thought_type": thought_type,
+            "topics": topics,
+            "people": people,
+            "action_items": action_items,
+            "metadata": metadata,
+        }
+        patch = jsonpatch.make_patch(prev_state, curr_state)
+        diff_json = patch.patch
+
+    if prov_agent is None:
+        prov_agent = _derive_prov_agent("manual", user_id)
+
+    cur.execute(
+        """
+        INSERT INTO brain.thought_versions (
+            thought_id, revision, raw_text, summary, thought_type,
+            topics, people, action_items, embedding, metadata,
+            prov_agent, prov_activity, parent_version, diff_json
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
+            %s, %s, %s, %s::jsonb
+        )
+        RETURNING version_id
+        """,
+        (
+            thought_id, next_revision, raw_text, summary, thought_type,
+            json.dumps(topics) if topics is not None else None,
+            json.dumps(people) if people is not None else None,
+            json.dumps(action_items) if action_items is not None else None,
+            embedding if embedding is not None else None,
+            json.dumps(metadata) if metadata is not None else None,
+            prov_agent, prov_activity, parent_version,
+            json.dumps(diff_json) if diff_json is not None else None,
+        ),
+    )
+    version_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    return {
+        "version_id": version_id,
+        "revision": next_revision,
+        "thought_id": thought_id,
+    }
+
+
+def list_versions(
+    conn,
+    thought_id: str,
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    """Return all versions of ``thought_id`` in chronological (revision asc) order.
+
+    PS scoping: raises :class:`RuntimeError` if the thought is not in
+    ``user_id``'s scope.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM brain.thoughts WHERE thought_id=%s AND user_id=%s",
+        (thought_id, user_id),
+    )
+    if cur.fetchone() is None:
+        cur.close()
+        raise RuntimeError(
+            f"list_versions: thought {thought_id} not in user scope "
+            f"(user={user_id})"
+        )
+    cur.execute(
+        """
+        SELECT version_id, revision, raw_text, prov_agent, prov_activity,
+               parent_version, created_at
+        FROM brain.thought_versions
+        WHERE thought_id = %s
+        ORDER BY revision ASC
+        """,
+        (thought_id,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [
+        {
+            "version_id": r[0],
+            "revision": r[1],
+            # Truncate raw_text for list display (full text is on the row).
+            "raw_text": r[2][:200] if r[2] is not None else None,
+            "prov_agent": r[3],
+            "prov_activity": r[4],
+            "parent_version": r[5],
+            "created_at": r[6].isoformat() if r[6] else None,
+        }
+        for r in rows
+    ]
+
+
+def rollback_thought(
+    conn,
+    thought_id: str,
+    user_id: str,
+    to_revision: int,
+    prov_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Roll the current state of ``thought_id`` back to the content of revision
+    ``to_revision``.
+
+    CRITICAL CONTRACT (Lin/Li/Chen 2026 §12.1): rollback creates NEW history.
+    It does NOT delete or rewrite earlier revisions. After
+    ``rollback(tid, to_revision=1)`` on a thought with revisions 1, 2, 3, the
+    result is revisions 1, 2, 3, 4 — where revision 4 has the content of
+    revision 1, ``prov_activity='rollback'``, and ``parent_version`` pointing
+    to the ``version_id`` of revision 1.
+
+    Also updates the live ``brain.thoughts`` row to match the rolled-back
+    content so subsequent reads/searches see the restored state.
+
+    Returns
+    -------
+    dict
+        ``{"version_id": int, "revision": int, "thought_id": str,
+        "rolled_back_to_revision": int}``
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM brain.thoughts WHERE thought_id=%s AND user_id=%s",
+        (thought_id, user_id),
+    )
+    if cur.fetchone() is None:
+        cur.close()
+        raise RuntimeError(
+            f"rollback_thought: thought {thought_id} not in user scope "
+            f"(user={user_id})"
+        )
+
+    # Fetch the target revision's state.
+    cur.execute(
+        """
+        SELECT version_id, raw_text, summary, thought_type, topics, people,
+               action_items, embedding, metadata
+        FROM brain.thought_versions
+        WHERE thought_id = %s AND revision = %s
+        """,
+        (thought_id, to_revision),
+    )
+    target = cur.fetchone()
+    if target is None:
+        cur.close()
+        raise RuntimeError(
+            f"rollback_thought: revision {to_revision} of {thought_id} not found"
+        )
+    (
+        target_version_id, raw_text, summary, thought_type, topics, people,
+        action_items, embedding, metadata,
+    ) = target
+
+    # Determine the next revision. Rollback ALWAYS appends — never rewrites.
+    cur.execute(
+        """
+        SELECT revision FROM brain.thought_versions WHERE thought_id = %s
+        ORDER BY revision DESC LIMIT 1
+        """,
+        (thought_id,),
+    )
+    max_rev = cur.fetchone()
+    next_revision = (max_rev[0] + 1) if max_rev else 1
+
+    if prov_agent is None:
+        prov_agent = _derive_prov_agent("manual", user_id)
+
+    # INSERT the rollback version (prov_activity='rollback', parent = target).
+    cur.execute(
+        """
+        INSERT INTO brain.thought_versions (
+            thought_id, revision, raw_text, summary, thought_type,
+            topics, people, action_items, embedding, metadata,
+            prov_agent, prov_activity, parent_version, diff_json
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
+            %s, 'rollback', %s, NULL
+        )
+        RETURNING version_id
+        """,
+        (
+            thought_id, next_revision, raw_text, summary, thought_type,
+            json.dumps(topics) if topics is not None else None,
+            json.dumps(people) if people is not None else None,
+            json.dumps(action_items) if action_items is not None else None,
+            embedding if embedding is not None else None,
+            json.dumps(metadata) if metadata is not None else None,
+            prov_agent, target_version_id,
+        ),
+    )
+    new_version_id = cur.fetchone()[0]
+
+    # Update the live brain.thoughts row to match the rolled-back content.
+    cur.execute(
+        """
+        UPDATE brain.thoughts
+        SET raw_text = %s,
+            summary = %s,
+            thought_type = %s,
+            topics = %s::jsonb,
+            people = %s::jsonb,
+            action_items = %s::jsonb,
+            metadata = %s::jsonb,
+            updated_at = NOW()
+        WHERE thought_id = %s
+        """,
+        (
+            raw_text, summary, thought_type,
+            json.dumps(topics) if topics is not None else None,
+            json.dumps(people) if people is not None else None,
+            json.dumps(action_items) if action_items is not None else None,
+            json.dumps(metadata) if metadata is not None else None,
+            thought_id,
+        ),
+    )
+    conn.commit()
+    cur.close()
+    return {
+        "version_id": new_version_id,
+        "revision": next_revision,
+        "thought_id": thought_id,
+        "rolled_back_to_revision": to_revision,
+    }
+
+
+def diff_versions(
+    conn,
+    thought_id: str,
+    user_id: str,
+    revision_a: int,
+    revision_b: int,
+) -> List[Dict[str, Any]]:
+    """Return the RFC 6902 JSON Patch transforming revision_a into revision_b.
+
+    Embedding vectors are NOT diffed (cosine-similarity noise; vector diff
+    is a no-op). PS scoping is enforced.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM brain.thoughts WHERE thought_id=%s AND user_id=%s",
+        (thought_id, user_id),
+    )
+    if cur.fetchone() is None:
+        cur.close()
+        raise RuntimeError(
+            f"diff_versions: thought {thought_id} not in user scope "
+            f"(user={user_id})"
+        )
+
+    # Fetch both revisions in a single round-trip. Use the IN-list explicitly
+    # so we can distinguish "one of the two is missing" cleanly.
+    cur.execute(
+        """
+        SELECT revision, raw_text, summary, thought_type, topics, people,
+               action_items, metadata
+        FROM brain.thought_versions
+        WHERE thought_id = %s AND revision IN (%s, %s)
+        ORDER BY revision ASC
+        """,
+        (thought_id, revision_a, revision_b),
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    # If revision_a == revision_b, the IN-list collapses to a single value
+    # and we get exactly one row — treat as a no-op diff.
+    if revision_a == revision_b:
+        if not rows:
+            raise RuntimeError(
+                f"diff_versions: revision {revision_a} of {thought_id} not found"
+            )
+        return []
+
+    if len(rows) != 2:
+        found = {r[0] for r in rows}
+        missing = {revision_a, revision_b} - found
+        raise RuntimeError(
+            f"diff_versions: revisions {missing} of {thought_id} not found"
+        )
+
+    # Sort the two rows by the requested order (A first, then B) so the
+    # patch direction is revision_a → revision_b.
+    by_rev = {r[0]: r for r in rows}
+    rev_a = by_rev[revision_a]
+    rev_b = by_rev[revision_b]
+
+    state_a = {
+        "raw_text": rev_a[1],
+        "summary": rev_a[2],
+        "thought_type": rev_a[3],
+        "topics": rev_a[4],
+        "people": rev_a[5],
+        "action_items": rev_a[6],
+        "metadata": rev_a[7],
+    }
+    state_b = {
+        "raw_text": rev_b[1],
+        "summary": rev_b[2],
+        "thought_type": rev_b[3],
+        "topics": rev_b[4],
+        "people": rev_b[5],
+        "action_items": rev_b[6],
+        "metadata": rev_b[7],
+    }
+    patch = jsonpatch.make_patch(state_a, state_b)
+    return patch.patch
 
 
 def capture(
@@ -1574,6 +1977,19 @@ def main():
     group.add_argument("--migrate", type=str, metavar="SQL_FILE",
                        help="Execute a one-shot SQL migration file (idempotent)")
     group.add_argument("--from-pi", action="store_true", help="Pi bridge (stdin JSON)")
+    group.add_argument("--snapshot", type=str, metavar="THOUGHT_ID",
+                       help="Snapshot the current state of a thought to brain.thought_versions")
+    group.add_argument("--versions", type=str, metavar="THOUGHT_ID",
+                       help="List all versions of a thought")
+    group.add_argument("--rollback", type=str, metavar="THOUGHT_ID",
+                       help="Roll back a thought (combine with --to-revision)")
+    group.add_argument("--diff", type=str, metavar="THOUGHT_ID",
+                       help="Diff two revisions of a thought (combine with --from-revision and --to-revision)")
+
+    parser.add_argument("--to-revision", type=int, default=None, metavar="N",
+                        help="Target revision for --rollback or B-revision for --diff")
+    parser.add_argument("--from-revision", type=int, default=None, metavar="N",
+                        help="A-revision for --diff")
 
     parser.add_argument("--sort", type=str, choices=["similarity", "time"], default="similarity",
                         help="Sort search results: similarity (default) or time (oldest first)")
@@ -1677,6 +2093,89 @@ def main():
                 print(json.dumps(result, default=str))
             else:
                 print(_format_stats(result))
+
+        elif args.snapshot:
+            result = snapshot_thought(
+                conn,
+                thought_id=args.snapshot,
+                user_id=user_id,
+                prov_agent=args.prov_agent,
+            )
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                print(
+                    f"Snapshot created: thought={result['thought_id']} "
+                    f"revision={result['revision']} version_id={result['version_id']}"
+                )
+
+        elif args.versions:
+            results = list_versions(
+                conn,
+                thought_id=args.versions,
+                user_id=user_id,
+            )
+            if args.json:
+                print(json.dumps(results, default=str))
+            else:
+                if not results:
+                    print(f"No versions for thought {args.versions}")
+                else:
+                    print(f"Versions of {args.versions} ({len(results)} total):")
+                    for v in results:
+                        print(
+                            f"  rev={v['revision']:3d} "
+                            f"version_id={v['version_id']:6d} "
+                            f"activity={v['prov_activity']:10s} "
+                            f"agent={v['prov_agent']:32s} "
+                            f"created={v['created_at']}"
+                        )
+                        if v.get("raw_text"):
+                            print(f"        text: {v['raw_text']}")
+
+        elif args.rollback:
+            if args.to_revision is None:
+                parser.error("--rollback requires --to-revision N")
+            result = rollback_thought(
+                conn,
+                thought_id=args.rollback,
+                user_id=user_id,
+                to_revision=args.to_revision,
+                prov_agent=args.prov_agent,
+            )
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                print(
+                    f"Rolled back: thought={result['thought_id']} "
+                    f"to revision {result['rolled_back_to_revision']} "
+                    f"(new revision={result['revision']}, "
+                    f"version_id={result['version_id']}). "
+                    f"History preserved — earlier revisions still in brain.thought_versions."
+                )
+
+        elif args.diff:
+            if args.from_revision is None or args.to_revision is None:
+                parser.error("--diff requires both --from-revision A and --to-revision B")
+            patch = diff_versions(
+                conn,
+                thought_id=args.diff,
+                user_id=user_id,
+                revision_a=args.from_revision,
+                revision_b=args.to_revision,
+            )
+            if args.json:
+                print(json.dumps(patch, default=str))
+            else:
+                print(
+                    f"RFC 6902 JSON Patch from revision {args.from_revision} "
+                    f"→ {args.to_revision} of {args.diff}:"
+                )
+                if not patch:
+                    print("  (no changes)")
+                else:
+                    for op in patch:
+                        print(f"  {json.dumps(op, default=str)}")
     finally:
         conn.close()
 

@@ -14,3 +14,6 @@ anthropic>=0.30.0
 
 # YAML support for Memory System (optional but recommended)
 PyYAML>=6.0
+
+# RFC 6902 JSON Patch for RB primitive (brain-W1-S5: snapshot diffs, rollback)
+jsonpatch>=1.32
