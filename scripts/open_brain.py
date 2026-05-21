@@ -46,7 +46,7 @@ DEFAULT_RECENT_LIMIT = 20
 
 METADATA_EXTRACTION_PROMPT = '''Extract metadata from this thought. Return ONLY valid JSON, no markdown fencing, no explanation:
 {{
-  "type": "decision|insight|person_note|meeting|idea|task|reflection|preference|impression|pattern|working_memory",
+  "type": "decision|insight|person_note|meeting|idea|task|reflection|preference|impression|pattern|working_memory|sentinel_event|sentinel_relevant",
   "topics": ["topic1", "topic2"],
   "people": ["Name1"],
   "action_items": ["action1"],
@@ -67,6 +67,8 @@ Types:
 - impression: A formed opinion about a person, system, or process
 - pattern: A recurring approach, technique, or gotcha that applies broadly
 - working_memory: Active context from current work that should bridge sessions
+- sentinel_event: An actual Sentinel runtime event (outward-facing market-signal trigger or inward-facing observability alert)
+- sentinel_relevant: A memory entry that touches on Sentinel work (design, scaffolding, decisions, dual-purpose framing)
 
 Scope: "session" for temporary context, "project" for project-specific, "permanent" for universal knowledge.
 Confidence: How certain is this — "high" for stated facts, "medium" for inferences, "low" for hunches.
@@ -1427,6 +1429,46 @@ def _run_from_pi():
         conn.close()
 
 
+# ─── Migration runner ────────────────────────────────────────────────────────
+
+def run_migration(sql_path: str) -> Dict[str, Any]:
+    """Execute a one-shot SQL migration file. Idempotent migrations only.
+
+    Migrations are expected to use ADD COLUMN IF NOT EXISTS / CREATE INDEX IF
+    NOT EXISTS / guarded DO $$ blocks so that re-running them is a no-op. The
+    SQL file is executed as a single multi-statement script; if it contains
+    its own BEGIN/COMMIT it manages its own transaction, otherwise it runs
+    inside the implicit transaction opened by psycopg2.
+
+    Returns a status dict suitable for JSON serialization. Raises RuntimeError
+    (the local error convention in this module) on failure.
+    """
+    if not sql_path:
+        raise RuntimeError("Migration path required")
+    if not os.path.exists(sql_path):
+        raise RuntimeError(f"Migration file not found: {sql_path}")
+    with open(sql_path, "r", encoding="utf-8") as f:
+        sql = f.read()
+    if not sql.strip():
+        raise RuntimeError(f"Migration file is empty: {sql_path}")
+
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+        return {
+            "status": "ok",
+            "file": sql_path,
+            "size_bytes": len(sql),
+        }
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration failed: {e}") from e
+    finally:
+        conn.close()
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1440,6 +1482,8 @@ def main():
     group.add_argument("--recent", action="store_true", help="List recent thoughts")
     group.add_argument("--stats", action="store_true", help="Show brain stats")
     group.add_argument("--timeline", type=str, metavar="TOPIC", help="Temporal evolution of a topic")
+    group.add_argument("--migrate", type=str, metavar="SQL_FILE",
+                       help="Execute a one-shot SQL migration file (idempotent)")
     group.add_argument("--from-pi", action="store_true", help="Pi bridge (stdin JSON)")
 
     parser.add_argument("--sort", type=str, choices=["similarity", "time"], default="similarity",
@@ -1447,7 +1491,7 @@ def main():
     parser.add_argument("--days", type=int, default=DEFAULT_RECENT_DAYS)
     parser.add_argument("--limit", type=int, default=DEFAULT_RECENT_LIMIT)
     parser.add_argument("--type", type=str, dest="thought_type",
-                        help="Filter by type: decision|insight|person_note|meeting|idea|task|reflection|preference|impression|pattern|working_memory")
+                        help="Filter by type: decision|insight|person_note|meeting|idea|task|reflection|preference|impression|pattern|working_memory|sentinel_event|sentinel_relevant")
     parser.add_argument("--source", type=str, default="manual")
     parser.add_argument("--session-id", type=str, default="")
     parser.add_argument("--project", type=str, default="")
@@ -1457,6 +1501,14 @@ def main():
 
     if args.from_pi:
         _run_from_pi()
+        return
+
+    if args.migrate:
+        result = run_migration(args.migrate)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"Migration {result['status']}: {result['file']} ({result['size_bytes']} bytes)")
         return
 
     user_id = _get_user_id()
