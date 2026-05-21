@@ -21,6 +21,7 @@ All operations are user-scoped. USER_ID derived from $USER env var.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -34,6 +35,200 @@ from typing import Dict, Any, List, Optional
 import jsonpatch
 
 logger = logging.getLogger("open_brain")
+
+
+# ─── PII redaction (brain-W2-S6) ─────────────────────────────────────────────
+# Patterns are additive and intentionally specific to minimise false positives.
+# The redactor runs at the replay-log emitter boundary BEFORE any write, so
+# brain.replay_log rows never contain raw PII (the pii_distinct DEFAULT TRUE
+# column marker is the auditable assertion of this discipline).
+
+PII_PATTERNS = [
+    # Email — RFC-5322-flavoured (intentionally less greedy than full RFC).
+    (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), '[EMAIL]'),
+    # SSN — XXX-XX-XXXX. Anchored to word boundaries so plain "123-45-6789"
+    # in a longer digit string is not silently masked.
+    (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), '[SSN]'),
+    # Card numbers — 16 digits in 4 groups of 4, separator either space or dash.
+    (re.compile(r'\b(?:\d{4}[ -]?){3}\d{4}\b'), '[CARD]'),
+    # Phone — North-American format with optional country code. Anchored on
+    # word boundaries; the (?<!\d) lookbehind on the leading group prevents
+    # eating an already-redacted card-fragment tail. SSN runs first so that
+    # NNN-NN-NNNN never reaches this pattern.
+    (re.compile(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'), '[PHONE]'),
+]
+
+
+def redact_pii(text: Optional[str]) -> Optional[str]:
+    """Apply PII regex masking. Returns None for None input, '' for ''.
+
+    Order matters: SSN (NNN-NN-NNNN) is masked BEFORE phone (NNN-NNN-NNNN) so
+    the more specific format wins. Cards run before phone for the same reason
+    (16-digit blocks would otherwise be partially eaten by the phone pattern).
+    """
+    if text is None:
+        return None
+    result = text
+    for pattern, replacement in PII_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+# ─── Replay-log emitter (brain-W2-S6) ────────────────────────────────────────
+# Best-effort discipline: any write failure is swallowed and the emitter
+# returns -1. A user-facing brain op MUST NOT be blocked by an audit-log
+# failure. See HARN-L704 and Scorecard #7 (durable PII-distinct OTel
+# audit trail). The call site is placed BEFORE each function's `return` so
+# the audit row is created in the same successful-operation context.
+
+def emit_replay_log(
+    conn,
+    user_id: str,
+    event_type: str,
+    thought_id: Optional[str] = None,
+    query: Optional[str] = None,
+    result_text: Optional[str] = None,
+    session_id: Optional[str] = None,
+    prov_agent: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Emit a row into ``brain.replay_log``. PII-redacted at the boundary.
+
+    Never raises — if the table doesn't exist (migration not run) or the
+    write fails, we silently swallow. The audit log is best-effort; we
+    never block a user-facing brain op on an audit failure.
+
+    Parameters
+    ----------
+    conn
+        Open psycopg2 connection.
+    user_id
+        Owner of the row; mirrors the live op's principal scope.
+    event_type
+        One of ``'capture' | 'search' | 'forget' | 'promote' | 'demote'
+        | 'rollback' | 'inspect' | 'trace' | 'snapshot'``.
+    thought_id
+        Subject of the event (optional).
+    query
+        Search/forget query text — PII-redacted before write.
+    result_text
+        Free-form result text — PII-redacted then truncated to 100 chars.
+    session_id
+        Defaults to ``$BRAIN_SESSION_ID`` if unset.
+    prov_agent
+        PROV-DM principal; defaults to ``cli-user-{user_id}``.
+    metadata
+        Type-specific extra fields persisted as JSONB.
+
+    Returns
+    -------
+    int
+        The new ``event_id`` on success, or ``-1`` if the write failed.
+    """
+    if prov_agent is None:
+        prov_agent = _derive_prov_agent("manual", user_id)
+    if session_id is None:
+        session_id = os.environ.get("BRAIN_SESSION_ID")
+    trace_id = os.environ.get("OTEL_TRACE_ID")
+    span_id = os.environ.get("OTEL_SPAN_ID")
+    query_redacted = redact_pii(query) if query else None
+    redacted_result = redact_pii(result_text) if result_text else None
+    result_summary = redacted_result[:100] if redacted_result else None
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO brain.replay_log (
+                user_id, session_id, event_type, thought_id,
+                query_redacted, result_summary, pii_distinct,
+                trace_id, span_id, prov_agent, metadata
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s::jsonb
+            )
+            RETURNING event_id
+            """,
+            (
+                user_id, session_id, event_type, thought_id,
+                query_redacted, result_summary,
+                trace_id, span_id, prov_agent,
+                json.dumps(metadata) if metadata is not None else None,
+            ),
+        )
+        event_id = cur.fetchone()[0]
+        conn.commit()
+        return int(event_id)
+    except Exception:
+        # Best-effort: rollback the bound connection so a subsequent caller
+        # is not stuck in a failed-tx state. Swallow any rollback exception.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return -1
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+
+def query_replay_log(
+    conn,
+    user_id: str,
+    session_id: Optional[str] = None,
+    from_iso: Optional[str] = None,
+    to_iso: Optional[str] = None,
+    event_type: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Query ``brain.replay_log`` scoped to ``user_id``.
+
+    Returns chronologically-sorted rows (oldest first, ties broken by
+    ``event_id``). Datetime values are serialised to ISO 8601 strings for
+    JSON-friendliness.
+    """
+    where = ["user_id = %s"]
+    params: List[Any] = [user_id]
+    if session_id is not None:
+        where.append("session_id = %s")
+        params.append(session_id)
+    if from_iso is not None:
+        where.append("created_at >= %s")
+        params.append(from_iso)
+    if to_iso is not None:
+        where.append("created_at <= %s")
+        params.append(to_iso)
+    if event_type is not None:
+        where.append("event_type = %s")
+        params.append(event_type)
+
+    sql = f"""
+        SELECT event_id, user_id, session_id, event_type, thought_id,
+               query_redacted, result_summary, pii_distinct,
+               trace_id, span_id, prov_agent, metadata, created_at
+        FROM brain.replay_log
+        WHERE {' AND '.join(where)}
+        ORDER BY created_at ASC, event_id ASC
+        LIMIT %s
+    """
+    params.append(limit)
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        cols = [c[0] for c in cur.description]
+        out: List[Dict[str, Any]] = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            ts = d.get("created_at")
+            if ts is not None and hasattr(ts, "isoformat"):
+                d["created_at"] = ts.isoformat()
+            out.append(d)
+        return out
+    finally:
+        cur.close()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -542,6 +737,17 @@ def snapshot_thought(
     version_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
+
+    # brain-W2-S6: replay-log emission. Best-effort; never raises.
+    emit_replay_log(
+        conn,
+        user_id=user_id,
+        event_type="snapshot",
+        thought_id=thought_id,
+        prov_agent=prov_agent,
+        metadata={"version_id": int(version_id), "revision": int(next_revision)},
+    )
+
     return {
         "version_id": version_id,
         "revision": next_revision,
@@ -724,6 +930,21 @@ def rollback_thought(
     )
     conn.commit()
     cur.close()
+
+    # brain-W2-S6: replay-log emission. Best-effort; never raises.
+    emit_replay_log(
+        conn,
+        user_id=user_id,
+        event_type="rollback",
+        thought_id=thought_id,
+        prov_agent=prov_agent,
+        metadata={
+            "rolled_back_to_revision": int(to_revision),
+            "new_revision": int(next_revision),
+            "new_version_id": int(new_version_id),
+        },
+    )
+
     return {
         "version_id": new_version_id,
         "revision": next_revision,
@@ -979,6 +1200,23 @@ def forget_thought(
             prov_agent=prov_agent,
             diagnostic={"verify_exception": str(e), "restored": True},
         )
+        # brain-W2-S6: replay-log emission (verify-error branch). Best-effort.
+        emit_replay_log(
+            conn,
+            user_id=user_id,
+            event_type="forget",
+            thought_id=thought_id,
+            result_text=f"forget-failed-error audit_id={audit_id} error={str(e)[:80]}",
+            prov_agent=prov_agent,
+            metadata={
+                "status": "forget-failed-error",
+                "audit_id": int(audit_id),
+                "n": int(n),
+                "k": 0,
+                "epsilon": float(epsilon),
+                "restored": True,
+            },
+        )
         return {
             "thought_id": thought_id,
             "status": "forget-failed-error",
@@ -1022,6 +1260,27 @@ def forget_thought(
                 "restored": True,
             }
         ),
+    )
+
+    # brain-W2-S6: replay-log emission (verify-decision branch). Best-effort.
+    forget_status = "forgotten" if accepted else "forget-failed-residue"
+    emit_replay_log(
+        conn,
+        user_id=user_id,
+        event_type="forget",
+        thought_id=thought_id,
+        result_text=(
+            f"{forget_status} audit_id={audit_id} "
+            f"n={verify_result.n} k={verify_result.k} eps={verify_result.epsilon}"
+        ),
+        prov_agent=prov_agent,
+        metadata={
+            "status": forget_status,
+            "audit_id": int(audit_id),
+            "n": int(verify_result.n),
+            "k": int(verify_result.k),
+            "epsilon": float(verify_result.epsilon),
+        },
     )
 
     return {
@@ -1282,6 +1541,25 @@ def promote_thought(
         cur.close()
 
     effective = compute_effective_weight(conn, thought_id, user_id)
+
+    # brain-W2-S6: replay-log emission. Best-effort; never raises.
+    # demote_thought delegates here with a negative weight, so sign-of-weight
+    # distinguishes the two event types in the audit trail.
+    emit_event_type = "demote" if float(weight) < 0 else "promote"
+    emit_replay_log(
+        conn,
+        user_id=user_id,
+        event_type=emit_event_type,
+        thought_id=thought_id,
+        prov_agent=prov_agent,
+        metadata={
+            "weight": float(weight),
+            "effective_weight": float(effective),
+            "promotion_id": int(promotion_id),
+            "reason": reason,
+        },
+    )
+
     return {
         "promotion_id": int(promotion_id),
         "thought_id": thought_id,
@@ -1484,6 +1762,18 @@ def capture(
     # Incrementally update knowledge graph with extracted metadata
     _update_graph_incremental(
         conn, thought_id, summary, thought_type, topics, people, project, user_id
+    )
+
+    # brain-W2-S6: replay-log emission. Best-effort; never raises. Placed
+    # BEFORE return so the audit row reflects the same successful op context.
+    emit_replay_log(
+        conn,
+        user_id=user_id,
+        event_type="capture",
+        thought_id=thought_id,
+        result_text=text,
+        session_id=session_id or None,
+        prov_agent=prov_agent,
     )
 
     return {
@@ -2580,6 +2870,20 @@ def main():
     group.add_argument("--inspect", type=str, metavar="THOUGHT_ID",
                        help="Inspect historical state of a thought "
                             "(combine with --at or --at-revision; default: latest)")
+    group.add_argument("--replay", action="store_true",
+                       help="Show the chronological brain replay log "
+                            "(combine with --session-id, --from, --to, --event-type)")
+
+    parser.add_argument("--from", type=str, default=None, dest="from_iso",
+                        metavar="ISO",
+                        help="Start of replay window (ISO 8601); used with --replay")
+    parser.add_argument("--to", type=str, default=None, dest="to_iso",
+                        metavar="ISO",
+                        help="End of replay window (ISO 8601); used with --replay")
+    parser.add_argument("--event-type", type=str, default=None,
+                        dest="event_type", metavar="TYPE",
+                        help="Filter --replay by event_type "
+                             "(capture/forget/snapshot/rollback/promote/demote/search)")
 
     parser.add_argument("--at", type=str, default=None, metavar="ISO_TIMESTAMP",
                         help="Timestamp for --inspect (returns latest version <= this time); "
@@ -2952,6 +3256,32 @@ def main():
                     print(f"  text: {text_preview}")
                     if result.summary:
                         print(f"  summary: {result.summary[:100]}")
+
+        elif args.replay:
+            # brain-W2-S7: replay-log dispatcher. Read-only over brain.replay_log.
+            rows = query_replay_log(
+                conn,
+                user_id=user_id,
+                session_id=args.session_id or None,
+                from_iso=args.from_iso,
+                to_iso=args.to_iso,
+                event_type=args.event_type,
+                limit=args.limit,
+            )
+            if args.json:
+                print(json.dumps(rows, indent=2, default=str))
+            else:
+                if not rows:
+                    print("No replay-log entries match your query.")
+                else:
+                    for r in rows:
+                        tid = r.get("thought_id") or "-"
+                        summary = r.get("result_summary") or ""
+                        print(
+                            f"[{r['created_at']}] "
+                            f"{r['event_type']:<10} "
+                            f"{tid:<32} {summary}"
+                        )
     finally:
         conn.close()
 

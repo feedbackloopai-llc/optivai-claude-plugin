@@ -131,6 +131,35 @@ CREATE TABLE IF NOT EXISTS promotions (
 CREATE INDEX IF NOT EXISTS idx_promotions_thought_user ON promotions (thought_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_promotions_user_time ON promotions (user_id, promoted_at DESC);
 
+-- ============================================================================
+-- Replay log (brain-W2-S5): durable PII-distinct OTel-correlated audit trail
+-- of every brain operation. See sql/migrations/2026-05-21-replay-log.sql for
+-- the migration version. Reference: optivai-builder W3-REPLAY-LOG
+-- (HARN-L704 + Scorecard #7). The pii_distinct DEFAULT TRUE marker makes every
+-- row's redaction discipline auditable. trace_id / span_id correlate to OTel
+-- spans when OTEL_TRACE_ID / OTEL_SPAN_ID env vars are set.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS replay_log (
+    event_id        BIGSERIAL         NOT NULL PRIMARY KEY,
+    user_id         VARCHAR(100)      NOT NULL,
+    session_id      VARCHAR(200),
+    event_type      VARCHAR(50)       NOT NULL,
+    thought_id      VARCHAR(64),
+    query_redacted  TEXT,
+    result_summary  TEXT,
+    pii_distinct    BOOLEAN           NOT NULL DEFAULT TRUE,
+    trace_id        VARCHAR(64),
+    span_id         VARCHAR(64),
+    prov_agent      VARCHAR(100)      NOT NULL,
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ       NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_log_session ON replay_log (session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_replay_log_user_time ON replay_log (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_log_thought ON replay_log (thought_id) WHERE thought_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_replay_log_event_type ON replay_log (event_type, created_at DESC);
+
 -- Landing schema for activity logs
 CREATE SCHEMA IF NOT EXISTS landing;
 
