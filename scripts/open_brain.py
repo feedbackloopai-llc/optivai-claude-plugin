@@ -367,6 +367,42 @@ def init_schema(conn) -> str:
     return "Schema initialized successfully"
 
 
+def _derive_prov_agent(source: Optional[str], user_id: str) -> str:
+    """Derive a default ``prov_agent`` from the capture source.
+
+    Mappings (W3C PROV-DM ``prov:Agent`` identifier):
+      - ``"manual"`` / empty / ``None``  → ``"cli-user-{user_id}"``
+      - ``"pi"`` or any ``"pi-*"`` source → ``"pi-agent"``
+      - ``"claude-code"``                 → ``"claude-code"`` (passthrough)
+      - ``"hook-*"``                      → ``"claude-code-hook-{suffix}"``
+      - anything else                     → ``"source-{source}"`` (fallback)
+
+    The mappings give every capture a recognizable principal even when the
+    caller omits ``prov_agent`` explicitly. This is the WA-gate default;
+    callers may override by passing ``prov_agent=...`` to :func:`capture`.
+    """
+    if not source or source == "manual":
+        return f"cli-user-{user_id}"
+    if source == "pi" or source.startswith("pi-"):
+        return "pi-agent"
+    if source == "claude-code":
+        return "claude-code"
+    if source.startswith("hook-"):
+        return f"claude-code-hook-{source[5:]}"
+    return f"source-{source}"
+
+
+def _generate_activity_id(thought_id: str) -> str:
+    """Stable ``was_generated_by`` activity ID for a thought.
+
+    Format: ``activity-{thought_id}``. 1:1 with the thought for now;
+    multi-thought activities (e.g. batch import, conversation turn that
+    spawns several thoughts) are deferred to Wave-3 and will introduce
+    a separate ``brain.activities`` row.
+    """
+    return f"activity-{thought_id}"
+
+
 def capture(
     conn,
     text: str,
@@ -374,10 +410,52 @@ def capture(
     source: str = "manual",
     session_id: str = "",
     project: str = "",
+    prov_agent: Optional[str] = None,
+    prov_activity: Optional[str] = None,
+    was_derived_from: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Capture a thought with local embedding + Claude metadata extraction."""
+    """Capture a thought with local embedding + Claude metadata extraction.
+
+    Writes a W3C PROV-DM 1.3-conformant row: every capture stamps a
+    ``prov_agent`` (defaulting from ``source``), a ``prov_activity``
+    ("capture"), and a generated ``was_generated_by`` activity ID.
+
+    Parameters
+    ----------
+    prov_agent
+        Override the default agent ID. When ``None`` (default), derived
+        from ``source`` + ``user_id`` via :func:`_derive_prov_agent`.
+    prov_activity
+        Override the activity verb. When ``None`` (default), ``"capture"``.
+    was_derived_from
+        Optional parent ``thought_id``. Validated to exist within the
+        caller's ``user_id`` scope (PS — Principal Scoping); a mismatch
+        raises :class:`RuntimeError`.
+    """
     thought_id = _generate_thought_id()
     cur = conn.cursor()
+
+    # Resolve PROV-DM defaults BEFORE any DB work so a bad input fails fast.
+    if prov_agent is None:
+        prov_agent = _derive_prov_agent(source, user_id)
+    if prov_activity is None:
+        prov_activity = "capture"
+    was_generated_by = _generate_activity_id(thought_id)
+
+    # PS primitive: was_derived_from must reference a thought in the caller's
+    # scope. For this plugin, scope == user_id. A mismatch is a write-gate
+    # rejection — raise before doing embedding / LLM work.
+    if was_derived_from is not None:
+        cur.execute(
+            "SELECT 1 FROM brain.thoughts WHERE thought_id = %s AND user_id = %s",
+            (was_derived_from, user_id),
+        )
+        if cur.fetchone() is None:
+            cur.close()
+            raise RuntimeError(
+                "was_derived_from references non-existent thought "
+                f"(or wrong user scope): {was_derived_from} (user={user_id})"
+            )
 
     # Step 1: Extract metadata via Claude API
     metadata = _extract_metadata(text)
@@ -399,17 +477,20 @@ def capture(
     # Step 2: Generate embedding locally
     embedding = _generate_embedding(text)
 
-    # Step 3: INSERT
+    # Step 3: INSERT with PROV-DM fields. source_uri stays NULL for internal
+    # captures (deferred to a later bead if/when ingesting from external URLs).
     insert_sql = """
         INSERT INTO brain.thoughts (
             thought_id, user_id, raw_text, summary, thought_type,
             topics, people, action_items, source, session_id, project,
+            prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri,
             embedding, metadata, created_at, updated_at
         )
         VALUES (
             %s, %s, %s, %s, %s,
             %s::jsonb, %s::jsonb, %s::jsonb,
             %s, %s, %s,
+            %s, %s, %s, %s, %s,
             %s::vector, %s::jsonb,
             NOW(), NOW()
         )
@@ -428,6 +509,11 @@ def capture(
             source,
             session_id,
             project,
+            prov_agent,
+            prov_activity,
+            was_generated_by,
+            was_derived_from,
+            None,  # source_uri — reserved for external-URL captures
             str(embedding),
             json.dumps(metadata),
         ),
@@ -1362,6 +1448,9 @@ def _run_from_pi():
                 source=args.get("source", "pi"),
                 session_id=args.get("session_id", ""),
                 project=args.get("project", ""),
+                prov_agent=args.get("prov_agent"),
+                prov_activity=args.get("prov_activity"),
+                was_derived_from=args.get("was_derived_from"),
             )
             print(json.dumps(result))
         elif op == "search":
@@ -1495,6 +1584,12 @@ def main():
     parser.add_argument("--source", type=str, default="manual")
     parser.add_argument("--session-id", type=str, default="")
     parser.add_argument("--project", type=str, default="")
+    parser.add_argument("--prov-agent", type=str, default=None, dest="prov_agent",
+                        help="Override default prov_agent for --capture (default derived from --source + USER)")
+    parser.add_argument("--prov-activity", type=str, default=None, dest="prov_activity",
+                        help="Override default prov_activity ('capture' for --capture, 'auto-capture-{trigger}' for hooks)")
+    parser.add_argument("--derived-from", type=str, default=None, dest="was_derived_from",
+                        help="thought_id of parent thought (was_derived_from); must be in your scope")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
 
     args = parser.parse_args()
@@ -1533,6 +1628,9 @@ def main():
                 source=args.source,
                 session_id=args.session_id,
                 project=args.project,
+                prov_agent=args.prov_agent,
+                prov_activity=args.prov_activity,
+                was_derived_from=args.was_derived_from,
             )
             if args.json:
                 print(json.dumps(result))
