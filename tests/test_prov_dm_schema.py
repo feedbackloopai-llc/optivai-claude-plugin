@@ -12,6 +12,7 @@ import sys
 import subprocess
 import pytest
 import psycopg2
+import psycopg2.errors  # for ForeignKeyViolation (F4 behavioral tests)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import open_brain  # noqa: E402,F401  (imported to verify module is importable)
@@ -127,15 +128,63 @@ class TestProvDmBackfill:
         )
 
     def test_legacy_backfill_marker(self, conn):
-        """Pre-migration rows tagged with prov_agent='legacy-import' (sanity check the backfill ran)."""
+        """Backfill discipline: pre-migration rows tagged with prov_agent='legacy-import'
+        AND prov_activity='unknown' AND was_generated_by='activity-legacy-{thought_id}'.
+
+        If table is empty (fresh DB), the test skips. If rows exist, the backfill must
+        have populated all three required fields with the legacy markers.
+        """
         cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM brain.thoughts")
+        total = cur.fetchone()[0]
+        if total == 0:
+            pytest.skip("Empty thoughts table — backfill marker test not applicable")
+
+        # If any pre-S2 row exists (i.e., captured before --capture knew about PROV),
+        # it must carry the legacy markers. Post-S2 rows have proper PROV from capture flow.
+        # We detect pre-S2 rows by the legacy marker itself.
         cur.execute(
-            "SELECT COUNT(*) FROM brain.thoughts WHERE prov_agent='legacy-import'"
+            """
+            SELECT COUNT(*) FROM brain.thoughts
+            WHERE prov_agent = 'legacy-import'
+            """
         )
         legacy_count = cur.fetchone()[0]
-        # If this is a fresh DB with no rows, legacy_count==0 is fine.
-        # We only assert the query ran without error and returned a non-negative count.
-        assert legacy_count >= 0
+
+        if legacy_count == 0:
+            # All rows are post-S2 captures — that's fine.
+            # Just assert that POST-S2 rows do NOT carry the legacy marker on prov_activity.
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.thoughts
+                WHERE prov_activity = 'unknown'
+                """
+            )
+            unknown_count = cur.fetchone()[0]
+            assert unknown_count == 0, (
+                f"Post-S2 rows should have specific prov_activity (capture / auto-capture-* / etc), "
+                f"not 'unknown'. Found {unknown_count} rows with prov_activity='unknown'."
+            )
+            return
+
+        # Legacy rows present — verify they carry the matching trio of legacy markers
+        cur.execute(
+            """
+            SELECT thought_id, prov_agent, prov_activity, was_generated_by
+            FROM brain.thoughts
+            WHERE prov_agent = 'legacy-import'
+            LIMIT 5
+            """
+        )
+        sample = cur.fetchall()
+        for tid, p_agent, p_activity, w_gen in sample:
+            assert p_agent == 'legacy-import', f"Row {tid} has prov_agent={p_agent}"
+            assert p_activity == 'unknown', (
+                f"Row {tid} has prov_activity={p_activity}, expected 'unknown'"
+            )
+            assert w_gen == f"activity-legacy-{tid}", (
+                f"Row {tid} has was_generated_by={w_gen}, expected 'activity-legacy-{tid}'"
+            )
 
 
 class TestProvDmFkConstraint:
@@ -222,3 +271,113 @@ class TestMigrationRunnerCli:
         assert "ok" in out or "status" in out, (
             f"Expected JSON status output, got: {result.stdout}"
         )
+
+
+class TestFkAndIndexBehavior:
+    """F4 closure: verify the FK constraint actually FIRES and ON DELETE SET NULL
+    behaves correctly. Verify the partial index excludes NULL rows.
+    """
+
+    def test_fk_rejects_nonexistent_derived_from_at_insert(self, conn):
+        """Direct SQL INSERT with bogus was_derived_from must fail FK constraint.
+        capture() validates BEFORE insert; this tests the DB-level enforcement.
+        """
+        # Use a unique tid so we don't pollute
+        cur = conn.cursor()
+        try:
+            with pytest.raises(psycopg2.errors.ForeignKeyViolation):
+                cur.execute(
+                    """
+                    INSERT INTO brain.thoughts (
+                        thought_id, user_id, raw_text, summary, thought_type,
+                        topics, people, action_items, source,
+                        prov_agent, prov_activity, was_generated_by, was_derived_from
+                    ) VALUES (
+                        %s, %s, 'fk-test', 'fk-test', 'insight',
+                        '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'manual',
+                        'cli-user-fktest', 'capture', %s,
+                        %s
+                    )
+                    """,
+                    (
+                        "brain-fk-test-001",
+                        "fktest-user",
+                        "activity-brain-fk-test-001",
+                        "nonexistent-parent-id-xyz",
+                    ),
+                )
+                conn.commit()
+        finally:
+            conn.rollback()  # Always rollback whether the INSERT succeeded or raised
+
+    def test_on_delete_set_null_sets_child_to_null(self, conn):
+        """When a parent thought is deleted, child's was_derived_from is set to NULL,
+        not cascade-deleted (preserves citation chain history).
+        """
+        # Create parent
+        parent = open_brain.capture(
+            conn, text="parent for cascade test", user_id="ondelete-test"
+        )
+        pid = parent["thought_id"]
+        # Create child derived from parent
+        child = open_brain.capture(
+            conn,
+            text="child for cascade test",
+            user_id="ondelete-test",
+            was_derived_from=pid,
+        )
+        cid = child["thought_id"]
+        try:
+            # Delete the parent
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id = %s", (pid,))
+            conn.commit()
+            # Verify child still exists AND its was_derived_from is NULL
+            cur.execute(
+                "SELECT was_derived_from FROM brain.thoughts WHERE thought_id = %s",
+                (cid,),
+            )
+            row = cur.fetchone()
+            assert row is not None, "Child should NOT be cascade-deleted"
+            assert row[0] is None, (
+                f"Child's was_derived_from should be NULL after parent delete, got {row[0]}"
+            )
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id = %s", (cid,))
+            conn.commit()
+
+    def test_partial_index_excludes_null_rows(self, conn):
+        """idx_thoughts_derived_from is a partial index WHERE was_derived_from IS NOT NULL.
+        Verify via pg_indexes that the WHERE clause is present.
+        """
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT indexdef FROM pg_indexes
+            WHERE schemaname='brain' AND tablename='thoughts'
+              AND indexname='idx_thoughts_derived_from'
+            """
+        )
+        row = cur.fetchone()
+        assert row is not None, "Partial index missing"
+        indexdef = row[0].lower()
+        # The partial WHERE clause must be in the index definition
+        assert "where" in indexdef and "is not null" in indexdef, (
+            f"Index is not partial — full definition: {indexdef}"
+        )
+
+    def test_fk_constraint_action_is_set_null(self, conn):
+        """Verify the FK action is ON DELETE SET NULL (not CASCADE, not RESTRICT)."""
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT confdeltype
+            FROM pg_constraint
+            WHERE conname = 'fk_thoughts_derived_from'
+            """
+        )
+        row = cur.fetchone()
+        assert row is not None, "FK constraint not found"
+        # PG codes: 'a'=NO ACTION, 'r'=RESTRICT, 'c'=CASCADE, 'n'=SET NULL, 'd'=SET DEFAULT
+        assert row[0] == 'n', f"FK action expected SET NULL ('n'), got '{row[0]}'"
