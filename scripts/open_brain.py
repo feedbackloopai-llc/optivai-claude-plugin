@@ -2790,6 +2790,111 @@ def _run_from_pi():
         elif op == "init":
             result = init_schema(conn)
             print(json.dumps({"status": "ok", "message": result}))
+        # ─── Wave-1+2 ops (brain-W2-D2 stdin-JSON dispatch) ──────────────────
+        elif op == "forget":
+            result = forget_thought(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                epsilon=args.get("epsilon", 0.05),
+                n=args.get("n", 300),
+                prov_agent=args.get("prov_agent"),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "snapshot":
+            result = snapshot_thought(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                prov_agent=args.get("prov_agent"),
+                prov_activity=args.get("prov_activity", "snapshot"),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "versions":
+            result = list_versions(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+            )
+            print(json.dumps(result, default=str))
+        elif op == "rollback":
+            result = rollback_thought(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                to_revision=args.get("to_revision", 1),
+                prov_agent=args.get("prov_agent"),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "diff":
+            result = diff_versions(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                revision_a=args.get("revision_a", args.get("from_revision", 1)),
+                revision_b=args.get("revision_b", args.get("to_revision", 2)),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "trace":
+            import citation_walker
+            root = citation_walker.trace_citation(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                max_depth=args.get("max_depth", 50),
+            )
+            print(json.dumps(citation_walker.citation_node_to_dict(root), default=str))
+        elif op == "inspect":
+            import time_travel
+            at_iso = args.get("at")
+            at_revision = args.get("at_revision")
+            if at_revision is not None:
+                result = time_travel.inspect_at_revision(
+                    conn, args.get("thought_id", ""), user_id, revision=at_revision,
+                )
+            elif at_iso:
+                result = time_travel.inspect_at_timestamp(
+                    conn, args.get("thought_id", ""), user_id, at_iso=at_iso,
+                )
+            else:
+                result = time_travel.inspect_latest(
+                    conn, args.get("thought_id", ""), user_id,
+                )
+            if result is None:
+                print(json.dumps({"thought_id": args.get("thought_id", ""), "result": None}))
+            else:
+                print(json.dumps(time_travel.inspect_result_to_dict(result), default=str))
+        elif op == "promote":
+            result = promote_thought(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                weight=args.get("weight", 1.0),
+                reason=args.get("reason"),
+                prov_agent=args.get("prov_agent"),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "demote":
+            result = demote_thought(
+                conn,
+                thought_id=args.get("thought_id", ""),
+                user_id=user_id,
+                weight=args.get("weight", 1.0),
+                reason=args.get("reason"),
+                prov_agent=args.get("prov_agent"),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "replay":
+            result = query_replay_log(
+                conn,
+                user_id=user_id,
+                session_id=args.get("session_id"),
+                from_iso=args.get("from_iso") or args.get("from"),
+                to_iso=args.get("to_iso") or args.get("to"),
+                event_type=args.get("event_type"),
+                limit=args.get("limit", 100),
+            )
+            print(json.dumps(result, default=str))
         else:
             print(json.dumps({"error": f"Unknown op: {op}"}))
     finally:
