@@ -2577,7 +2577,16 @@ def main():
                        help="Demote a thought (inserts a negative-weight row; audit trail preserved)")
     group.add_argument("--trace", type=str, metavar="THOUGHT_ID",
                        help="Walk the provenance chain (was_derived_from) for a thought")
+    group.add_argument("--inspect", type=str, metavar="THOUGHT_ID",
+                       help="Inspect historical state of a thought "
+                            "(combine with --at or --at-revision; default: latest)")
 
+    parser.add_argument("--at", type=str, default=None, metavar="ISO_TIMESTAMP",
+                        help="Timestamp for --inspect (returns latest version <= this time); "
+                             "ISO 8601 (e.g. '2026-05-21T10:30:00Z')")
+    parser.add_argument("--at-revision", type=int, default=None, metavar="N",
+                        help="Specific revision number for --inspect "
+                             "(mutually exclusive with --at)")
     parser.add_argument("--max-depth", type=int, default=50, metavar="N",
                         help="Maximum walk depth for --trace (default: 50)")
     parser.add_argument("--weight", type=float, default=1.0, metavar="W",
@@ -2880,6 +2889,69 @@ def main():
                 ))
             else:
                 _print_citation_tree(root, indent=0)
+
+        elif args.inspect:
+            # Local import: time_travel is only needed for --inspect.
+            import time_travel
+            if args.at is not None and args.at_revision is not None:
+                msg = "--at and --at-revision are mutually exclusive"
+                if args.json:
+                    print(json.dumps({"error": msg}))
+                else:
+                    print(f"Error: {msg}", file=sys.stderr)
+                sys.exit(2)
+            try:
+                if args.at_revision is not None:
+                    result = time_travel.inspect_at_revision(
+                        conn,
+                        thought_id=args.inspect,
+                        user_id=user_id,
+                        revision=args.at_revision,
+                    )
+                elif args.at is not None:
+                    result = time_travel.inspect_at_timestamp(
+                        conn,
+                        thought_id=args.inspect,
+                        user_id=user_id,
+                        at_iso=args.at,
+                    )
+                else:
+                    result = time_travel.inspect_latest(
+                        conn,
+                        thought_id=args.inspect,
+                        user_id=user_id,
+                    )
+            except RuntimeError as e:
+                if args.json:
+                    print(json.dumps({"error": str(e)}))
+                else:
+                    print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+
+            if result is None:
+                if args.json:
+                    print(json.dumps({
+                        "thought_id": args.inspect,
+                        "result": None,
+                        "message": "no version exists at this query",
+                    }))
+                else:
+                    print(
+                        f"No version of {args.inspect} found at the requested query."
+                    )
+            else:
+                d = time_travel.inspect_result_to_dict(result)
+                if args.json:
+                    print(json.dumps(d, indent=2, default=str))
+                else:
+                    text_preview = (result.raw_text or "")[:200]
+                    print(
+                        f"● {result.thought_id} revision={result.revision} "
+                        f"({result.prov_activity}, {result.created_at})"
+                    )
+                    print(f"  text: {text_preview}")
+                    if result.summary:
+                        print(f"  summary: {result.summary[:100]}")
     finally:
         conn.close()
 
