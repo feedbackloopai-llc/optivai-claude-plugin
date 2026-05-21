@@ -2387,6 +2387,33 @@ def _format_stats(s: Dict) -> str:
 
 # ─── Pi bridge ────────────────────────────────────────────────────────────────
 
+def _print_citation_tree(node, indent: int = 0) -> None:
+    """Pretty-print a citation tree for human consumption.
+
+    Format::
+
+        ● <thought_id> (d0)
+            prov: <prov_agent>/<prov_activity>
+            text: <first 100 chars of raw_text_preview>
+          → <parent_thought_id> (d1)
+              prov: ...
+              text: ...
+
+    Sentinel nodes (orphaned / cycle / max-depth) are rendered as e.g.::
+
+        → <thought_id> (d2 [max-depth])
+    """
+    prefix = "  " * indent + ("→ " if indent > 0 else "● ")
+    marker = f" [{node.orphan_marker}]" if node.orphan_marker else ""
+    print(f"{prefix}{node.thought_id} (d{node.depth}{marker})")
+    if not node.orphan_marker:
+        print(f"{'  ' * indent}    prov: {node.prov_agent}/{node.prov_activity}")
+        if node.raw_text_preview:
+            print(f"{'  ' * indent}    text: {node.raw_text_preview[:100]}")
+    for child in node.children:
+        _print_citation_tree(child, indent=indent + 1)
+
+
 def _run_from_pi():
     """Pi bridge: read JSON from stdin, dispatch operation, print JSON result."""
     try:
@@ -2548,7 +2575,11 @@ def main():
                        help="Promote a thought (positive Hebbian weight; agent-controlled)")
     group.add_argument("--demote", type=str, metavar="THOUGHT_ID",
                        help="Demote a thought (inserts a negative-weight row; audit trail preserved)")
+    group.add_argument("--trace", type=str, metavar="THOUGHT_ID",
+                       help="Walk the provenance chain (was_derived_from) for a thought")
 
+    parser.add_argument("--max-depth", type=int, default=50, metavar="N",
+                        help="Maximum walk depth for --trace (default: 50)")
     parser.add_argument("--weight", type=float, default=1.0, metavar="W",
                         help="Weight magnitude for --promote / --demote (default 1.0)")
     parser.add_argument("--reason", type=str, default=None, metavar="TEXT",
@@ -2830,6 +2861,25 @@ def main():
                 )
                 if args.reason:
                     print(f"  reason: {args.reason}")
+
+        elif args.trace:
+            # Local import keeps citation_walker out of the cold-path imports
+            # for other CLI verbs (it's only needed for --trace).
+            import citation_walker
+            root = citation_walker.trace_citation(
+                conn,
+                thought_id=args.trace,
+                user_id=user_id,
+                max_depth=args.max_depth,
+            )
+            if args.json:
+                print(json.dumps(
+                    citation_walker.citation_node_to_dict(root),
+                    indent=2,
+                    default=str,
+                ))
+            else:
+                _print_citation_tree(root, indent=0)
     finally:
         conn.close()
 
