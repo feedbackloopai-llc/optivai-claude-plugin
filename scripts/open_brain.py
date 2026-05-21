@@ -439,6 +439,12 @@ def snapshot_thought(
     representing prev → current). PS scoping is enforced: raises
     :class:`RuntimeError` if ``thought_id`` is not in ``user_id``'s scope.
 
+    Note: "previous version" means the row with the highest revision number,
+    which after a ``rollback_thought`` will be the rollback row. The diff
+    from a rollback row to the current state will be empty if no further
+    changes have been made — this is semantically correct (no drift since
+    the rollback).
+
     Returns
     -------
     dict
@@ -552,6 +558,9 @@ def list_versions(
 
     PS scoping: raises :class:`RuntimeError` if the thought is not in
     ``user_id``'s scope.
+
+    Note: ``raw_text`` is truncated to 200 chars in the returned dicts for
+    display purposes. Use ``diff_versions`` or direct SQL to access full text.
     """
     cur = conn.cursor()
     cur.execute(
@@ -731,6 +740,12 @@ def diff_versions(
     revision_b: int,
 ) -> List[Dict[str, Any]]:
     """Return the RFC 6902 JSON Patch transforming revision_a into revision_b.
+
+    Direction-sensitive. ``diff_versions(a=1, b=2)`` returns the FORWARD patch
+    (what to change in v1 to get v2 — ``replace`` ops carry v2's values).
+    ``diff_versions(a=2, b=1)`` returns the REVERSE/undo patch (what to change
+    in v2 to get back v1 — ``replace`` ops carry v1's values). When
+    ``revision_a == revision_b``, the patch is the empty list.
 
     Embedding vectors are NOT diffed (cosine-similarity noise; vector diff
     is a no-op). PS scoping is enforced.

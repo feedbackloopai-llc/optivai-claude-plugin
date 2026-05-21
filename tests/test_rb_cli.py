@@ -411,3 +411,172 @@ class TestCliFlags:
             "--from-revision",
         ):
             assert flag in result.stdout, f"{flag} not in --help output"
+
+
+# ─── S6 corpus expansion ──────────────────────────────────────────────────────
+# Gap items the S5 review noted: snapshot idempotency-with-no-changes semantics,
+# version_id stability across rollback, monotonic revision invariant including
+# post-rollback, and diff order-invariance.
+
+
+class TestSnapshotIdempotencySemantics:
+    """Snapshotting twice with no edits between creates 2 distinct revisions
+    (NOT a no-op). Each snapshot is a distinct PROV event."""
+
+    def test_double_snapshot_no_edit_creates_two_revisions(self, conn):
+        tid = _setup_thought(conn, "rb-s6-double-snap", "unchanging text")
+        try:
+            r1 = open_brain.snapshot_thought(conn, tid, "rb-s6-double-snap")
+            r2 = open_brain.snapshot_thought(conn, tid, "rb-s6-double-snap")
+            assert r1["revision"] == 1
+            assert r2["revision"] == 2
+            assert r1["version_id"] != r2["version_id"]
+            # diff_json of v2 (vs v1, no edit) should be empty patch
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT diff_json FROM brain.thought_versions WHERE version_id=%s",
+                (r2["version_id"],),
+            )
+            row = cur.fetchone()
+            diff = row[0] if row else None
+            assert diff is None or diff == [], (
+                f"Expected empty diff (no changes between v1 and v2), got {diff}"
+            )
+        finally:
+            _cleanup_thought(conn, tid)
+
+
+class TestVersionIdStabilityAcrossRollback:
+    """The version_id of any revision (including the rollback TARGET) is
+    immutable after rollback. RB never modifies existing thought_versions rows."""
+
+    def test_rollback_does_not_modify_target_version_row(self, conn):
+        tid = _setup_thought(conn, "rb-s6-stability", "v1 content")
+        try:
+            r1 = open_brain.snapshot_thought(conn, tid, "rb-s6-stability")
+            cur = conn.cursor()
+            cur.execute("UPDATE brain.thoughts SET raw_text='v2 content' WHERE thought_id=%s", (tid,))
+            conn.commit()
+            open_brain.snapshot_thought(conn, tid, "rb-s6-stability")
+            # Capture v1's row state pre-rollback
+            cur.execute(
+                "SELECT version_id, revision, raw_text, prov_activity, created_at "
+                "FROM brain.thought_versions WHERE version_id=%s",
+                (r1["version_id"],),
+            )
+            v1_pre = cur.fetchone()
+            # Roll back to v1
+            open_brain.rollback_thought(conn, tid, "rb-s6-stability", to_revision=1)
+            # Verify v1's row is UNCHANGED post-rollback
+            cur.execute(
+                "SELECT version_id, revision, raw_text, prov_activity, created_at "
+                "FROM brain.thought_versions WHERE version_id=%s",
+                (r1["version_id"],),
+            )
+            v1_post = cur.fetchone()
+            assert v1_pre == v1_post, (
+                f"Rollback modified target revision row.\n"
+                f"  pre:  {v1_pre}\n  post: {v1_post}"
+            )
+        finally:
+            _cleanup_thought(conn, tid)
+
+    def test_rollback_target_remains_diffable(self, conn):
+        """After rollback, diff(target, rollback_row) is empty (they match)."""
+        tid = _setup_thought(conn, "rb-s6-target-ref", "v1")
+        try:
+            open_brain.snapshot_thought(conn, tid, "rb-s6-target-ref")
+            cur = conn.cursor()
+            cur.execute("UPDATE brain.thoughts SET raw_text='v2' WHERE thought_id=%s", (tid,))
+            conn.commit()
+            open_brain.snapshot_thought(conn, tid, "rb-s6-target-ref")
+            open_brain.rollback_thought(conn, tid, "rb-s6-target-ref", to_revision=1)
+            # Diff v1 vs the new rollback row (revision 3) — should be empty
+            patch = open_brain.diff_versions(conn, tid, "rb-s6-target-ref",
+                                              revision_a=1, revision_b=3)
+            assert patch == [], f"Rollback v3 should mirror v1; diff={patch}"
+        finally:
+            _cleanup_thought(conn, tid)
+
+
+class TestMonotonicRevisionInvariant:
+    """Revisions are strictly monotonic per thought_id including after multiple
+    rollbacks. The UNIQUE(thought_id, revision) constraint plus next_revision =
+    max + 1 formula guarantee this."""
+
+    def test_revisions_strictly_monotonic_through_rollback(self, conn):
+        tid = _setup_thought(conn, "rb-s6-monotone", "v1")
+        try:
+            # 3 snapshots → revisions [1, 2, 3]. Each loop edits the live thought.
+            for i in range(2, 5):
+                open_brain.snapshot_thought(conn, tid, "rb-s6-monotone")
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE brain.thoughts SET raw_text=%s WHERE thought_id=%s",
+                    (f"v{i}", tid),
+                )
+                conn.commit()
+            # Roll back to v2 → appends rev 4
+            r = open_brain.rollback_thought(conn, tid, "rb-s6-monotone", to_revision=2)
+            assert r["revision"] == 4
+            # Snapshot → rev 5
+            r2 = open_brain.snapshot_thought(conn, tid, "rb-s6-monotone")
+            assert r2["revision"] == 5
+            # Roll back to v3 → rev 6
+            r3 = open_brain.rollback_thought(conn, tid, "rb-s6-monotone", to_revision=3)
+            assert r3["revision"] == 6
+            # Verify all 6 in sequence (no gaps; strictly monotonic)
+            versions = open_brain.list_versions(conn, tid, "rb-s6-monotone")
+            assert [v["revision"] for v in versions] == [1, 2, 3, 4, 5, 6]
+        finally:
+            _cleanup_thought(conn, tid)
+
+
+class TestDiffDirectionSemantics:
+    """diff_versions is direction-sensitive: A→B and B→A produce reverse patches.
+    A→B reads as 'how to transform A into B'. B→A reads as 'how to transform B
+    back to A'. Both are valid; useful for forward vs. undo direction."""
+
+    def test_diff_forward_direction_replaces_to_new_value(self, conn):
+        tid = _setup_thought(conn, "rb-s6-revdiff-fwd", "original")
+        try:
+            open_brain.snapshot_thought(conn, tid, "rb-s6-revdiff-fwd")
+            cur = conn.cursor()
+            cur.execute("UPDATE brain.thoughts SET raw_text='modified' WHERE thought_id=%s", (tid,))
+            conn.commit()
+            open_brain.snapshot_thought(conn, tid, "rb-s6-revdiff-fwd")
+            patch = open_brain.diff_versions(conn, tid, "rb-s6-revdiff-fwd",
+                                              revision_a=1, revision_b=2)
+            replace_ops = [op for op in patch if op.get("op") == "replace" and op.get("path") == "/raw_text"]
+            assert len(replace_ops) == 1
+            assert replace_ops[0]["value"] == "modified"
+        finally:
+            _cleanup_thought(conn, tid)
+
+    def test_diff_reverse_direction_replaces_to_old_value(self, conn):
+        """Calling diff with revision_a=2, revision_b=1 yields the REVERSE patch
+        (undo direction). The replace value is the OLD content, not the new."""
+        tid = _setup_thought(conn, "rb-s6-revdiff-rev", "original")
+        try:
+            open_brain.snapshot_thought(conn, tid, "rb-s6-revdiff-rev")
+            cur = conn.cursor()
+            cur.execute("UPDATE brain.thoughts SET raw_text='modified' WHERE thought_id=%s", (tid,))
+            conn.commit()
+            open_brain.snapshot_thought(conn, tid, "rb-s6-revdiff-rev")
+            patch = open_brain.diff_versions(conn, tid, "rb-s6-revdiff-rev",
+                                              revision_a=2, revision_b=1)
+            replace_ops = [op for op in patch if op.get("op") == "replace" and op.get("path") == "/raw_text"]
+            assert len(replace_ops) == 1
+            assert replace_ops[0]["value"] == "original"  # undo direction
+        finally:
+            _cleanup_thought(conn, tid)
+
+    def test_diff_same_revision_returns_empty(self, conn):
+        tid = _setup_thought(conn, "rb-s6-samerev", "x")
+        try:
+            open_brain.snapshot_thought(conn, tid, "rb-s6-samerev")
+            patch = open_brain.diff_versions(conn, tid, "rb-s6-samerev",
+                                              revision_a=1, revision_b=1)
+            assert patch == []
+        finally:
+            _cleanup_thought(conn, tid)
