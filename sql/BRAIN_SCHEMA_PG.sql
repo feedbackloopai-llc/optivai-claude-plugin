@@ -79,6 +79,34 @@ CREATE TABLE IF NOT EXISTS thought_versions (
 CREATE INDEX IF NOT EXISTS idx_thought_versions_thought ON thought_versions (thought_id, revision DESC);
 CREATE INDEX IF NOT EXISTS idx_thought_versions_created ON thought_versions (created_at DESC);
 
+-- ============================================================================
+-- VF_eps audit log (brain-W1-S8): procurement-grade trail for every --forget.
+-- See sql/migrations/2026-05-21-vf-audit.sql for the migration version.
+-- Records BOTH Hoeffding (loose) and exact-binomial (tight) bounds (R2 fix-wave).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS forget_audit (
+    audit_id              BIGSERIAL         NOT NULL PRIMARY KEY,
+    forgotten_thought_id  VARCHAR(64)       NOT NULL,
+    user_id               VARCHAR(100)      NOT NULL,
+    status                VARCHAR(20)       NOT NULL,
+    n                     INTEGER           NOT NULL,
+    k                     INTEGER           NOT NULL,
+    epsilon               DOUBLE PRECISION  NOT NULL,
+    hoeffding_bound       DOUBLE PRECISION  NOT NULL,
+    hoeffding_confidence  DOUBLE PRECISION  NOT NULL,
+    exact_binomial_bound  DOUBLE PRECISION  NOT NULL,
+    exact_binomial_conf   DOUBLE PRECISION  NOT NULL,
+    probe_quality_json    JSONB             NOT NULL,
+    prov_agent            VARCHAR(100)      NOT NULL,
+    prov_activity         VARCHAR(50)       NOT NULL DEFAULT 'forget',
+    diagnostic_json       JSONB,
+    created_at            TIMESTAMPTZ       NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_forget_audit_user_time ON forget_audit (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_forget_audit_thought ON forget_audit (forgotten_thought_id);
+CREATE INDEX IF NOT EXISTS idx_forget_audit_status ON forget_audit (status);
+
 -- Landing schema for activity logs
 CREATE SCHEMA IF NOT EXISTS landing;
 

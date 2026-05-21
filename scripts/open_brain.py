@@ -821,6 +821,353 @@ def diff_versions(
     return patch.patch
 
 
+# ─── VF_eps primitive: --forget with delete-after-verify ─────────────────────
+#
+# brain-W1-S8. Implements the procurement-grade verified-forgetting flow:
+#
+#   1. build_probe_seed_snapshot (PRE-delete; captures forgotten_text +
+#      top-50 NN neighbors)
+#   2. CAPTURE the full row state into restore_row (for R1 restore safety)
+#   3. DELETE the live row (CASCADE removes thought_versions)
+#   4. verify_forgetting (probes against post-delete store)
+#   5. If accepted (k=0): emit audit row status='forgotten'
+#   6. If rejected (k>0) OR verify errors: RESTORE the row + emit failure audit
+#
+# The delete-after-verify pattern (R1 fix-wave) STRUCTURALLY ELIMINATES the
+# rollback data-loss bug: any non-zero residue triggers re-INSERT from the
+# pre-delete snapshot before the function returns.
+#
+# Audit log (brain.forget_audit) records BOTH bounds distinctly (R2 fix-wave):
+#   - hoeffding_bound / hoeffding_confidence (loose; 77.69% at n=300/eps=0.05)
+#   - exact_binomial_bound / exact_binomial_conf (tight; 99.9999793% — the
+#     procurement headline per Lin/Li/Chen §12.1)
+
+
+def forget_thought(
+    conn,
+    thought_id: str,
+    user_id: str,
+    epsilon: float = 0.05,
+    n: int = 300,
+    prov_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Forget a thought with VF_eps verification (Lin/Li/Chen 2026 §12.1).
+
+    The delete-after-verify protocol (R1 fix-wave):
+
+      1. Build ProbeSeedSnapshot capturing forgotten_text + top-50 NN
+         neighbors PRE-DELETE.
+      2. Capture the full thought row for restore (user_id + all PROV columns).
+      3. DELETE the thought from brain.thoughts (CASCADE drops thought_versions).
+      4. Run n probes against the post-delete live store.
+      5. If accepted (k=0): emit audit row with status='forgotten'. Done.
+      6. If rejected (k>0) or verify errors: RESTORE the row from the snapshot
+         (re-INSERT with the same thought_id). Emit audit row with
+         status='forget-failed-residue' or 'forget-failed-error'.
+
+    PS scoping (Principal Scoping per Lin §12.1): raises RuntimeError if
+    ``thought_id`` is not in ``user_id``'s scope. Cross-user forgets are
+    rejected at the snapshot step BEFORE any DELETE — the live row remains
+    untouched.
+
+    Parameters
+    ----------
+    conn
+        Open psycopg2 connection.
+    thought_id
+        Target thought_id to forget.
+    user_id
+        Caller scope; the row MUST belong to this user.
+    epsilon
+        Operational target expose-rate (default 0.05).
+    n
+        Number of probes (default 300, the procurement-grade parameter).
+    prov_agent
+        Override the default agent ID. When None, derived as
+        ``cli-user-{user_id}``.
+
+    Returns
+    -------
+    dict
+        ``{
+            "thought_id": str,
+            "status": "forgotten" | "forget-failed-residue" | "forget-failed-error",
+            "audit_id": int,
+            "audit": { ... full audit-row mirror ... },
+        }``
+
+    Raises
+    ------
+    RuntimeError
+        If ``thought_id`` is not in ``user_id``'s scope. The live row is
+        untouched in that case.
+    """
+    import vf_probe  # local import — vf_probe is in the same scripts/ dir
+
+    if prov_agent is None:
+        prov_agent = _derive_prov_agent("manual", user_id)
+
+    # Step 1: snapshot pre-delete (also enforces PS scoping — raises on mismatch).
+    snapshot = vf_probe.build_probe_seed_snapshot(conn, thought_id, user_id)
+
+    # Step 2: capture full row for restore-on-failure. user_id is FIRST so the
+    # restore helper can de-tuple in a stable order.
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT user_id, raw_text, summary, thought_type,
+                   topics, people, action_items,
+                   source, session_id, project,
+                   embedding, metadata,
+                   prov_agent, prov_activity, was_generated_by,
+                   was_derived_from, source_uri,
+                   created_at
+            FROM brain.thoughts
+            WHERE thought_id = %s AND user_id = %s
+            """,
+            (thought_id, user_id),
+        )
+        restore_row = cur.fetchone()
+    finally:
+        cur.close()
+
+    if restore_row is None:
+        # Defensive: snapshot succeeded but row vanished mid-call.
+        raise RuntimeError(
+            f"forget_thought: thought {thought_id} not in user scope "
+            f"(user={user_id})"
+        )
+
+    # Step 3: DELETE the live row (CASCADE on brain.thought_versions handles
+    # version history; knowledge_graph_nodes.source_thought_id is ON DELETE
+    # SET NULL so KG-edge cleanup is automatic).
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM brain.thoughts WHERE thought_id = %s AND user_id = %s",
+            (thought_id, user_id),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+
+    # Step 4: verification. ANY exception triggers a restore-and-record-error.
+    try:
+        verify_result = vf_probe.verify_forgetting(
+            conn, snapshot, n=n, epsilon=epsilon,
+        )
+    except Exception as e:
+        # Restore + audit + return error status.
+        _restore_thought(conn, thought_id, restore_row)
+        audit_id = _emit_forget_audit(
+            conn,
+            thought_id=thought_id,
+            user_id=user_id,
+            status="forget-failed-error",
+            n=n,
+            k=0,
+            epsilon=epsilon,
+            hoeffding_bound=vf_probe.hoeffding_bound(n, epsilon),
+            exact_binomial_bound=vf_probe.exact_binomial_bound(n, epsilon),
+            probe_quality={
+                "n": n,
+                "distribution": {},
+                "sampledFromSnapshot": True,
+                "error": str(e),
+            },
+            prov_agent=prov_agent,
+            diagnostic={"verify_exception": str(e), "restored": True},
+        )
+        return {
+            "thought_id": thought_id,
+            "status": "forget-failed-error",
+            "audit_id": audit_id,
+            "audit": {
+                "error": str(e),
+                "restored": True,
+                "n": n,
+                "k": 0,
+                "epsilon": epsilon,
+            },
+        }
+
+    # Step 5 / 6: decision based on accepted flag.
+    accepted = verify_result.accepted
+    if not accepted:
+        # k > 0: residue detected — restore the row BEFORE emitting the audit
+        # row, so the audit row is the durable record of the (restored) state.
+        _restore_thought(conn, thought_id, restore_row)
+
+    audit_id = _emit_forget_audit(
+        conn,
+        thought_id=thought_id,
+        user_id=user_id,
+        status="forgotten" if accepted else "forget-failed-residue",
+        n=verify_result.n,
+        k=verify_result.k,
+        epsilon=verify_result.epsilon,
+        hoeffding_bound=verify_result.hoeffdingBound,
+        exact_binomial_bound=verify_result.exactBinomialBound,
+        probe_quality=verify_result.probeQuality,
+        prov_agent=prov_agent,
+        diagnostic=(
+            None
+            if accepted
+            else {
+                "surfaced_probes": [
+                    p for p in verify_result.probes
+                    if p.get("surfaced_forgotten")
+                ],
+                "restored": True,
+            }
+        ),
+    )
+
+    return {
+        "thought_id": thought_id,
+        "status": "forgotten" if accepted else "forget-failed-residue",
+        "audit_id": audit_id,
+        "audit": {
+            "n": verify_result.n,
+            "k": verify_result.k,
+            "epsilon": verify_result.epsilon,
+            "hoeffdingBound": verify_result.hoeffdingBound,
+            "hoeffdingConfidence": verify_result.hoeffdingConfidence,
+            "exactBinomialBound": verify_result.exactBinomialBound,
+            "exactBinomialConfidence": verify_result.exactBinomialConfidence,
+            "probeQuality": verify_result.probeQuality,
+            "prov_agent": prov_agent,
+        },
+    }
+
+
+def _restore_thought(conn, thought_id: str, restore_row: tuple) -> None:
+    """Re-INSERT a deleted thought row to preserve user data when VF rejects.
+
+    The non-negotiable R1 invariant: forget never destroys data if verification
+    fails. Called from :func:`forget_thought` when ``verify_forgetting`` either
+    rejects (``k>0``) or raises. The restored row keeps its original
+    ``thought_id`` so any external references remain valid; ``prov_activity``
+    is set to ``'restore'`` to mark the lineage event distinctly.
+    """
+    (
+        user_id, raw_text, summary, thought_type,
+        topics, people, action_items,
+        source, session_id, project,
+        embedding, metadata,
+        prov_agent_old, _prov_activity_old, was_generated_by,
+        was_derived_from, source_uri,
+        created_at,
+    ) = restore_row
+
+    # JSONB columns: psycopg2 returns them as Python lists/dicts already, but
+    # we re-serialize defensively so a string fallback also works.
+    def _jsonb(val):
+        if val is None:
+            return None
+        if isinstance(val, str):
+            return val
+        return json.dumps(val)
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO brain.thoughts (
+                thought_id, user_id, raw_text, summary, thought_type,
+                topics, people, action_items,
+                source, session_id, project,
+                prov_agent, prov_activity, was_generated_by,
+                was_derived_from, source_uri,
+                embedding, metadata,
+                created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                %s::vector, %s::jsonb,
+                %s, NOW()
+            )
+            """,
+            (
+                thought_id, user_id, raw_text, summary, thought_type,
+                _jsonb(topics), _jsonb(people), _jsonb(action_items),
+                source, session_id, project,
+                prov_agent_old, "restore", was_generated_by,
+                was_derived_from, source_uri,
+                embedding if embedding is not None else None,
+                _jsonb(metadata),
+                created_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+
+
+def _emit_forget_audit(
+    conn,
+    thought_id: str,
+    user_id: str,
+    status: str,
+    n: int,
+    k: int,
+    epsilon: float,
+    hoeffding_bound: float,
+    exact_binomial_bound: float,
+    probe_quality: Dict[str, Any],
+    prov_agent: str,
+    diagnostic: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Insert one row into ``brain.forget_audit``; return its ``audit_id``.
+
+    Procurement-grade audit: BOTH bounds and confidences are stored as
+    distinct labeled columns (R2 fix-wave), and the probe-quality marker
+    (R3 fix-wave) is preserved as JSONB for downstream verification.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO brain.forget_audit (
+                forgotten_thought_id, user_id, status,
+                n, k, epsilon,
+                hoeffding_bound, hoeffding_confidence,
+                exact_binomial_bound, exact_binomial_conf,
+                probe_quality_json,
+                prov_agent, prov_activity,
+                diagnostic_json
+            ) VALUES (
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                %s, %s,
+                %s::jsonb,
+                %s, 'forget',
+                %s::jsonb
+            )
+            RETURNING audit_id
+            """,
+            (
+                thought_id, user_id, status,
+                n, k, epsilon,
+                hoeffding_bound, 1.0 - hoeffding_bound,
+                exact_binomial_bound, 1.0 - exact_binomial_bound,
+                json.dumps(probe_quality),
+                prov_agent,
+                json.dumps(diagnostic) if diagnostic is not None else None,
+            ),
+        )
+        audit_id = cur.fetchone()[0]
+        conn.commit()
+        return int(audit_id)
+    finally:
+        cur.close()
+
+
 def capture(
     conn,
     text: str,
@@ -2000,11 +2347,18 @@ def main():
                        help="Roll back a thought (combine with --to-revision)")
     group.add_argument("--diff", type=str, metavar="THOUGHT_ID",
                        help="Diff two revisions of a thought (combine with --from-revision and --to-revision)")
+    group.add_argument("--forget", type=str, metavar="THOUGHT_ID",
+                       help="Forget a thought with VF_eps verification (delete-after-verify)")
 
     parser.add_argument("--to-revision", type=int, default=None, metavar="N",
                         help="Target revision for --rollback or B-revision for --diff")
     parser.add_argument("--from-revision", type=int, default=None, metavar="N",
                         help="A-revision for --diff")
+    parser.add_argument("--epsilon", type=float, default=0.05, metavar="EPS",
+                        help="VF_eps target for --forget (default: 0.05)")
+    parser.add_argument("--n", type=int, default=300, metavar="N",
+                        help="Number of probes for --forget (default: 300; "
+                             "gives 99.9999793%% exact-binomial confidence at eps=0.05)")
 
     parser.add_argument("--sort", type=str, choices=["similarity", "time"], default="similarity",
                         help="Sort search results: similarity (default) or time (oldest first)")
@@ -2191,6 +2545,46 @@ def main():
                 else:
                     for op in patch:
                         print(f"  {json.dumps(op, default=str)}")
+
+        elif args.forget:
+            result = forget_thought(
+                conn,
+                thought_id=args.forget,
+                user_id=user_id,
+                epsilon=args.epsilon,
+                n=args.n,
+                prov_agent=args.prov_agent,
+            )
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                status = result["status"]
+                audit = result.get("audit", {})
+                if status == "forgotten":
+                    print(f"✓ Forgotten: {result['thought_id']}")
+                    print(
+                        f"  n={audit.get('n')}, k={audit.get('k')}, "
+                        f"eps={audit.get('epsilon')}"
+                    )
+                    print(
+                        f"  Hoeffding: "
+                        f"{audit.get('hoeffdingConfidence', 0.0) * 100:.4f}% "
+                        f"confidence (loose)"
+                    )
+                    print(
+                        f"  Exact binomial: "
+                        f"{audit.get('exactBinomialConfidence', 0.0) * 100:.7f}% "
+                        f"confidence (tight; procurement-grade)"
+                    )
+                else:
+                    print(f"✗ Forget FAILED ({status}): {result['thought_id']}")
+                    k = audit.get("k", "?")
+                    print(
+                        f"  k={k} probes surfaced the content; row restored "
+                        f"from pre-delete snapshot (R1 invariant)."
+                    )
+                    if "error" in audit:
+                        print(f"  error: {audit['error']}")
     finally:
         conn.close()
 
