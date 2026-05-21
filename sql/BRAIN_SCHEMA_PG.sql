@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS forget_audit (
     audit_id              BIGSERIAL         NOT NULL PRIMARY KEY,
     forgotten_thought_id  VARCHAR(64)       NOT NULL,
     user_id               VARCHAR(100)      NOT NULL,
-    status                VARCHAR(20)       NOT NULL,
+    status                VARCHAR(40)       NOT NULL,
     n                     INTEGER           NOT NULL,
     k                     INTEGER           NOT NULL,
     epsilon               DOUBLE PRECISION  NOT NULL,

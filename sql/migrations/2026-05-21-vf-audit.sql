@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS brain.forget_audit (
     audit_id              BIGSERIAL         NOT NULL PRIMARY KEY,
     forgotten_thought_id  VARCHAR(64)       NOT NULL,
     user_id               VARCHAR(100)      NOT NULL,
-    status                VARCHAR(20)       NOT NULL,           -- 'forgotten' | 'forget-failed-residue' | 'forget-failed-error'
+    status                VARCHAR(40)       NOT NULL,           -- 'forgotten' | 'forget-failed-residue' | 'forget-failed-error'
     n                     INTEGER           NOT NULL,
     k                     INTEGER           NOT NULL,
     epsilon               DOUBLE PRECISION  NOT NULL,
