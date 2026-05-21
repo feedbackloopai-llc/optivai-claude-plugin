@@ -107,6 +107,30 @@ CREATE INDEX IF NOT EXISTS idx_forget_audit_user_time ON forget_audit (user_id, 
 CREATE INDEX IF NOT EXISTS idx_forget_audit_thought ON forget_audit (forgotten_thought_id);
 CREATE INDEX IF NOT EXISTS idx_forget_audit_status ON forget_audit (status);
 
+-- ============================================================================
+-- Hebbian promotion primitive (brain-W1-S10): agent-controlled memory
+-- weighting with time-decay — the 4th MS_eps column (after PV, RB, VF_eps).
+-- See sql/migrations/2026-05-21-hebbian-promotions.sql for the migration.
+-- Reference: Lin/Li/Chen 2026 §12.1; OptivAI builder memory_promotions table.
+-- ON DELETE CASCADE: forgetting a thought (VF_eps) removes its promotions too.
+-- Demote works by INSERTING a row with NEGATIVE weight (NOT deleting positives)
+-- so the audit trail is preserved.
+-- Decay formula (compute_effective_weight): sum(weight * (1+days_since)^(-0.7)).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS promotions (
+    promotion_id    BIGSERIAL         NOT NULL PRIMARY KEY,
+    thought_id      VARCHAR(64)       NOT NULL REFERENCES thoughts(thought_id) ON DELETE CASCADE,
+    user_id         VARCHAR(100)      NOT NULL,
+    weight          DOUBLE PRECISION  NOT NULL DEFAULT 1.0,
+    promoted_at     TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
+    prov_agent      VARCHAR(100)      NOT NULL,
+    reason          TEXT,
+    UNIQUE (thought_id, user_id, promoted_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_promotions_thought_user ON promotions (thought_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_promotions_user_time ON promotions (user_id, promoted_at DESC);
+
 -- Landing schema for activity logs
 CREATE SCHEMA IF NOT EXISTS landing;
 

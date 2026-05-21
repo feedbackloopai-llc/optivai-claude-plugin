@@ -1168,6 +1168,201 @@ def _emit_forget_audit(
         cur.close()
 
 
+# ─── Hebbian primitive: --promote / --demote with time-decay ─────────────────
+#
+# brain-W1-S10 (schema) + S11 (helpers + CLI) + S12 (tests). The 4th MS_eps
+# column — agent-controlled memory weighting with natural decay.
+#
+# Reference: Lin/Li/Chen 2026 §12.1 ("Hebbian agent-controlled metacognition");
+# OptivAI builder neurosymbolic harness (memory_promotions table).
+#
+# Mechanics:
+#   * promote_thought() INSERTs a positive-weight row in brain.promotions.
+#   * demote_thought() INSERTs a NEGATIVE-weight row. It does NOT delete prior
+#     positives — the audit trail is preserved (R1-style invariant: history is
+#     append-only, decisions are reversible).
+#   * compute_effective_weight() sums all rows for a (thought_id, user_id),
+#     applying the time-decay  weight * (1 + days_since)^(-0.7).
+#
+# Why -0.7? The exponent is taken directly from the OptivAI builder
+# implementation. Empirically: at 1 day decay is ~0.62, at 7 days ~0.23, at
+# 30 days ~0.09. Aggressive enough that stale promotions fade; gentle enough
+# that recent emphasis survives a week of context churn.
+#
+# Within-kind over-application defense (gz-dsax2 from optivai-builder backlog):
+# the search-side integration MUST gate the Hebbian boost by a minimum cosine
+# similarity (HEBBIAN_MIN_RELEVANCE_FLOOR = 0.30). A heavily-promoted but
+# semantically-irrelevant thought must NOT rank above a lower-promoted but
+# highly-relevant one. The constant lives here for the future S13 search
+# integration; this bundle (S10/S11/S12) ships the primitive only.
+
+
+HEBBIAN_DECAY_EXPONENT = -0.7  # time-decay exponent: weight * (1+days_since)^(-0.7)
+HEBBIAN_MIN_RELEVANCE_FLOOR = 0.30  # cosine sim floor below which promotion gives no boost
+HEBBIAN_BOOST_COEFFICIENT = 0.1  # search-side multiplier for effective_weight (S13)
+
+
+def promote_thought(
+    conn,
+    thought_id: str,
+    user_id: str,
+    weight: float = 1.0,
+    reason: Optional[str] = None,
+    prov_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Agent-controlled Hebbian promotion. INSERTs a positive-weight row into
+    ``brain.promotions``.
+
+    PS scoping (Principal Scoping per Lin/Li/Chen §12.1): ``thought_id`` must
+    be in ``user_id``'s scope. Cross-user promotions raise ``RuntimeError``
+    BEFORE any write — the table is untouched in that case.
+
+    Multiple promotions on the same thought accumulate. Later retrieval
+    scoring sums all promotions with time-decay; see
+    :func:`compute_effective_weight`.
+
+    Parameters
+    ----------
+    conn
+        Open psycopg2 connection.
+    thought_id
+        The thought to promote (must belong to ``user_id``).
+    user_id
+        Caller scope.
+    weight
+        Promotion magnitude (default 1.0). Caller may pass any float; this
+        function does NOT normalize the sign (use :func:`demote_thought`
+        for negative weighting with sign-normalization).
+    reason
+        Optional human-readable rationale, persisted on the row.
+    prov_agent
+        PROV-DM agent identifier. Defaults to ``cli-user-{user_id}``.
+
+    Returns
+    -------
+    dict
+        ``{"promotion_id": int, "thought_id": str, "weight": float,
+        "effective_weight": float}`` — the trailing field is the time-decayed
+        sum of ALL promotions for this thought (post-insert, as of NOW).
+        Useful for sanity-checking the immediate effect.
+
+    Raises
+    ------
+    RuntimeError
+        If ``thought_id`` is not in ``user_id``'s scope.
+    """
+    cur = conn.cursor()
+    try:
+        # PS scope check.
+        cur.execute(
+            "SELECT 1 FROM brain.thoughts WHERE thought_id=%s AND user_id=%s",
+            (thought_id, user_id),
+        )
+        if cur.fetchone() is None:
+            raise RuntimeError(
+                f"promote_thought: thought {thought_id} not in user scope "
+                f"(user={user_id})"
+            )
+
+        if prov_agent is None:
+            prov_agent = _derive_prov_agent("manual", user_id)
+
+        cur.execute(
+            """
+            INSERT INTO brain.promotions
+              (thought_id, user_id, weight, prov_agent, reason)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING promotion_id
+            """,
+            (thought_id, user_id, float(weight), prov_agent, reason),
+        )
+        promotion_id = cur.fetchone()[0]
+        conn.commit()
+    finally:
+        cur.close()
+
+    effective = compute_effective_weight(conn, thought_id, user_id)
+    return {
+        "promotion_id": int(promotion_id),
+        "thought_id": thought_id,
+        "weight": float(weight),
+        "effective_weight": effective,
+    }
+
+
+def demote_thought(
+    conn,
+    thought_id: str,
+    user_id: str,
+    weight: float = 1.0,
+    reason: Optional[str] = None,
+    prov_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Demote a thought by INSERTing a negative-weight row.
+
+    Does NOT delete prior positive promotions — the audit trail is preserved.
+    A demoted thought can later be re-promoted without losing history.
+
+    The sign of ``weight`` is normalized: any input becomes ``-abs(weight)``.
+    That way ``demote_thought(weight=2.0)`` and ``demote_thought(weight=-2.0)``
+    behave identically — both insert ``-2.0``.
+
+    Cross-user scope is rejected by :func:`promote_thought` (the underlying
+    write path); no separate scope check is necessary here.
+    """
+    return promote_thought(
+        conn,
+        thought_id=thought_id,
+        user_id=user_id,
+        weight=-abs(float(weight)),
+        reason=reason,
+        prov_agent=prov_agent,
+    )
+
+
+def compute_effective_weight(
+    conn,
+    thought_id: str,
+    user_id: str,
+) -> float:
+    """Sum the time-decayed Hebbian weights for a thought.
+
+    Formula::
+
+        effective_weight = sum( weight * (1 + days_since_promoted)^(-0.7) )
+
+    Filters by ``user_id`` as well as ``thought_id`` — defensive against any
+    hypothetical row whose ``user_id`` differs from the parent thought's
+    (the UNIQUE constraint and write-path PS check make this unreachable
+    through ``promote_thought``, but a direct SQL INSERT can produce it).
+
+    Returns ``0.0`` if no promotions exist. Negative ``days_since`` (clock
+    skew — ``promoted_at`` in the future) is clamped to ``0.0`` so the decay
+    factor caps at ``1.0`` rather than producing a spurious >1 boost.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT weight,
+                   EXTRACT(EPOCH FROM (NOW() - promoted_at)) / 86400.0 AS days_since
+            FROM brain.promotions
+            WHERE thought_id = %s AND user_id = %s
+            """,
+            (thought_id, user_id),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    total = 0.0
+    for weight, days_since in rows:
+        days_clamped = max(0.0, float(days_since))
+        decay = (1.0 + days_clamped) ** HEBBIAN_DECAY_EXPONENT
+        total += float(weight) * decay
+    return total
+
+
 def capture(
     conn,
     text: str,
@@ -2349,7 +2544,15 @@ def main():
                        help="Diff two revisions of a thought (combine with --from-revision and --to-revision)")
     group.add_argument("--forget", type=str, metavar="THOUGHT_ID",
                        help="Forget a thought with VF_eps verification (delete-after-verify)")
+    group.add_argument("--promote", type=str, metavar="THOUGHT_ID",
+                       help="Promote a thought (positive Hebbian weight; agent-controlled)")
+    group.add_argument("--demote", type=str, metavar="THOUGHT_ID",
+                       help="Demote a thought (inserts a negative-weight row; audit trail preserved)")
 
+    parser.add_argument("--weight", type=float, default=1.0, metavar="W",
+                        help="Weight magnitude for --promote / --demote (default 1.0)")
+    parser.add_argument("--reason", type=str, default=None, metavar="TEXT",
+                        help="Optional human-readable rationale for promote/demote")
     parser.add_argument("--to-revision", type=int, default=None, metavar="N",
                         help="Target revision for --rollback or B-revision for --diff")
     parser.add_argument("--from-revision", type=int, default=None, metavar="N",
@@ -2585,6 +2788,48 @@ def main():
                     )
                     if "error" in audit:
                         print(f"  error: {audit['error']}")
+
+        elif args.promote:
+            result = promote_thought(
+                conn,
+                thought_id=args.promote,
+                user_id=user_id,
+                weight=args.weight,
+                reason=args.reason,
+                prov_agent=args.prov_agent,
+            )
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                print(
+                    f"✓ Promoted: thought={result['thought_id']} "
+                    f"weight={result['weight']:+.3f} "
+                    f"effective_weight={result['effective_weight']:.4f} "
+                    f"(promotion_id={result['promotion_id']})"
+                )
+                if args.reason:
+                    print(f"  reason: {args.reason}")
+
+        elif args.demote:
+            result = demote_thought(
+                conn,
+                thought_id=args.demote,
+                user_id=user_id,
+                weight=args.weight,
+                reason=args.reason,
+                prov_agent=args.prov_agent,
+            )
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                print(
+                    f"✓ Demoted: thought={result['thought_id']} "
+                    f"weight={result['weight']:+.3f} "
+                    f"effective_weight={result['effective_weight']:.4f} "
+                    f"(promotion_id={result['promotion_id']})"
+                )
+                if args.reason:
+                    print(f"  reason: {args.reason}")
     finally:
         conn.close()
 
