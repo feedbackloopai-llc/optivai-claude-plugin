@@ -4,7 +4,7 @@ Replay the session audit log: $ARGUMENTS
 python3 ~/.claude/hooks/open_brain.py --replay --json
 ```
 
-This emits the **chronological audit log** of every brain operation in the time window. Each entry is the OTel-correlated event recorded at the time the operation ran — capture, search, promote/demote, forget, inspect, trace. PII in raw thought text is redacted; the structural metadata (agent, activity, session_id, trace_id, event_type, timestamp) is preserved verbatim so the log is procurement-auditable.
+This emits the **chronological audit log** of every brain operation in the time window. Each entry is the OTel-correlated event recorded at the time the operation ran — capture, search, promote/demote, forget, inspect, trace. PII in raw thought text is redacted; the structural metadata (agent, activity, session_id, trace_id, event_type, timestamp) is preserved verbatim so the log is auditable.
 
 ## PII-distinct redaction
 
@@ -13,7 +13,7 @@ The log distinguishes two text classes:
 - **Structural fields** (agent, activity, session_id, event_type, principal, project) — NEVER redacted. These are required for audit reconstruction.
 - **Free-text fields** (raw_text excerpts, query strings, reason strings) — passed through the RE2 PII redactor (same gate that runs at capture time). Emails, phone numbers, credit cards, and configured custom patterns become `[REDACTED:KIND]` tokens.
 
-This is intentional and procurement-required: an auditor reviewing the log must be able to verify WHO did WHAT WHEN against WHICH session, without that audit creating a new PII exposure.
+This is intentional: an auditor reviewing the log must be able to verify WHO did WHAT WHEN against WHICH session, without that audit creating a new PII exposure.
 
 ## Filtering flags
 

@@ -17,7 +17,7 @@ This invokes the **citation walker** — it walks the `was_derived_from` chain (
 
 - Present the chain bottom-up (root → target) so the reader follows derivation forward in time.
 - For each node, show: short_id, agent, activity, wasGeneratedBy timestamp, one-line summary.
-- Highlight orphan nodes — they are the most procurement-relevant entries because they prove the broken-link disclosure pattern.
+- Highlight orphan nodes — they reveal where a parent was forgotten via VF_ε, making the chain auditable in both directions.
 - If `truncated: true` (max-depth hit), suggest re-running with a higher `--max-depth`.
 
 ## Example output

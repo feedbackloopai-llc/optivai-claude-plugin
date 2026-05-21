@@ -50,5 +50,5 @@ Multiple promotions on the same thought stack (additively, each with its own dec
 
 ## When NOT to use this command
 
-- To delete a thought entirely — use `--forget` (VF_ε) for procurement-grade deletion, or `--rollback` for plain reversion.
+- To delete a thought entirely — use `--forget` (VF_ε) for verified deletion, or `--rollback` for plain reversion.
 - To mark a memory "do not surface" — demoting is soft; the thought remains retrievable. If you need a hard exclusion, capture a corrective thought and demote the original.

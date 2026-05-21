@@ -4,7 +4,7 @@ Verified-forget a memory with MS_ε guarantee: $ARGUMENTS
 python3 ~/.claude/hooks/open_brain.py --forget "$ARGUMENTS" --epsilon 0.05 --n 300 --json
 ```
 
-This invokes the **VF_ε primitive** (verified forgetting). It is not a `DELETE`. It is a delete-after-verify operation that produces a procurement-grade probabilistic guarantee that the forgotten content can no longer be recovered.
+This invokes the **VF_ε primitive** (verified forgetting). It is not a `DELETE`. It is a delete-after-verify operation that produces a strong probabilistic guarantee that the forgotten content can no longer be recovered by semantic search.
 
 ## What happens (delete-after-verify pattern)
 
@@ -20,13 +20,13 @@ This invokes the **VF_ε primitive** (verified forgetting). It is not a `DELETE`
 | Hoeffding (one-sided, conservative) | `exp(−2·n·ε²)` at n=300, ε=0.05 | `0.2231` | 77.69% |
 | Exact binomial (k=0, tight) | `(1−ε)^n` at n=300, ε=0.05 | `2.075×10⁻⁷` | **99.9999793%** |
 
-The procurement headline "99.9999793% verified forgetting" is the **exact binomial** confidence. The Hoeffding bound is included for academic conservatism; both are emitted as distinct labeled fields in the audit log (`hoeffdingBound`, `hoeffdingConfidence`, `exactBinomialBound`, `exactBinomialConfidence`, `probeQuality`). Never quote the Hoeffding number as the procurement claim.
+The "99.9999793% verified forgetting" headline is the **exact binomial** confidence. The Hoeffding bound is included for distribution-free conservatism; both are emitted as distinct labeled fields in the audit log (`hoeffdingBound`, `hoeffdingConfidence`, `exactBinomialBound`, `exactBinomialConfidence`, `probeQuality`). Quote the exact-binomial number as the strength of the guarantee.
 
 ## What the agent should do with the JSON output
 
 - Report which thought_id was forgotten and confirm `k=0` (or surface the failure if k>0).
 - Quote the exactBinomialConfidence (5 sig figs).
-- If the user is preparing partner-facing materials, point them at `docs/MS_EPS_PRIMER.md`.
+- If the user wants context on the math, point them at `docs/MS_EPS_PRIMER.md`.
 - If a leak occurred (`status: "rollback"`), surface the audit_event_id so the operator can inspect which probe returned the content.
 
 ## Example output (success)

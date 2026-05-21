@@ -1044,7 +1044,7 @@ def diff_versions(
 
 # ─── VF_eps primitive: --forget with delete-after-verify ─────────────────────
 #
-# brain-W1-S8. Implements the procurement-grade verified-forgetting flow:
+# brain-W1-S8. Implements the verified-forgetting flow:
 #
 #   1. build_probe_seed_snapshot (PRE-delete; captures forgotten_text +
 #      top-50 NN neighbors)
@@ -1061,7 +1061,7 @@ def diff_versions(
 # Audit log (brain.forget_audit) records BOTH bounds distinctly (R2 fix-wave):
 #   - hoeffding_bound / hoeffding_confidence (loose; 77.69% at n=300/eps=0.05)
 #   - exact_binomial_bound / exact_binomial_conf (tight; 99.9999793% — the
-#     procurement headline per Lin/Li/Chen §12.1)
+#     headline confidence to quote)
 
 
 def forget_thought(
@@ -1102,7 +1102,8 @@ def forget_thought(
     epsilon
         Operational target expose-rate (default 0.05).
     n
-        Number of probes (default 300, the procurement-grade parameter).
+        Number of probes (default 300, the calibrated value yielding
+        99.9999793% exact-binomial confidence at eps=0.05/k=0).
     prov_agent
         Override the default agent ID. When None, derived as
         ``cli-user-{user_id}``.
@@ -3121,7 +3122,7 @@ def main():
                     print(
                         f"  Exact binomial: "
                         f"{audit.get('exactBinomialConfidence', 0.0) * 100:.7f}% "
-                        f"confidence (tight; procurement-grade)"
+                        f"confidence (tight; headline)"
                     )
                 else:
                     print(f"✗ Forget FAILED ({status}): {result['thought_id']}")

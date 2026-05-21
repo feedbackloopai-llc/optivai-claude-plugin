@@ -1,14 +1,13 @@
 """brain-W1-S7: VF_eps probe library.
 
-Lin/Li/Chen 2026 §12.1 VF_eps primitive: verified forgetting with
-epsilon-bound. Generates n=300 probes from a pre-delete ProbeSeedSnapshot,
-scores residue detection, computes both Hoeffding (loose) and exact-binomial
-(tight) bounds.
+Verified-forgetting primitive (Lin/Li/Chen 2026 §12.1). Generates n=300 probes
+from a pre-delete ProbeSeedSnapshot, scores residue detection, computes both
+Hoeffding (loose, distribution-free) and exact-binomial (tight) confidence
+bounds — both are recorded distinctly so a reader can see which number is
+being quoted.
 
-The 99.9999793% confidence figure (exact binomial at n=300/k=0/eps=0.05) is
-the procurement-grade headline — record it precisely in audit logs.
-
-Reference: optivai-builder/src/agents/vf-probe.ts (633 LOC TypeScript).
+Reference: optivai-builder/src/agents/vf-probe.ts (the TS design source we
+ported from; algorithmic provenance only).
 
 Bead: gz-dcwjp (brain-W1-S7).
 """
@@ -20,7 +19,7 @@ import random
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-# ─── Defaults (procurement-grade VF_eps parameters) ─────────────────────────
+# ─── Defaults (calibrated VF_eps parameters) ─────────────────────────────────
 
 DEFAULT_N: int = 300
 DEFAULT_EPSILON: float = 0.05
@@ -140,7 +139,8 @@ def exact_binomial_bound(n: int, epsilon: float) -> float:
     """Exact binomial bound for ``k=0``: ``(1 - eps) ** n``.
 
     Tight. At ``n=300, eps=0.05`` → ``≈ 2.075e-7`` (99.9999793% confidence).
-    This is the procurement-grade headline per Lin/Li/Chen §12.1.
+    This is the headline confidence — the figure to quote when describing
+    the strength of the forget guarantee.
 
     Raises
     ------
