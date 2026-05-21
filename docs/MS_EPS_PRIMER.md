@@ -42,9 +42,9 @@ The exact binomial confidence at `n=300, k=0, ε=0.05`:
 
 ```bash
 python3 -c "print((1 - 0.05) ** 300)"
-# 2.0747734557863635e-07
+# 2.075303347768056e-07
 python3 -c "print(1 - (1 - 0.05) ** 300)"
-# 0.9999997925226544
+# 0.9999997924696653
 ```
 
 `0.9999997925…` rounded to 5 significant figures is **99.9999793%**. This is the number that appears in procurement materials. The Hoeffding one-sided bound at the same parameters is `exp(−2·300·0.05²) = 0.2231`, which gives only 77.69% confidence — Hoeffding is included in the audit log for academic conservatism, but it is **not** the procurement claim. The audit log emits both as distinct labeled fields (`hoeffdingConfidence`, `exactBinomialConfidence`) so a reviewer can verify which number is being quoted.
