@@ -1618,6 +1618,10 @@ def compute_effective_weight(
     Returns ``0.0`` if no promotions exist. Negative ``days_since`` (clock
     skew — ``promoted_at`` in the future) is clamped to ``0.0`` so the decay
     factor caps at ``1.0`` rather than producing a spurious >1 boost.
+
+    Single-thought version. For multi-thought callers (e.g. ``search()``
+    scoring its result set), use :func:`compute_effective_weights_batch`
+    which pushes the sum into Postgres in a single round-trip.
     """
     cur = conn.cursor()
     try:
@@ -1640,6 +1644,77 @@ def compute_effective_weight(
         decay = (1.0 + days_clamped) ** HEBBIAN_DECAY_EXPONENT
         total += float(weight) * decay
     return total
+
+
+def compute_effective_weights_batch(
+    conn,
+    thought_ids: List[str],
+    user_id: str,
+) -> Dict[str, float]:
+    """Batch version of :func:`compute_effective_weight` — one SQL round-trip.
+
+    Pushes the time-decay sum into Postgres rather than walking rows in
+    Python. Used by :func:`search` to score a full result set without
+    issuing N separate queries.
+
+    Formula (server-side, identical to the single-thought version)::
+
+        effective_weight = SUM( weight * POWER(1 + days_since, -0.7) )
+
+    Filters by ``user_id`` (PS scope) AND ``thought_id = ANY(:ids)``.
+    Negative ``days_since`` (clock skew) is clamped to 0 in SQL — matching
+    the single-thought implementation's behavior — so the per-row decay
+    factor caps at 1.0.
+
+    Parameters
+    ----------
+    conn
+        Open psycopg2 connection.
+    thought_ids
+        List of thought_ids to score. Empty list → empty dict (no SQL).
+    user_id
+        Caller PS scope.
+
+    Returns
+    -------
+    dict
+        Mapping ``thought_id -> effective_weight``. Every input ``thought_id``
+        appears in the result: thoughts with no matching promotions default
+        to ``0.0`` rather than being silently dropped.
+    """
+    if not thought_ids:
+        return {}
+    cur = conn.cursor()
+    try:
+        # `ANY(%s)` accepts a Python list and binds as a Postgres array.
+        # Cleaner than IN (%s, %s, ...) at variable arity.
+        # Apply the same clock-skew clamp the single-thought version does
+        # by wrapping (NOW() - promoted_at) days-since in GREATEST(., 0).
+        cur.execute(
+            """
+            SELECT thought_id,
+                   COALESCE(SUM(
+                       weight * POWER(
+                           1.0 + GREATEST(
+                               0.0,
+                               EXTRACT(EPOCH FROM (NOW() - promoted_at)) / 86400.0
+                           ),
+                           %s
+                       )
+                   ), 0.0) AS effective_weight
+            FROM brain.promotions
+            WHERE user_id = %s AND thought_id = ANY(%s)
+            GROUP BY thought_id
+            """,
+            (HEBBIAN_DECAY_EXPONENT, user_id, list(thought_ids)),
+        )
+        by_tid = {row[0]: float(row[1]) for row in cur.fetchall()}
+    finally:
+        cur.close()
+    # Thoughts with zero promotions don't appear in the GROUP BY result —
+    # callers expect a complete mapping (e.g., search() iterates result
+    # rows by tid), so default missing ids to 0.0.
+    return {tid: by_tid.get(tid, 0.0) for tid in thought_ids}
 
 
 def capture(
@@ -2076,6 +2151,62 @@ def search(
             # Normalize to uppercase keys for compatibility with formatters/Pi bridge
             d = {k.upper(): v for k, v in d.items()}
             results.append(d)
+
+    # brain-W1-S13 (gz-97l2z): Hebbian promotion boost, gated by within-kind
+    # over-application defense. A heavily-promoted-but-irrelevant thought
+    # MUST NOT outrank a relevant unpromoted one — so the boost is zeroed
+    # below HEBBIAN_MIN_RELEVANCE_FLOOR (0.30 cosine sim). Defense per
+    # gz-dsax2 / W1-R0 finding.
+    #
+    # Final score formula:
+    #     hybrid_score' = hybrid_score
+    #                     + HEBBIAN_BOOST_COEFFICIENT * effective_weight
+    #                       if similarity >= HEBBIAN_MIN_RELEVANCE_FLOOR
+    #                       else 0
+    #
+    # Implementation note: effective_weight fetched via single SQL aggregate
+    # round-trip (compute_effective_weights_batch — gz-8nsvj) rather than
+    # N per-thought queries.
+    if results:
+        candidate_tids = [r.get("THOUGHT_ID") for r in results if r.get("THOUGHT_ID")]
+        if candidate_tids:
+            try:
+                weights_by_tid = compute_effective_weights_batch(
+                    conn, candidate_tids, user_id,
+                )
+            except Exception:
+                # On any aggregate error, degrade gracefully: emit zero
+                # boosts. Hebbian is a scoring assist, not a correctness
+                # invariant — search() must still return results.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                weights_by_tid = {tid: 0.0 for tid in candidate_tids}
+
+            for r in results:
+                tid = r.get("THOUGHT_ID")
+                vs = float(r.get("SIMILARITY", 0.0) or 0.0)
+                eff_weight = float(weights_by_tid.get(tid, 0.0))
+                # Gate: below the floor, boost is 0 regardless of weight.
+                if vs >= HEBBIAN_MIN_RELEVANCE_FLOOR and eff_weight != 0.0:
+                    promotion_boost = HEBBIAN_BOOST_COEFFICIENT * eff_weight
+                else:
+                    promotion_boost = 0.0
+                r["EFFECTIVE_WEIGHT"] = round(eff_weight, 4)
+                r["PROMOTION_BOOST"] = round(promotion_boost, 4)
+                base_score = float(r.get("HYBRID_SCORE", 0.0) or 0.0)
+                r["HYBRID_SCORE"] = round(base_score + promotion_boost, 4)
+
+            # Re-sort by the now-boosted HYBRID_SCORE — the input order
+            # reflects pre-boost ranking. Only re-sort when sort_by leaves
+            # similarity-driven ordering in effect (sort_by="time" callers
+            # explicitly want chronological order; respect that).
+            if sort_by != "time":
+                results.sort(
+                    key=lambda x: float(x.get("HYBRID_SCORE", 0.0) or 0.0),
+                    reverse=True,
+                )
 
     # ── Memory reinforcement: touch updated_at on accessed thoughts ──
     # This resets the time_decay clock, making frequently-accessed memories

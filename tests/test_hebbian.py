@@ -504,3 +504,236 @@ class TestMultiUserIsolation:
             assert abs(eff_b - 1.0) < 0.05
         finally:
             _cleanup_thought(conn, tid)
+
+
+# ─── brain-W1-S13 (gz-97l2z): Hebbian search integration ─────────────────────
+#
+# These tests verify that the Hebbian primitive (S11) is wired into the
+# search() retrieval path with the within-kind over-application defense
+# (gz-dsax2 / W1-R0): the boost is gated by a vector-similarity floor
+# (HEBBIAN_MIN_RELEVANCE_FLOOR = 0.30). A heavily-promoted but
+# semantically-irrelevant thought MUST NOT outrank a relevant unpromoted one.
+
+
+def _result_tid(row):
+    """search() uppercases keys; pick the thought_id field robustly."""
+    return row.get("THOUGHT_ID") or row.get("thought_id")
+
+
+class TestHebbianSearchIntegration:
+    """Wave-1 S13 — Hebbian promotion boosts search scoring, gated by the
+    within-kind over-application defense (vec_similarity >= MIN_RELEVANCE_FLOOR)."""
+
+    def test_promoted_relevant_thought_outranks_unpromoted_relevant(self, conn):
+        """A relevant thought that's been promoted outranks an equally-relevant unpromoted one."""
+        u = "hebbian-rank-promoted"
+        # Both thoughts mention the query topic
+        r1 = open_brain.capture(conn, text="alpha quantum entanglement physics", user_id=u)
+        r2 = open_brain.capture(conn, text="alpha quantum entanglement physics extra", user_id=u)
+        try:
+            open_brain.promote_thought(conn, r1["thought_id"], u, weight=5.0)
+            results = open_brain.search(conn, query="alpha quantum entanglement", user_id=u, limit=10)
+            # r1 (promoted) should rank ahead of r2 (unpromoted)
+            tids = [_result_tid(r) for r in results]
+            assert r1["thought_id"] in tids and r2["thought_id"] in tids, (
+                f"Expected both r1={r1['thought_id']} and r2={r2['thought_id']} in {tids}"
+            )
+            assert tids.index(r1["thought_id"]) < tids.index(r2["thought_id"])
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id IN (%s, %s)",
+                        (r1["thought_id"], r2["thought_id"]))
+            conn.commit()
+
+    def test_promoted_irrelevant_thought_does_not_outrank_relevant_unpromoted(self, conn):
+        """The within-kind defense: a heavily-promoted-but-irrelevant thought
+        below MIN_RELEVANCE_FLOOR gets ZERO boost and cannot leapfrog a
+        truly-relevant unpromoted thought."""
+        u = "hebbian-within-kind"
+        # r_relevant: matches query well
+        r_relevant = open_brain.capture(conn,
+            text="beta photon laser optics deep coherence resonance",
+            user_id=u)
+        # r_irrelevant: totally unrelated; heavily promoted
+        r_irrelevant = open_brain.capture(conn,
+            text="banana sandwich recipe cooking",
+            user_id=u)
+        try:
+            open_brain.promote_thought(conn, r_irrelevant["thought_id"], u, weight=20.0)
+            results = open_brain.search(conn,
+                query="beta photon laser optics",
+                user_id=u, limit=10)
+            # r_relevant must outrank r_irrelevant despite massive promotion delta
+            tids = [_result_tid(r) for r in results]
+            if r_irrelevant["thought_id"] in tids and r_relevant["thought_id"] in tids:
+                assert tids.index(r_relevant["thought_id"]) < tids.index(r_irrelevant["thought_id"]), \
+                    "Within-kind defense FAILED: heavily-promoted irrelevant outranked relevant"
+            # Acceptable also: r_irrelevant doesn't appear at all (below threshold)
+            if r_irrelevant["thought_id"] in tids:
+                # Verify its promotion_boost was 0 (gated by floor)
+                r_obj = [r for r in results if _result_tid(r) == r_irrelevant["thought_id"]][0]
+                boost = r_obj.get("PROMOTION_BOOST", r_obj.get("promotion_boost", 0.0))
+                assert boost == 0.0, (
+                    f"Within-kind defense FAILED: irrelevant thought got non-zero boost {boost}"
+                )
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id IN (%s, %s)",
+                        (r_relevant["thought_id"], r_irrelevant["thought_id"]))
+            conn.commit()
+
+    def test_search_result_carries_effective_weight_and_promotion_boost_fields(self, conn):
+        """Every search result row carries effective_weight + promotion_boost fields."""
+        u = "hebbian-fields"
+        r = open_brain.capture(conn, text="gamma ray spectrum observation", user_id=u)
+        try:
+            open_brain.promote_thought(conn, r["thought_id"], u, weight=2.0)
+            results = open_brain.search(conn, query="gamma ray spectrum", user_id=u, limit=5)
+            assert results, "expected at least one result"
+            top = results[0]
+            assert "EFFECTIVE_WEIGHT" in top or "effective_weight" in top, (
+                f"effective_weight field missing from result keys={list(top.keys())}"
+            )
+            assert "PROMOTION_BOOST" in top or "promotion_boost" in top, (
+                f"promotion_boost field missing from result keys={list(top.keys())}"
+            )
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id=%s", (r["thought_id"],))
+            conn.commit()
+
+    def test_demoted_thought_ranks_lower(self, conn):
+        """A demoted thought (negative effective_weight) ranks lower than an unmodified one."""
+        u = "hebbian-demote-rank"
+        r1 = open_brain.capture(conn, text="delta wave neural pattern signature", user_id=u)
+        r2 = open_brain.capture(conn, text="delta wave neural pattern signature extra", user_id=u)
+        try:
+            open_brain.demote_thought(conn, r1["thought_id"], u, weight=5.0)
+            results = open_brain.search(conn, query="delta wave neural pattern", user_id=u, limit=10)
+            tids = [_result_tid(r) for r in results]
+            if r1["thought_id"] in tids and r2["thought_id"] in tids:
+                assert tids.index(r2["thought_id"]) < tids.index(r1["thought_id"]), \
+                    "Demoted thought did not rank lower"
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id IN (%s, %s)",
+                        (r1["thought_id"], r2["thought_id"]))
+            conn.commit()
+
+
+class TestComputeEffectiveWeightsBatch:
+    """gz-8nsvj — SQL aggregate batch version of compute_effective_weight."""
+
+    def test_batch_returns_zero_for_unpromoted(self, conn):
+        u = "hebbian-batch-zero"
+        r = open_brain.capture(conn, text="batch zero test", user_id=u)
+        try:
+            results = open_brain.compute_effective_weights_batch(
+                conn, [r["thought_id"]], u)
+            assert results[r["thought_id"]] == 0.0
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id=%s", (r["thought_id"],))
+            conn.commit()
+
+    def test_batch_sums_correctly_for_promoted(self, conn):
+        u = "hebbian-batch-sum"
+        r = open_brain.capture(conn, text="batch sum test", user_id=u)
+        try:
+            open_brain.promote_thought(conn, r["thought_id"], u, weight=1.0)
+            open_brain.promote_thought(conn, r["thought_id"], u, weight=2.0)
+            results = open_brain.compute_effective_weights_batch(
+                conn, [r["thought_id"]], u)
+            assert abs(results[r["thought_id"]] - 3.0) < 0.05
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id=%s", (r["thought_id"],))
+            conn.commit()
+
+    def test_batch_empty_list_returns_empty_dict(self, conn):
+        assert open_brain.compute_effective_weights_batch(conn, [], "anyuser") == {}
+
+    def test_batch_matches_single_call_value(self, conn):
+        """compute_effective_weights_batch returns the same value as the per-thought version."""
+        u = "hebbian-batch-parity"
+        r = open_brain.capture(conn, text="parity test", user_id=u)
+        try:
+            open_brain.promote_thought(conn, r["thought_id"], u, weight=1.5)
+            single = open_brain.compute_effective_weight(conn, r["thought_id"], u)
+            batch = open_brain.compute_effective_weights_batch(
+                conn, [r["thought_id"]], u)
+            assert abs(single - batch[r["thought_id"]]) < 0.01
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id=%s", (r["thought_id"],))
+            conn.commit()
+
+    def test_batch_handles_multiple_thoughts(self, conn):
+        """Batch fetch returns one entry per requested thought_id, including
+        unpromoted ones (defaulted to 0.0)."""
+        u = "hebbian-batch-multi"
+        r_a = open_brain.capture(conn, text="batch multi a", user_id=u)
+        r_b = open_brain.capture(conn, text="batch multi b", user_id=u)
+        r_c = open_brain.capture(conn, text="batch multi c (no promo)", user_id=u)
+        try:
+            open_brain.promote_thought(conn, r_a["thought_id"], u, weight=2.0)
+            open_brain.promote_thought(conn, r_b["thought_id"], u, weight=4.0)
+            tids = [r_a["thought_id"], r_b["thought_id"], r_c["thought_id"]]
+            results = open_brain.compute_effective_weights_batch(conn, tids, u)
+            assert set(results.keys()) == set(tids)
+            assert abs(results[r_a["thought_id"]] - 2.0) < 0.05
+            assert abs(results[r_b["thought_id"]] - 4.0) < 0.05
+            assert results[r_c["thought_id"]] == 0.0
+        finally:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM brain.thoughts WHERE thought_id IN (%s, %s, %s)",
+                (r_a["thought_id"], r_b["thought_id"], r_c["thought_id"]),
+            )
+            conn.commit()
+
+    def test_batch_respects_user_scope(self, conn):
+        """Promotions under a different user_id must not bleed into the
+        batch fetch for the requested user."""
+        u_a = "hebbian-batch-scope-A"
+        u_b = "hebbian-batch-scope-B"
+        r = open_brain.capture(conn, text="batch scope test", user_id=u_a)
+        tid = r["thought_id"]
+        try:
+            open_brain.promote_thought(conn, tid, u_a, weight=3.0)
+            # Bypass PS via direct SQL to plant a userB row.
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO brain.promotions
+                  (thought_id, user_id, weight, prov_agent)
+                VALUES (%s, %s, 99.0, 'test')
+                """,
+                (tid, u_b),
+            )
+            conn.commit()
+            results_a = open_brain.compute_effective_weights_batch(conn, [tid], u_a)
+            results_b = open_brain.compute_effective_weights_batch(conn, [tid], u_b)
+            assert abs(results_a[tid] - 3.0) < 0.05
+            assert abs(results_b[tid] - 99.0) < 0.5
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id=%s", (tid,))
+            conn.commit()
+
+    def test_batch_includes_unpromoted_with_zero(self, conn):
+        """Unpromoted thought_ids in the input list MUST appear with value 0.0
+        (not be silently dropped from the returned dict)."""
+        u = "hebbian-batch-fill"
+        r = open_brain.capture(conn, text="batch fill test", user_id=u)
+        try:
+            results = open_brain.compute_effective_weights_batch(
+                conn, [r["thought_id"], "nonexistent-thought-id-12345"], u)
+            assert r["thought_id"] in results
+            assert "nonexistent-thought-id-12345" in results
+            assert results["nonexistent-thought-id-12345"] == 0.0
+            assert results[r["thought_id"]] == 0.0
+        finally:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM brain.thoughts WHERE thought_id=%s", (r["thought_id"],))
+            conn.commit()
