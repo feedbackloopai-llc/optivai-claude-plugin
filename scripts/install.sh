@@ -530,10 +530,13 @@ install_unix() {
     print_header "Installing Skills"
 
     if [ -d "$REPO_DIR/skills" ]; then
-        cp "$REPO_DIR/skills/"* "$SKILLS_DIR/" 2>/dev/null || true
+        # Skills follow the agentskills.io layout: each skill is a directory
+        # containing SKILL.md plus optional reference files. Recursive copy
+        # preserves that layout. Loose top-level files (legacy) are also copied.
+        cp -R "$REPO_DIR/skills/"* "$SKILLS_DIR/" 2>/dev/null || true
         SKILL_COUNT=$(ls -1 "$SKILLS_DIR" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$SKILL_COUNT" -gt 0 ]; then
-            print_status "Installed $SKILL_COUNT skill files to $SKILLS_DIR"
+            print_status "Installed $SKILL_COUNT skill entries to $SKILLS_DIR"
         fi
     fi
 
@@ -679,6 +682,36 @@ $ENV_BLOCK
 SETTINGS
 
     print_status "Generated settings.json"
+
+    # ─── brain-v0.2.0 upgrade detection (deploy-S2) ─────────────────────────────
+    # If brain.thoughts exists but lacks the PROV-DM columns, this is a pre-v0.2.0
+    # install — run migrate-all.sh to upgrade. Idempotent: safe on fresh installs.
+    if [[ -n "${DATABASE_URL:-}" ]]; then
+      HAS_PROV=$(python3 -c "
+import os, sys
+try:
+    import psycopg2
+    conn = psycopg2.connect(os.environ['DATABASE_URL'])
+    cur = conn.cursor()
+    cur.execute(\"\"\"
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='brain' AND table_name='thoughts'
+          AND column_name='prov_agent'
+    \"\"\")
+    print('yes' if cur.fetchone() else 'no')
+    conn.close()
+except Exception:
+    print('error', file=sys.stderr)
+    sys.exit(0)  # don't block install on DB issues — user can re-run
+" 2>/dev/null || echo "no")
+
+      if [[ "$HAS_PROV" == "no" ]]; then
+        echo "→ Upgrading brain schema to v0.2.0..."
+        bash "$REPO_DIR/scripts/migrate-all.sh"
+      elif [[ "$HAS_PROV" == "yes" ]]; then
+        echo "✓ Brain schema is at v0.2.0 — no upgrade needed."
+      fi
+    fi
 
     # Install PostgreSQL sync daemon
     if [ "$SKIP_DAEMON" = false ]; then
