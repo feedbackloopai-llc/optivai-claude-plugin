@@ -1785,6 +1785,16 @@ def capture(
         Optional parent ``thought_id``. Validated to exist within the
         caller's ``user_id`` scope (PS — Principal Scoping); a mismatch
         raises :class:`RuntimeError`.
+
+    Notes
+    -----
+    **PS contract granularity (gz-ldmr4):** Principal Scoping is enforced
+    at ``user_id`` granularity only. There is no ``project`` sub-scope —
+    a ``was_derived_from`` parent in the same user's scope is accepted
+    even if its ``project`` field differs from the caller's. The
+    ``project`` column is metadata, not an isolation boundary. If you
+    need stricter isolation (e.g., per-project), enforce it at the
+    application layer or scope `user_id` to include a project suffix.
     """
     thought_id = _generate_thought_id()
     cur = conn.cursor()
