@@ -180,23 +180,25 @@ class TestReplayLogSchema:
 
 class TestPiiRedaction:
     def test_email_redacted(self):
+        # redact-S7: pipeline now emits category-tagged [REDACTED:...] markers
+        # rather than the older [EMAIL]/[PHONE]/[SSN]/[CARD] tokens.
         result = open_brain.redact_pii("contact me at alice@example.com")
-        assert "[EMAIL]" in result
+        assert "[REDACTED:pii.contact.email]" in result
         assert "alice@example.com" not in result
 
     def test_phone_redacted(self):
         result = open_brain.redact_pii("Call 555-867-5309 anytime")
-        assert "[PHONE]" in result
+        assert "[REDACTED:pii.contact.phone_us]" in result
         assert "555-867-5309" not in result
 
     def test_ssn_redacted(self):
         result = open_brain.redact_pii("SSN: 123-45-6789 on file")
-        assert "[SSN]" in result
+        assert "[REDACTED:pii.identity.ssn_us]" in result
         assert "123-45-6789" not in result
 
     def test_card_redacted(self):
         result = open_brain.redact_pii("Visa: 4111 1111 1111 1111")
-        assert "[CARD]" in result
+        assert "[REDACTED:payment.card.pan]" in result
         assert "4111 1111 1111 1111" not in result
 
     def test_no_pii_passes_through(self):
@@ -242,8 +244,9 @@ class TestCaptureInstrumentation:
             _cleanup_logs(conn, u)
 
     def test_capture_with_pii_redacts_in_log(self, conn):
-        """A capture containing an email gets the [EMAIL] token in the replay log,
-        NOT the raw email."""
+        """A capture containing an email gets the [REDACTED:pii.contact.email]
+        token in the replay log, NOT the raw email. Token format updated under
+        redact-S7 (was [EMAIL] under the previous 4-pattern redactor)."""
         u = "replay-cap-pii"
         _cleanup_logs(conn, u)
         r = open_brain.capture(
@@ -264,7 +267,7 @@ class TestCaptureInstrumentation:
             summary = cur.fetchone()[0]
             cur.close()
             assert "bob@example.com" not in summary
-            assert "[EMAIL]" in summary
+            assert "[REDACTED:pii.contact.email]" in summary
         finally:
             _cleanup_thought(conn, tid)
             _cleanup_logs(conn, u)
@@ -419,7 +422,8 @@ class TestSearchInstrumentation:
             _cleanup_logs(conn, u)
 
     def test_search_with_pii_redacts_query(self, conn):
-        """A query containing an email gets [EMAIL] in the replay log, not the raw address."""
+        """A query containing an email gets [REDACTED:pii.contact.email] in the
+        replay log, not the raw address. Token format updated under redact-S7."""
         u = "replay-search-pii"
         _cleanup_logs(conn, u)
         open_brain.search(conn, query="who is bob@example.com", user_id=u, limit=5)
@@ -432,7 +436,7 @@ class TestSearchInstrumentation:
         row = cur.fetchone()
         assert row is not None
         assert "bob@example.com" not in (row[0] or "")
-        assert "[EMAIL]" in (row[0] or "")
+        assert "[REDACTED:pii.contact.email]" in (row[0] or "")
         _cleanup_logs(conn, u)
 
     def test_search_metadata_records_result_count(self, conn):

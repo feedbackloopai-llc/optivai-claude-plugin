@@ -37,41 +37,64 @@ import jsonpatch
 logger = logging.getLogger("open_brain")
 
 
-# ─── PII redaction (brain-W2-S6) ─────────────────────────────────────────────
-# Patterns are additive and intentionally specific to minimise false positives.
+# ─── PII + secrets redaction (redact-S7 — was brain-W2-S6) ───────────────────
+# Defense-in-depth redaction pipeline (replaces the prior 4-pattern PII regex).
+# Vendored from gz-redact under scripts/redact/ — bead redact-S7.
+# Pipeline order:
+#   1. secrets_redactors (8+ categories — AWS, Anthropic, OpenAI, GitHub, Slack,
+#      Stripe, JWT, PEM private keys, plus several more)
+#   2. pii_redactors (7 categories — email, phone, SSN, PAN+Luhn, IPv4, IPv6, DOB)
+#   3. ContextRedactor wrapping EntropyRedactor — catches high-entropy unknown
+#      tokens near keywords like 'password' / 'api_key', suppresses low-confidence
+#      noise in unrelated prose.
+#
 # The redactor runs at the replay-log emitter boundary BEFORE any write, so
 # brain.replay_log rows never contain raw PII (the pii_distinct DEFAULT TRUE
 # column marker is the auditable assertion of this discipline).
 
-PII_PATTERNS = [
-    # Email — RFC-5322-flavoured (intentionally less greedy than full RFC).
-    (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), '[EMAIL]'),
-    # SSN — XXX-XX-XXXX. Anchored to word boundaries so plain "123-45-6789"
-    # in a longer digit string is not silently masked.
-    (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), '[SSN]'),
-    # Card numbers — 16 digits in 4 groups of 4, separator either space or dash.
-    (re.compile(r'\b(?:\d{4}[ -]?){3}\d{4}\b'), '[CARD]'),
-    # Phone — North-American format with optional country code. Anchored on
-    # word boundaries; the (?<!\d) lookbehind on the leading group prevents
-    # eating an already-redacted card-fragment tail. SSN runs first so that
-    # NNN-NN-NNNN never reaches this pattern.
-    (re.compile(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'), '[PHONE]'),
-]
+import sys as _sys
+_redact_path = os.path.dirname(os.path.abspath(__file__))
+if _redact_path not in _sys.path:
+    _sys.path.insert(0, _redact_path)
+from redact import (
+    compose,
+    redact as _redact_compose,
+    secrets_redactors,
+    pii_redactors,
+    EntropyRedactor,
+    ContextRedactor,
+)
+
+# Composed pipeline — built once at module load (immutable).
+_REDACT_PIPELINE = compose([
+    *secrets_redactors,
+    *pii_redactors,
+    ContextRedactor(
+        inner=EntropyRedactor(),  # default opts (min_entropy=4.58, base confidence 0.4)
+        keywords=["password", "secret", "api_key", "token", "key", "cred"],
+        radius=15,
+        upgraded_confidence=0.85,
+        suppress_low_confidence=0.6,
+    ),
+])
 
 
 def redact_pii(text: Optional[str]) -> Optional[str]:
-    """Apply PII regex masking. Returns None for None input, '' for ''.
+    """Defense-in-depth redaction via the composed gz-redact-derived pipeline.
 
-    Order matters: SSN (NNN-NN-NNNN) is masked BEFORE phone (NNN-NNN-NNNN) so
-    the more specific format wins. Cards run before phone for the same reason
-    (16-digit blocks would otherwise be partially eaten by the phone pattern).
+    Same signature as the original 4-pattern function, so existing callsites
+    (emit_replay_log, etc.) work unchanged. Now catches:
+      - 8+ secret categories (AWS, Anthropic, OpenAI, GitHub, Slack, Stripe,
+        JWT, PEM private keys, plus GCP, HuggingFace, GitLab, Twilio, SendGrid,
+        HubSpot, Atlassian, bearer headers, basic-auth URLs)
+      - 7 PII categories (email, phone, SSN, Luhn-validated PAN, IPv4, IPv6, DOB)
+      - High-entropy unknown tokens near 'password' / 'api_key' / similar keywords
+
+    Returns None if input is None (preserves the old contract).
     """
     if text is None:
         return None
-    result = text
-    for pattern, replacement in PII_PATTERNS:
-        result = pattern.sub(replacement, result)
-    return result
+    return _redact_compose(text, _REDACT_PIPELINE)
 
 
 # ─── Replay-log emitter (brain-W2-S6) ────────────────────────────────────────
@@ -3207,6 +3230,8 @@ def main():
     group.add_argument("--replay", action="store_true",
                        help="Show the chronological brain replay log "
                             "(combine with --session-id, --from, --to, --event-type)")
+    group.add_argument("--redact-test", type=str, metavar="TEXT", dest="redact_test",
+                       help="Run the redaction pipeline against TEXT and show what gets caught")
 
     parser.add_argument("--from", type=str, default=None, dest="from_iso",
                         metavar="ISO",
@@ -3270,6 +3295,25 @@ def main():
             print(json.dumps(result))
         else:
             print(f"Migration {result['status']}: {result['file']} ({result['size_bytes']} bytes)")
+        return
+
+    if args.redact_test:
+        # redact-S10: manual verification CLI. Runs the composed redaction
+        # pipeline against TEXT and shows what gets caught. Useful for
+        # partner-trust verification ("paste a sample, see what would be
+        # redacted"). No DB connection needed.
+        redacted = redact_pii(args.redact_test)
+        if args.json:
+            print(json.dumps({
+                "input": args.redact_test,
+                "redacted": redacted,
+                "changed": args.redact_test != redacted,
+            }, indent=2))
+        else:
+            print(f"Input:    {args.redact_test}")
+            print(f"Redacted: {redacted}")
+            if args.redact_test == redacted:
+                print("(no changes — nothing caught)")
         return
 
     user_id = _get_user_id()
