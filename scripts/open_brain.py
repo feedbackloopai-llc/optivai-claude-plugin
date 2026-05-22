@@ -577,16 +577,24 @@ def _derive_prov_agent(source: Optional[str], user_id: str) -> str:
     The mappings give every capture a recognizable principal even when the
     caller omits ``prov_agent`` explicitly. This is the WA-gate default;
     callers may override by passing ``prov_agent=...`` to :func:`capture`.
+
+    gz-1t9l2 — result is clamped to 100 chars to fit the VARCHAR(100)
+    column on every prov_agent storage path (brain.thoughts.prov_agent,
+    brain.promotions.prov_agent, brain.thought_versions.prov_agent). A
+    long ``user_id`` (>= 92 chars after the "cli-user-" prefix) would
+    otherwise overflow the column at INSERT time.
     """
     if not source or source == "manual":
-        return f"cli-user-{user_id}"
-    if source == "pi" or source.startswith("pi-"):
-        return "pi-agent"
-    if source == "claude-code":
-        return "claude-code"
-    if source.startswith("hook-"):
-        return f"claude-code-hook-{source[5:]}"
-    return f"source-{source}"
+        result = f"cli-user-{user_id}"
+    elif source == "pi" or source.startswith("pi-"):
+        result = "pi-agent"
+    elif source == "claude-code":
+        result = "claude-code"
+    elif source.startswith("hook-"):
+        result = f"claude-code-hook-{source[5:]}"
+    else:
+        result = f"source-{source}"
+    return result[:100]
 
 
 def _generate_activity_id(thought_id: str) -> str:
@@ -646,97 +654,114 @@ def snapshot_thought(
         ``{"version_id": int, "revision": int, "thought_id": str}``
     """
     cur = conn.cursor()
-
-    # PS scope check + fetch current thought state
-    cur.execute(
-        """
-        SELECT raw_text, summary, thought_type, topics, people, action_items,
-               embedding, metadata
-        FROM brain.thoughts
-        WHERE thought_id = %s AND user_id = %s
-        """,
-        (thought_id, user_id),
-    )
-    row = cur.fetchone()
-    if row is None:
-        cur.close()
-        raise RuntimeError(
-            f"snapshot_thought: thought {thought_id} not in user scope "
-            f"(user={user_id})"
+    try:
+        # gz-y0zmq — snapshot concurrent race defense. The PS scope check
+        # below uses SELECT ... FOR UPDATE so a second concurrent snapshot
+        # of the same thought blocks until this one commits, serializing
+        # the (max-revision + 1) → INSERT sequence against the UNIQUE
+        # (thought_id, revision) constraint.
+        cur.execute(
+            """
+            SELECT raw_text, summary, thought_type, topics, people, action_items,
+                   embedding, metadata
+            FROM brain.thoughts
+            WHERE thought_id = %s AND user_id = %s
+            FOR UPDATE
+            """,
+            (thought_id, user_id),
         )
-    raw_text, summary, thought_type, topics, people, action_items, embedding, metadata = row
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"snapshot_thought: thought {thought_id} not in user scope "
+                f"(user={user_id})"
+            )
+        raw_text, summary, thought_type, topics, people, action_items, embedding, metadata = row
 
-    # Determine next revision + previous version state (for diff).
-    cur.execute(
-        """
-        SELECT version_id, revision, raw_text, summary, thought_type,
-               topics, people, action_items, metadata
-        FROM brain.thought_versions
-        WHERE thought_id = %s
-        ORDER BY revision DESC
-        LIMIT 1
-        """,
-        (thought_id,),
-    )
-    prev = cur.fetchone()
-    next_revision = (prev[1] + 1) if prev else 1
-    parent_version = prev[0] if prev else None
-
-    # Compute RFC 6902 diff from prev to current. Embedding vectors are
-    # not diffed (cosine-similarity noise; vector diff is a no-op).
-    diff_json = None
-    if prev:
-        prev_state = {
-            "raw_text": prev[2],
-            "summary": prev[3],
-            "thought_type": prev[4],
-            "topics": prev[5],
-            "people": prev[6],
-            "action_items": prev[7],
-            "metadata": prev[8],
-        }
-        curr_state = {
-            "raw_text": raw_text,
-            "summary": summary,
-            "thought_type": thought_type,
-            "topics": topics,
-            "people": people,
-            "action_items": action_items,
-            "metadata": metadata,
-        }
-        patch = jsonpatch.make_patch(prev_state, curr_state)
-        diff_json = patch.patch
-
-    if prov_agent is None:
-        prov_agent = _derive_prov_agent("manual", user_id)
-
-    cur.execute(
-        """
-        INSERT INTO brain.thought_versions (
-            thought_id, revision, raw_text, summary, thought_type,
-            topics, people, action_items, embedding, metadata,
-            prov_agent, prov_activity, parent_version, diff_json
-        ) VALUES (
-            %s, %s, %s, %s, %s,
-            %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
-            %s, %s, %s, %s::jsonb
+        # Determine next revision + previous version state (for diff).
+        cur.execute(
+            """
+            SELECT version_id, revision, raw_text, summary, thought_type,
+                   topics, people, action_items, metadata
+            FROM brain.thought_versions
+            WHERE thought_id = %s
+            ORDER BY revision DESC
+            LIMIT 1
+            """,
+            (thought_id,),
         )
-        RETURNING version_id
-        """,
-        (
-            thought_id, next_revision, raw_text, summary, thought_type,
-            json.dumps(topics) if topics is not None else None,
-            json.dumps(people) if people is not None else None,
-            json.dumps(action_items) if action_items is not None else None,
-            embedding if embedding is not None else None,
-            json.dumps(metadata) if metadata is not None else None,
-            prov_agent, prov_activity, parent_version,
-            json.dumps(diff_json) if diff_json is not None else None,
-        ),
-    )
-    version_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
+        prev = cur.fetchone()
+        next_revision = (prev[1] + 1) if prev else 1
+        parent_version = prev[0] if prev else None
+
+        # Compute RFC 6902 diff from prev to current. Embedding vectors are
+        # not diffed (cosine-similarity noise; vector diff is a no-op).
+        diff_json = None
+        if prev:
+            prev_state = {
+                "raw_text": prev[2],
+                "summary": prev[3],
+                "thought_type": prev[4],
+                "topics": prev[5],
+                "people": prev[6],
+                "action_items": prev[7],
+                "metadata": prev[8],
+            }
+            curr_state = {
+                "raw_text": raw_text,
+                "summary": summary,
+                "thought_type": thought_type,
+                "topics": topics,
+                "people": people,
+                "action_items": action_items,
+                "metadata": metadata,
+            }
+            patch = jsonpatch.make_patch(prev_state, curr_state)
+            diff_json = patch.patch
+
+        if prov_agent is None:
+            prov_agent = _derive_prov_agent("manual", user_id)
+
+        cur.execute(
+            """
+            INSERT INTO brain.thought_versions (
+                thought_id, revision, raw_text, summary, thought_type,
+                topics, people, action_items, embedding, metadata,
+                prov_agent, prov_activity, parent_version, diff_json
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
+                %s, %s, %s, %s::jsonb
+            )
+            RETURNING version_id
+            """,
+            (
+                thought_id, next_revision, raw_text, summary, thought_type,
+                json.dumps(topics) if topics is not None else None,
+                json.dumps(people) if people is not None else None,
+                json.dumps(action_items) if action_items is not None else None,
+                embedding if embedding is not None else None,
+                json.dumps(metadata) if metadata is not None else None,
+                prov_agent, prov_activity, parent_version,
+                json.dumps(diff_json) if diff_json is not None else None,
+            ),
+        )
+        version_id = cur.fetchone()[0]
+        conn.commit()
+    except Exception:
+        # gz-af9kn — guarantee rollback + cursor cleanup even when the
+        # JSON-patch / embedding-serialization paths above raise. Without
+        # this the cursor + tx state leaks back to the caller's conn.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
     # brain-W2-S6: replay-log emission. Best-effort; never raises.
     emit_replay_log(
@@ -833,103 +858,118 @@ def rollback_thought(
         "rolled_back_to_revision": int}``
     """
     cur = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM brain.thoughts WHERE thought_id=%s AND user_id=%s",
-        (thought_id, user_id),
-    )
-    if cur.fetchone() is None:
-        cur.close()
-        raise RuntimeError(
-            f"rollback_thought: thought {thought_id} not in user scope "
-            f"(user={user_id})"
+    try:
+        # gz-y0zmq — same concurrent-race defense as snapshot_thought:
+        # take a row-level lock on the parent thought so concurrent
+        # rollbacks (or snapshot + rollback) of the same thought serialize
+        # against the UNIQUE (thought_id, revision) constraint.
+        cur.execute(
+            "SELECT 1 FROM brain.thoughts WHERE thought_id=%s AND user_id=%s FOR UPDATE",
+            (thought_id, user_id),
         )
+        if cur.fetchone() is None:
+            raise RuntimeError(
+                f"rollback_thought: thought {thought_id} not in user scope "
+                f"(user={user_id})"
+            )
 
-    # Fetch the target revision's state.
-    cur.execute(
-        """
-        SELECT version_id, raw_text, summary, thought_type, topics, people,
-               action_items, embedding, metadata
-        FROM brain.thought_versions
-        WHERE thought_id = %s AND revision = %s
-        """,
-        (thought_id, to_revision),
-    )
-    target = cur.fetchone()
-    if target is None:
-        cur.close()
-        raise RuntimeError(
-            f"rollback_thought: revision {to_revision} of {thought_id} not found"
+        # Fetch the target revision's state.
+        cur.execute(
+            """
+            SELECT version_id, raw_text, summary, thought_type, topics, people,
+                   action_items, embedding, metadata
+            FROM brain.thought_versions
+            WHERE thought_id = %s AND revision = %s
+            """,
+            (thought_id, to_revision),
         )
-    (
-        target_version_id, raw_text, summary, thought_type, topics, people,
-        action_items, embedding, metadata,
-    ) = target
-
-    # Determine the next revision. Rollback ALWAYS appends — never rewrites.
-    cur.execute(
-        """
-        SELECT revision FROM brain.thought_versions WHERE thought_id = %s
-        ORDER BY revision DESC LIMIT 1
-        """,
-        (thought_id,),
-    )
-    max_rev = cur.fetchone()
-    next_revision = (max_rev[0] + 1) if max_rev else 1
-
-    if prov_agent is None:
-        prov_agent = _derive_prov_agent("manual", user_id)
-
-    # INSERT the rollback version (prov_activity='rollback', parent = target).
-    cur.execute(
-        """
-        INSERT INTO brain.thought_versions (
-            thought_id, revision, raw_text, summary, thought_type,
-            topics, people, action_items, embedding, metadata,
-            prov_agent, prov_activity, parent_version, diff_json
-        ) VALUES (
-            %s, %s, %s, %s, %s,
-            %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
-            %s, 'rollback', %s, NULL
-        )
-        RETURNING version_id
-        """,
+        target = cur.fetchone()
+        if target is None:
+            raise RuntimeError(
+                f"rollback_thought: revision {to_revision} of {thought_id} not found"
+            )
         (
-            thought_id, next_revision, raw_text, summary, thought_type,
-            json.dumps(topics) if topics is not None else None,
-            json.dumps(people) if people is not None else None,
-            json.dumps(action_items) if action_items is not None else None,
-            embedding if embedding is not None else None,
-            json.dumps(metadata) if metadata is not None else None,
-            prov_agent, target_version_id,
-        ),
-    )
-    new_version_id = cur.fetchone()[0]
+            target_version_id, raw_text, summary, thought_type, topics, people,
+            action_items, embedding, metadata,
+        ) = target
 
-    # Update the live brain.thoughts row to match the rolled-back content.
-    cur.execute(
-        """
-        UPDATE brain.thoughts
-        SET raw_text = %s,
-            summary = %s,
-            thought_type = %s,
-            topics = %s::jsonb,
-            people = %s::jsonb,
-            action_items = %s::jsonb,
-            metadata = %s::jsonb,
-            updated_at = NOW()
-        WHERE thought_id = %s
-        """,
-        (
-            raw_text, summary, thought_type,
-            json.dumps(topics) if topics is not None else None,
-            json.dumps(people) if people is not None else None,
-            json.dumps(action_items) if action_items is not None else None,
-            json.dumps(metadata) if metadata is not None else None,
-            thought_id,
-        ),
-    )
-    conn.commit()
-    cur.close()
+        # Determine the next revision. Rollback ALWAYS appends — never rewrites.
+        cur.execute(
+            """
+            SELECT revision FROM brain.thought_versions WHERE thought_id = %s
+            ORDER BY revision DESC LIMIT 1
+            """,
+            (thought_id,),
+        )
+        max_rev = cur.fetchone()
+        next_revision = (max_rev[0] + 1) if max_rev else 1
+
+        if prov_agent is None:
+            prov_agent = _derive_prov_agent("manual", user_id)
+
+        # INSERT the rollback version (prov_activity='rollback', parent = target).
+        cur.execute(
+            """
+            INSERT INTO brain.thought_versions (
+                thought_id, revision, raw_text, summary, thought_type,
+                topics, people, action_items, embedding, metadata,
+                prov_agent, prov_activity, parent_version, diff_json
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
+                %s, 'rollback', %s, NULL
+            )
+            RETURNING version_id
+            """,
+            (
+                thought_id, next_revision, raw_text, summary, thought_type,
+                json.dumps(topics) if topics is not None else None,
+                json.dumps(people) if people is not None else None,
+                json.dumps(action_items) if action_items is not None else None,
+                embedding if embedding is not None else None,
+                json.dumps(metadata) if metadata is not None else None,
+                prov_agent, target_version_id,
+            ),
+        )
+        new_version_id = cur.fetchone()[0]
+
+        # Update the live brain.thoughts row to match the rolled-back content.
+        cur.execute(
+            """
+            UPDATE brain.thoughts
+            SET raw_text = %s,
+                summary = %s,
+                thought_type = %s,
+                topics = %s::jsonb,
+                people = %s::jsonb,
+                action_items = %s::jsonb,
+                metadata = %s::jsonb,
+                updated_at = NOW()
+            WHERE thought_id = %s
+            """,
+            (
+                raw_text, summary, thought_type,
+                json.dumps(topics) if topics is not None else None,
+                json.dumps(people) if people is not None else None,
+                json.dumps(action_items) if action_items is not None else None,
+                json.dumps(metadata) if metadata is not None else None,
+                thought_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        # gz-af9kn — match snapshot_thought's defensive cleanup. Rollback
+        # the tx and re-raise; finally clause closes the cursor.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
     # brain-W2-S6: replay-log emission. Best-effort; never raises.
     emit_replay_log(
@@ -1748,92 +1788,111 @@ def capture(
     """
     thought_id = _generate_thought_id()
     cur = conn.cursor()
+    try:
+        # Resolve PROV-DM defaults BEFORE any DB work so a bad input fails fast.
+        if prov_agent is None:
+            prov_agent = _derive_prov_agent(source, user_id)
+        if prov_activity is None:
+            prov_activity = "capture"
+        was_generated_by = _generate_activity_id(thought_id)
 
-    # Resolve PROV-DM defaults BEFORE any DB work so a bad input fails fast.
-    if prov_agent is None:
-        prov_agent = _derive_prov_agent(source, user_id)
-    if prov_activity is None:
-        prov_activity = "capture"
-    was_generated_by = _generate_activity_id(thought_id)
-
-    # PS primitive: was_derived_from must reference a thought in the caller's
-    # scope. For this plugin, scope == user_id. A mismatch is a write-gate
-    # rejection — raise before doing embedding / LLM work.
-    if was_derived_from is not None:
-        cur.execute(
-            "SELECT 1 FROM brain.thoughts WHERE thought_id = %s AND user_id = %s",
-            (was_derived_from, user_id),
-        )
-        if cur.fetchone() is None:
-            cur.close()
-            raise RuntimeError(
-                "was_derived_from references non-existent thought "
-                f"(or wrong user scope): {was_derived_from} (user={user_id})"
+        # PS primitive: was_derived_from must reference a thought in the caller's
+        # scope. For this plugin, scope == user_id. A mismatch is a write-gate
+        # rejection — raise before doing embedding / LLM work.
+        if was_derived_from is not None:
+            cur.execute(
+                "SELECT 1 FROM brain.thoughts WHERE thought_id = %s AND user_id = %s",
+                (was_derived_from, user_id),
             )
+            if cur.fetchone() is None:
+                raise RuntimeError(
+                    "was_derived_from references non-existent thought "
+                    f"(or wrong user scope): {was_derived_from} (user={user_id})"
+                )
 
-    # Step 1: Extract metadata via Claude API
-    metadata = _extract_metadata(text)
-    if not metadata:
-        metadata = {
-            "type": "insight",
-            "topics": [],
-            "people": [],
-            "action_items": [],
-            "summary": text[:200],
-        }
+        # Step 1: Extract metadata via Claude API
+        metadata = _extract_metadata(text)
+        if not metadata:
+            metadata = {
+                "type": "insight",
+                "topics": [],
+                "people": [],
+                "action_items": [],
+                "summary": text[:200],
+            }
 
-    thought_type = metadata.get("type", "insight")
-    topics = metadata.get("topics", [])
-    people = metadata.get("people", [])
-    action_items = metadata.get("action_items", [])
-    summary = metadata.get("summary", text[:200])
+        thought_type = metadata.get("type", "insight")
+        topics = metadata.get("topics", [])
+        people = metadata.get("people", [])
+        action_items = metadata.get("action_items", [])
+        # gz-j29f0 — null-summary guard. `dict.get("summary", default)`
+        # returns None when the LLM payload contains an explicit
+        # {"summary": null} (vs a missing key, where the default applies).
+        # The `or` idiom catches both None and the empty string, so
+        # downstream `summary[:1000]` slicing never trips
+        # `TypeError: 'NoneType' object is not subscriptable`.
+        summary = metadata.get("summary") or text[:200]
 
-    # Step 2: Generate embedding locally
-    embedding = _generate_embedding(text)
+        # Step 2: Generate embedding locally
+        embedding = _generate_embedding(text)
 
-    # Step 3: INSERT with PROV-DM fields. source_uri stays NULL for internal
-    # captures (deferred to a later bead if/when ingesting from external URLs).
-    insert_sql = """
-        INSERT INTO brain.thoughts (
-            thought_id, user_id, raw_text, summary, thought_type,
-            topics, people, action_items, source, session_id, project,
-            prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri,
-            embedding, metadata, created_at, updated_at
+        # Step 3: INSERT with PROV-DM fields. source_uri stays NULL for internal
+        # captures (deferred to a later bead if/when ingesting from external URLs).
+        insert_sql = """
+            INSERT INTO brain.thoughts (
+                thought_id, user_id, raw_text, summary, thought_type,
+                topics, people, action_items, source, session_id, project,
+                prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri,
+                embedding, metadata, created_at, updated_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb,
+                %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s::vector, %s::jsonb,
+                NOW(), NOW()
+            )
+        """
+        cur.execute(
+            insert_sql,
+            (
+                thought_id,
+                user_id,
+                text[:16384],
+                summary[:1000],
+                thought_type,
+                json.dumps(topics),
+                json.dumps(people),
+                json.dumps(action_items),
+                source,
+                session_id,
+                project,
+                prov_agent,
+                prov_activity,
+                was_generated_by,
+                was_derived_from,
+                None,  # source_uri — reserved for external-URL captures
+                str(embedding),
+                json.dumps(metadata),
+            ),
         )
-        VALUES (
-            %s, %s, %s, %s, %s,
-            %s::jsonb, %s::jsonb, %s::jsonb,
-            %s, %s, %s,
-            %s, %s, %s, %s, %s,
-            %s::vector, %s::jsonb,
-            NOW(), NOW()
-        )
-    """
-    cur.execute(
-        insert_sql,
-        (
-            thought_id,
-            user_id,
-            text[:16384],
-            summary[:1000],
-            thought_type,
-            json.dumps(topics),
-            json.dumps(people),
-            json.dumps(action_items),
-            source,
-            session_id,
-            project,
-            prov_agent,
-            prov_activity,
-            was_generated_by,
-            was_derived_from,
-            None,  # source_uri — reserved for external-URL captures
-            str(embedding),
-            json.dumps(metadata),
-        ),
-    )
-    conn.commit()
-    cur.close()
+        conn.commit()
+    except Exception:
+        # gz-af9kn — cursor try-finally + rollback. _extract_metadata and
+        # _generate_embedding both call external services (Claude API,
+        # sentence-transformers); either can raise mid-capture. Without
+        # this guard the cursor + tx state leak back to the caller.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
     # Incrementally update knowledge graph with extracted metadata
     _update_graph_incremental(

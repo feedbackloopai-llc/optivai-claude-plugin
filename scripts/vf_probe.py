@@ -13,11 +13,37 @@ Bead: gz-dcwjp (brain-W1-S7).
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import random
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# gz-j5mj7 — fenced-block stripper. Some Claude responses wrap JSON in
+# ```json ... ``` fences; the prior strip("`") + lstrip("json") was
+# fragile (it stripped any of those chars, not the literal keyword).
+# This regex matches an opening fence (with optional ``json`` hint) and
+# the closing fence on the trailing line. MULTILINE so both anchors fire.
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|```\s*$", re.MULTILINE)
+
+
+def _stable_seed(text: str) -> int:
+    """Stable cross-process seed from text.
+
+    Python's built-in ``hash()`` is per-process randomized (PEP 456) — two
+    processes computing ``hash(thought_id)`` get different values, breaking
+    probe-set reproducibility. ``hashlib.md5`` is deterministic across
+    runs; truncate the hex digest to 32 bits for the
+    ``random.Random(seed)`` constructor.
+
+    Cryptographic strength is irrelevant here — md5 is used purely as a
+    deterministic mixer. The output is fed only to the PRNG seed, never
+    to authentication / integrity paths.
+    """
+    return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
 
 # ─── Defaults (calibrated VF_eps parameters) ─────────────────────────────────
 
@@ -343,7 +369,10 @@ def _generate_partial_probes(
     if length_text < 8:
         return [text] * count
 
-    rng = random.Random(hash(snapshot.forgotten_thought_id) & 0xFFFFFFFF)
+    # gz-j5mj7 — use _stable_seed instead of hash(). hash() is per-process
+    # randomized, so probe sets differed across runs for the same input;
+    # _stable_seed (md5-based) is reproducible.
+    rng = random.Random(_stable_seed(snapshot.forgotten_thought_id))
     probes: List[str] = []
     for _ in range(count):
         max_start = max(0, length_text - 8)
@@ -389,9 +418,11 @@ def _generate_paraphrase_probes(
         )
         text_out = msg.content[0].text if msg.content else "[]"
         text_out = text_out.strip()
-        if text_out.startswith("```"):
-            # Strip the fenced wrapper that some models occasionally emit.
-            text_out = text_out.strip("`").lstrip("json").strip()
+        # gz-j5mj7 — strip Markdown fences if the model emitted them.
+        # Use the module-level _FENCE_RE instead of the prior fragile
+        # strip("`") + lstrip("json") (which stripped any of those chars,
+        # not the literal "json" keyword).
+        text_out = _FENCE_RE.sub("", text_out).strip()
         paraphrases = json.loads(text_out)
         if not isinstance(paraphrases, list):
             raise ValueError("paraphrase response is not a JSON array")
@@ -422,7 +453,8 @@ def _generate_perturb_probes(
     if not snapshot.forgotten_embedding:
         return [[] for _ in range(count)]
     base = snapshot.forgotten_embedding
-    rng = random.Random(hash(snapshot.forgotten_thought_id) & 0xFFFFFFFF)
+    # gz-j5mj7 — same _stable_seed swap as in _generate_partial_probes.
+    rng = random.Random(_stable_seed(snapshot.forgotten_thought_id))
     sigma = 0.01  # small noise — preserves direction at fine granularity
     return [
         [v + rng.gauss(0.0, sigma) for v in base]
@@ -449,6 +481,14 @@ def _score_probe(
 
     The connection is rolled back on any query error so the test fixture's
     transaction state stays clean.
+
+    gz-j5mj7 — note on the substring-probe path: the text-probe scoring
+    uses ``ILIKE %{probe_text[:50]}%`` which is fail-closed by design.
+    A probe whose 50-char prefix accidentally substring-matches an
+    unrelated thought will register ``k > 0`` and trigger forget-failed-
+    residue. False positives PREVENT data loss (the forget operation
+    refuses to commit and the row is restored), so this bias is
+    intentional — never relax it without re-grounding the VF guarantee.
     """
     cur = conn.cursor()
     top_id: Optional[str] = None
