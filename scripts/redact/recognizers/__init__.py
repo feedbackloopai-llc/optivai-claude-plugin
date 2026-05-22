@@ -1,8 +1,8 @@
-"""Recognizer stubs — replaced by redact-S3 (secrets), S4 (pii),
-S5 (entropy), S6 (context) downstream bundles."""
+"""Recognizer exports — secrets (S3) and PII (S4) are real after Bundle B.
+EntropyRedactor (S5) and ContextRedactor (S6) remain stubs until those bundles land."""
 
-secrets_redactors = []
-pii_redactors = []
+from .secrets import secrets_redactors
+from .pii import pii_redactors
 
 
 class EntropyRedactor:
