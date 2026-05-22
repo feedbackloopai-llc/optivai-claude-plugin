@@ -387,6 +387,113 @@ class TestOtherOpsInstrumentation:
             _cleanup_logs(conn, u)
 
 
+# ─── S6.1: search instrumentation (gz-woema) ─────────────────────────────────
+
+
+class TestSearchInstrumentation:
+    """search() emits one replay row per invocation. Query is PII-redacted at
+    the emitter boundary; metadata captures result_count, top_thought_id, and
+    filter usage."""
+
+    def test_search_emits_replay_row(self, conn):
+        u = "replay-search"
+        _cleanup_logs(conn, u)
+        # Capture a thought we know we can search for
+        r = open_brain.capture(conn, text="distinctive purple llama runs in the rain", user_id=u)
+        tid = r["thought_id"]
+        try:
+            results = open_brain.search(conn, query="purple llama", user_id=u, limit=5)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT event_type, query_redacted FROM brain.replay_log "
+                "WHERE user_id=%s AND event_type='search' ORDER BY event_id DESC LIMIT 1",
+                (u,),
+            )
+            row = cur.fetchone()
+            assert row is not None, "search() did not emit a replay log row"
+            assert row[0] == "search"
+            # Query is preserved (no PII to redact in this case)
+            assert "purple llama" in (row[1] or "")
+        finally:
+            _cleanup_thought(conn, tid)
+            _cleanup_logs(conn, u)
+
+    def test_search_with_pii_redacts_query(self, conn):
+        """A query containing an email gets [EMAIL] in the replay log, not the raw address."""
+        u = "replay-search-pii"
+        _cleanup_logs(conn, u)
+        open_brain.search(conn, query="who is bob@example.com", user_id=u, limit=5)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT query_redacted FROM brain.replay_log "
+            "WHERE user_id=%s AND event_type='search' ORDER BY event_id DESC LIMIT 1",
+            (u,),
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert "bob@example.com" not in (row[0] or "")
+        assert "[EMAIL]" in (row[0] or "")
+        _cleanup_logs(conn, u)
+
+    def test_search_metadata_records_result_count(self, conn):
+        u = "replay-search-meta"
+        _cleanup_logs(conn, u)
+        r = open_brain.capture(conn, text="metadata recording test alpha beta gamma", user_id=u)
+        tid = r["thought_id"]
+        try:
+            open_brain.search(conn, query="alpha beta gamma", user_id=u, limit=10)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT metadata FROM brain.replay_log "
+                "WHERE user_id=%s AND event_type='search' ORDER BY event_id DESC LIMIT 1",
+                (u,),
+            )
+            md_raw = cur.fetchone()[0]
+            md = md_raw if isinstance(md_raw, dict) else json.loads(md_raw)
+            assert "result_count" in md
+            assert md["limit"] == 10
+            assert md["has_filters"] is False  # no filters used
+            assert "sort_by" in md
+        finally:
+            _cleanup_thought(conn, tid)
+            _cleanup_logs(conn, u)
+
+    def test_search_metadata_records_filter_usage(self, conn):
+        u = "replay-search-filters"
+        _cleanup_logs(conn, u)
+        open_brain.search(conn, query="filtered query", user_id=u, limit=5,
+                           thought_type="decision")
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT metadata FROM brain.replay_log "
+            "WHERE user_id=%s AND event_type='search' ORDER BY event_id DESC LIMIT 1",
+            (u,),
+        )
+        md_raw = cur.fetchone()[0]
+        md = md_raw if isinstance(md_raw, dict) else json.loads(md_raw)
+        assert md["has_filters"] is True
+        _cleanup_logs(conn, u)
+
+    def test_search_zero_results_still_emits(self, conn):
+        """A search that returns nothing still emits a replay row with result_count=0."""
+        u = "replay-search-empty"
+        _cleanup_logs(conn, u)
+        open_brain.search(conn, query="extremely-unlikely-phrase-zzzqqq-9999", user_id=u, limit=5)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT result_summary, metadata FROM brain.replay_log "
+            "WHERE user_id=%s AND event_type='search' ORDER BY event_id DESC LIMIT 1",
+            (u,),
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert "0 results" in (row[0] or "")
+        md = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+        assert md["result_count"] == 0
+        assert md["top_thought_id"] is None
+        _cleanup_logs(conn, u)
+
+
 # ─── S7: CLI surface ─────────────────────────────────────────────────────────
 
 

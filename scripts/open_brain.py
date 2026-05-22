@@ -2097,6 +2097,34 @@ def search(
             except Exception:
                 pass
 
+    # brain-W2-S6.1 (gz-woema): replay log emission for search ops.
+    # Query is PII-redacted at the emitter boundary. result_summary captures
+    # the top result's preview + total count so audit trails are informative
+    # without holding the full per-row payload.
+    top_thought_id = results[0].get("thought_id") if results else None
+    top_similarity = results[0].get("similarity") if results else None
+    result_text_preview = (
+        f"{len(results)} result(s); top={results[0].get('summary', '')[:80]}"
+        if results
+        else "0 results"
+    )
+    emit_replay_log(
+        conn,
+        user_id=user_id,
+        event_type="search",
+        query=query,
+        result_text=result_text_preview,
+        metadata={
+            "result_count": len(results),
+            "top_thought_id": top_thought_id,
+            "top_similarity": top_similarity,
+            "limit": limit,
+            "threshold": threshold,
+            "sort_by": sort_by,
+            "has_filters": any([thought_type, topics, people, date_from, date_to]),
+        },
+    )
+
     return results
 
 
