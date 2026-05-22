@@ -24,6 +24,21 @@ if not BRAIN_SCRIPT.exists():
     # Dev/repo layout: scripts/hooks/brain_hook.py → scripts/open_brain.py
     BRAIN_SCRIPT = Path(__file__).parent.parent / "open_brain.py"
 
+# ─── L3 ingest redaction (redact-S8) ──────────────────────────────────────────
+# Redact secrets / PII BEFORE the auto-capture payload is built. Defensive
+# import: if the redact module is missing or fails to load (e.g. during a
+# partial install or before Bundle D landed), fall back to a passthrough so
+# the auto-capture path keeps working. Fail-open is the explicit contract here:
+# better to capture an un-redacted thought than to lose the memory entirely.
+try:
+    _scripts_dir = str(Path(__file__).resolve().parent.parent)
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    from open_brain import redact_pii as _redact_pii  # type: ignore
+except Exception:
+    def _redact_pii(text):  # type: ignore[no-redef]
+        return text  # fail-open passthrough
+
 # ─── Trigger patterns ─────────────────────────────────────────────────────────
 
 # User prompt triggers — organized by signal type. Each (pattern, label) pair
@@ -107,10 +122,22 @@ def _fire_capture(
     if not text or len(text.strip()) < 20:
         return
 
+    # L3 ingest redaction: strip secrets / PII BEFORE the payload is built so
+    # the bridge never sees the raw text. Fail-open — if the redactor raises
+    # for any reason, fall back to the original text. A missed redaction can
+    # be cleaned up later via /brain-forget; a broken auto-capture loses the
+    # memory entirely. The trade-off favors capture completeness.
+    try:
+        safe_text = _redact_pii(text) if text else text
+        if safe_text is None:
+            safe_text = text
+    except Exception:
+        safe_text = text
+
     try:
         payload_obj = {
             "op": "capture",
-            "text": text[:4000],
+            "text": safe_text[:4000],
             "source": source,
             "session_id": session_id,
             "project": project,
