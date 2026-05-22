@@ -114,11 +114,19 @@ def _run_brain_json(*args):
 
 @pytest.fixture(scope="module")
 def test_thought():
-    """Capture a test thought and return its data."""
+    """Capture a test thought and return its data.
+
+    Text deliberately includes 'project timeline' and 'deadline' so the
+    test_semantic_match query ('project timeline and deadlines') ranks this
+    fixture in the top-N against the noisy live brain (otherwise older
+    accumulated thoughts crowd it out). Still includes 'Q4 migration', 'sign
+    off', and 'Friday' to exercise the embedding's semantic (not just
+    keyword) matching capability.
+    """
     text = (
-        "Integration test: Talked with Alice about the Q4 migration timeline. "
-        "She said the beta is ready but we need Dave to sign off on security. "
-        "Follow up with Dave by Friday."
+        "Integration test: Project timeline review with Alice — Q4 migration "
+        "deadline is approaching. She said the beta is ready but we need Dave "
+        "to sign off on security. Follow up with Dave by Friday."
     )
     stdout, _ = _run_brain("--capture", text, "--source", "pytest", "--project", "test")
     assert "Captured:" in stdout
@@ -203,7 +211,10 @@ class TestRecentIntegration:
 class TestStatsIntegration:
     def test_stats_returns_counts(self, test_thought):
         stdout, _ = _run_brain("--stats")
-        assert "Open Brain Stats" in stdout
+        # The header rendered by main() is "Memory Stats" (changed from
+        # "Open Brain Stats" pre-v0.2.0). Total-thoughts count line is the
+        # load-bearing assertion.
+        assert "Memory Stats" in stdout
         assert "Total thoughts:" in stdout
 
     def test_stats_json(self, test_thought):
