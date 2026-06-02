@@ -51,3 +51,25 @@ The "99.9999793% verified forgetting" headline is the **exact binomial** confide
 
 - For routine cleanup of stale memories — use a regular update/demote instead; VF_ε is expensive (~5–10 s per call).
 - To "undo" a capture immediately after the fact — that's what `--rollback` is for.
+
+## Why this command exists in the neurosymbolic discipline
+
+This is the seventh action — **verified forgetting** — and it sits outside the six reasoning rules deliberately. The MS_ε primitive enacted is `VF_ε`: a delete-after-verify operation with probabilistic guarantees. The substrate supports it because some content (PII committed in error, content the user has the legal right to remove, hallucinations the user wants permanently gone) must be removable with stronger evidence than "I overwrote it". The rest of the discipline — `WA` at capture, `PV` at provenance, `PS` at recall, `RB` at versioning — is reversible. VF_ε is the one move that is not. The cost of getting it wrong is permanent loss.
+
+## VF_ε boundary
+
+Agents may not invoke `/brain-forget` autonomously. Forgetting requires explicit user direction.
+
+VF_ε runs at 99.9999793% exact-binomial confidence (`n=300` probes, `k=0` acceptance, `0.95^300 ≈ 2.075×10⁻⁷`). The Hoeffding bound is 77.69% — that is the literature-comparable looseness, NOT the procurement claim. But the cost of a wrong forget is permanent loss of the atom: the rollback path catches probe leaks, not user-intent errors. The user holds the forget privilege.
+
+When an agent encounters a candidate for forgetting, the correct moves are:
+
+- **Suspected PII committed in error** — surface the candidate `thought_id` to the user, suggest `/brain-forget`, do NOT execute it. Pair with `/brain-demote` so the atom stops surfacing in recall while the user decides.
+- **Hallucinated or factually wrong atom** — capture a corrective atom with `--derived-from` pointing at the wrong one, then `/brain-demote` the wrong one. The lesson stays in memory; the bad ranking pressure does not. Surface the conflict to the user.
+- **Two contradicting atoms where one must be wrong** — escalate via `/brain-trace` on both (Rule 2 — Conflict-fusion via NAL) and surface the conflict to the user. Do not pre-empt their decision with a forget.
+
+The user-direction signals that authorize an agent to execute `/brain-forget` are explicit: "forget that", "erase this", "remove from memory", "delete that atom". Inferred direction ("you'd probably want this gone") is not sufficient.
+
+## Example
+
+The user reports that an earlier capture inadvertently included a third party's email address. You confirm by running `/brain-inspect <id>` and seeing the PII in the raw text. You do NOT call `/brain-forget`. Instead you say: "Atom `brain-1763-...` contains <person>'s email address in the raw text. I have demoted it (`/brain-demote brain-1763-... --reason 'pending PII review'`) so it stops surfacing in recall. To verifiably forget it I need explicit direction: should I run `/brain-forget brain-1763-... --epsilon 0.05`?" The user confirms; you execute and report the exact-binomial confidence + audit event id.

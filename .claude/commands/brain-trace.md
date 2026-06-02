@@ -40,3 +40,25 @@ This invokes the **citation walker** — it walks the `was_derived_from` chain (
 
 - For "what other thoughts mention X" — that's a semantic search (`/brain-search`), not a provenance walk.
 - For pure timeline-of-topic rendering — use `/brain-timeline` instead; trace is for derivation lineage, not topical evolution.
+
+## Why this command exists in the neurosymbolic discipline
+
+This is the **lineage-axis flavor of Rule 6 — Provenance-traversal** and the inspection half of **Rule 2 — Conflict-fusion via NAL**. The MS_ε primitive enacted is `PV` (Provenance Visibility): the whole point of stamping PROV-DM at write time (the `WA` gate enforces it) is to make this traversal cheap at read time. Recall returns what looks relevant; traversal verifies it is trustworthy. The orphan-marker discipline means the chain stays auditable even after a parent atom is forgotten under VF_ε — silent truncation would mask the deletion.
+
+## When to invoke
+
+- Before acting on a consequential recalled fact — one that would shape an architectural choice, justify a destructive action, or be cited to the user as authoritative. If the chain ends at a low-confidence source or an older-than-90-day single-source belief, down-weight the atom or seek corroboration (Rule 6).
+- When two recalled atoms contradict — trace both before deciding which to trust. The contradiction may resolve naturally if one chain's root atom has higher confidence or more recent PROV-DM stamps (Rule 2 — Conflict-fusion via NAL, inspection step).
+- When the user asks "where did this come from?", "what's the source of this memory?", or "how was this derived?" — this is the canonical answer surface.
+- During audit/debug — "show me how this thought was derived" surfaces the agent → activity → wasGeneratedBy lineage stamp-by-stamp.
+
+## How to use the result
+
+- Pair with `/brain-inspect <id> --at <ISO>` when the inspection question is "what did the parent atom say at the moment of derivation, not now" — trace gives the link, inspect gives the state at that timestamp.
+- Pair with `/brain-timeline "<topic>"` when the question is "how did the topic evolve" rather than "how was this single atom derived" — different axes of Rule 6.
+- Pair with `/brain-replay` when the question is "what did the agent retrieve before deriving this" — replay returns the search/recall log around the derivation timestamp.
+- After resolving a Rule 2 conflict, capture the fused belief via `/brain-capture --derived-from <both premise ids>` so the new atom's own chain remains auditable.
+
+## Example
+
+You recall a `decision` atom from six weeks ago saying "use IVFFlat for the embedding index". Before acting, you `/brain-trace` it. The chain shows: this decision derived from a benchmark atom (your agent, two months ago), which itself derived from a pgvector tuning guide note (low-confidence external `sourceUri`, three months ago). The chain has one orphan marker — an intermediate working_memory atom the user forgot last month. You note the chain's weakest link is the external tuning guide and that the orphan marker may have contained a counter-argument. Instead of acting on the IVFFlat decision blindly, you surface the chain to the user and ask whether the orphan was the basis of a later reversal.
