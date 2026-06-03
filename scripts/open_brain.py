@@ -562,6 +562,56 @@ def _strip_markdown_fencing(text: str) -> str:
     return text
 
 
+# ─── Connected provenance graph (gz-0l68v) ───────────────────────────────────
+#
+# Closed, CLI-validated vocabulary of typed link kinds between atoms.
+#
+# This is a Python-side gate enforced BEFORE INSERT — the column itself is
+# VARCHAR not an ENUM so that extending the vocabulary doesn't require an
+# ALTER TYPE migration. Add a new kind here, ship the code change, the schema
+# is unchanged. Document each kind so callers can pick the right one.
+LINK_TYPES = {
+    # Atom DAG (mirrors PROV-DM was_derived_from but typed)
+    "derives_from",
+    # Decision substrate
+    "rationale_for",            # source is the rationale supporting target decision
+    "alternative_rejected_by",  # source was rejected as an alternative by target decision
+    # Verification / dispute substrate
+    "verifies",                 # source verifies target's claim
+    "refutes",                  # source refutes target (strong contradiction)
+    "contradicts",              # source contradicts target (weaker than refutes)
+    "resolves",                 # source resolves target — load-bearing for unresolved-findings query
+    "supersedes",               # source supersedes target (target is stale)
+    # Cross-surface bridges
+    "references_bead",          # source references a bead (target_id like gz-XXXXX)
+    "cites",                    # source cites target as a source or quotation
+}
+
+
+# Standalone DDL for the connected-provenance-graph table. Kept here as a
+# fallback so a fresh install without the sql/ tree (or with a stale tree)
+# can still get the table created at --init time. The same DDL also lives
+# canonically in sql/BRAIN_SCHEMA_PG.sql.
+_ATOM_LINKS_DDL = """
+CREATE TABLE IF NOT EXISTS brain.atom_links (
+    link_id     BIGSERIAL         NOT NULL PRIMARY KEY,
+    source_id   VARCHAR(64)       NOT NULL,
+    target_id   VARCHAR(64)       NOT NULL,
+    link_type   VARCHAR(32)       NOT NULL,
+    prov        JSONB,
+    user_id     VARCHAR(100)      NOT NULL,
+    created_at  TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
+    CONSTRAINT atom_links_unique UNIQUE (source_id, target_id, link_type, user_id),
+    CONSTRAINT atom_links_source_fk
+      FOREIGN KEY (source_id) REFERENCES brain.thoughts(thought_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS atom_links_source_idx ON brain.atom_links(source_id);
+CREATE INDEX IF NOT EXISTS atom_links_target_idx ON brain.atom_links(target_id);
+CREATE INDEX IF NOT EXISTS atom_links_type_idx   ON brain.atom_links(link_type);
+CREATE INDEX IF NOT EXISTS atom_links_user_idx   ON brain.atom_links(user_id);
+"""
+
+
 # ─── Core Operations ─────────────────────────────────────────────────────────
 
 def init_schema(conn) -> str:
@@ -570,7 +620,19 @@ def init_schema(conn) -> str:
     if not ddl_path.exists():
         ddl_path = Path.home() / ".claude" / "sql" / "BRAIN_SCHEMA_PG.sql"
     if not ddl_path.exists():
-        return "DDL file not found (checked repo and ~/.claude/sql/)"
+        # No SQL file found — fall back to the minimal in-code DDL for the
+        # atom_links table only (other tables require the full SQL file).
+        cur = conn.cursor()
+        try:
+            cur.execute(_ATOM_LINKS_DDL)
+            conn.commit()
+            cur.close()
+            return ("DDL file not found (checked repo and ~/.claude/sql/); "
+                    "in-code atom_links DDL applied as partial fallback.")
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            return f"DDL file not found and in-code fallback failed: {e}"
 
     cur = conn.cursor()
     ddl = ddl_path.read_text(encoding="utf-8")
@@ -582,6 +644,18 @@ def init_schema(conn) -> str:
         conn.rollback()
         logger.warning(f"DDL warning: {e}")
         return f"Schema initialization had warnings: {e}"
+
+    # Defensive idempotent re-apply of atom_links DDL — covers the case
+    # where the on-disk SQL file is older than this script (e.g. a partial
+    # upgrade where open_brain.py is current but BRAIN_SCHEMA_PG.sql is
+    # stale). The DDL uses IF NOT EXISTS so re-running is a no-op when the
+    # table already exists.
+    try:
+        cur.execute(_ATOM_LINKS_DDL)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning(f"atom_links DDL defensive re-apply warning: {e}")
 
     cur.close()
     return "Schema initialized successfully"
@@ -2783,6 +2857,449 @@ def timeline(
     return results
 
 
+# ─── Connected provenance graph: atom_links operations (gz-0l68v) ────────────
+#
+# Typed many-to-many links between atoms. Orthogonal to the was_derived_from
+# PROV-DM column on brain.thoughts — that column stays as PROV-DM scaffolding,
+# atom_links is the typed-graph layer on top.
+#
+# Targets can be:
+#  - another atom thought_id (e.g. "brain-1780497129-1225dd48")
+#  - a bead id (e.g. "gz-0l68v")
+#  - anything else (queried later via --query-orphan-links for data-integrity audit)
+#
+# Source FK has ON DELETE CASCADE on brain.thoughts(thought_id), so when an
+# atom is VF_eps-forgotten its outgoing links go with it. Inbound links to a
+# forgotten atom become orphans which --query-orphan-links exposes.
+
+
+def _parse_link_spec(spec: str) -> tuple:
+    """Parse a ``target_id:link_type`` capture-flag spec into a tuple.
+
+    Raises ``ValueError`` with a clear message on:
+      - empty/whitespace input
+      - missing ``:`` separator
+      - empty target_id or link_type
+      - link_type not in ``LINK_TYPES``
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(target_id, link_type)`` — both stripped of whitespace.
+    """
+    if not spec or not spec.strip():
+        raise ValueError("link spec is empty")
+    s = spec.strip()
+    if ":" not in s:
+        raise ValueError(
+            f"link spec must be '<target_id>:<link_type>' "
+            f"(missing ':' in {s!r})"
+        )
+    # rsplit so a target_id that contains ':' (defensive — none should) gets
+    # the link_type as the LAST colon-delimited token.
+    target_id, link_type = s.rsplit(":", 1)
+    target_id = target_id.strip()
+    link_type = link_type.strip()
+    if not target_id:
+        raise ValueError(f"link spec has empty target_id: {spec!r}")
+    if not link_type:
+        raise ValueError(f"link spec has empty link_type: {spec!r}")
+    if link_type not in LINK_TYPES:
+        allowed = ", ".join(sorted(LINK_TYPES))
+        raise ValueError(
+            f"unknown link_type {link_type!r}; allowed: {allowed}"
+        )
+    return target_id, link_type
+
+
+def _build_link_prov(
+    prov_agent: Optional[str],
+    via: str,
+    user_id: str,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the per-link PROV-DM stamp written to ``atom_links.prov``.
+
+    Parameters
+    ----------
+    prov_agent
+        Override for the agent identifier. When ``None``, falls back to
+        ``claude-code``.
+    via
+        Either ``"capture-flag"`` (link emitted by ``--capture --link ...``)
+        or ``"post-hoc"`` (link emitted by ``--add-link``). Other values
+        accepted for future extensions.
+    user_id
+        Tenant / principal — recorded under ``prov`` for trace walks even
+        though it's already the row's ``user_id`` column.
+    session_id
+        Optional. Falls back to ``$CLAUDE_CODE_SESSION_ID`` env var when
+        not explicitly provided.
+    """
+    agent = prov_agent if prov_agent else "claude-code"
+    sess = session_id if session_id else os.environ.get("CLAUDE_CODE_SESSION_ID")
+    stamp: Dict[str, Any] = {
+        "agent": agent,
+        "activity": "link_add",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "via": via,
+        "user_id": user_id,
+    }
+    if sess:
+        stamp["session_id"] = sess
+    return stamp
+
+
+def _classify_target_kind(conn, target_id: str, user_id: str) -> str:
+    """Classify a link target as ``"atom"``, ``"bead"``, or ``"unknown"``.
+
+    Rules:
+      - If ``target_id`` exists in ``brain.thoughts`` AND belongs to ``user_id``,
+        return ``"atom"``.
+      - Otherwise, if ``target_id`` starts with ``"gz-"``, return ``"bead"``.
+      - Otherwise return ``"unknown"``.
+
+    Note the order: an atom-id that LOOKS like a bead (it doesn't — atoms
+    start with ``brain-``) would still be checked as an atom first; but in
+    practice atom IDs and bead IDs have disjoint prefixes so this is just
+    defense-in-depth.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT 1 FROM brain.thoughts WHERE thought_id = %s AND user_id = %s",
+            (target_id, user_id),
+        )
+        if cur.fetchone() is not None:
+            return "atom"
+    finally:
+        cur.close()
+    if target_id.startswith("gz-"):
+        return "bead"
+    return "unknown"
+
+
+def add_link(
+    conn,
+    source_id: str,
+    target_id: str,
+    link_type: str,
+    user_id: str,
+    via: str = "post-hoc",
+    prov_agent: Optional[str] = None,
+    session_id: Optional[str] = None,
+    verify_source_exists: bool = True,
+) -> Dict[str, Any]:
+    """Insert a row into ``brain.atom_links``.
+
+    Validates:
+      - ``link_type`` is in ``LINK_TYPES`` (ValueError if not).
+      - ``source_id`` exists in ``brain.thoughts`` under ``user_id`` scope
+        (RuntimeError if not, AND ``verify_source_exists=True``).
+
+    Uses ``ON CONFLICT DO NOTHING`` on the
+    ``(source_id, target_id, link_type, user_id)`` unique constraint:
+    re-inserting the same edge is an idempotent no-op (returns the
+    existing ``link_id`` rather than raising).
+
+    Returns
+    -------
+    dict
+        ``{"link_id": int, "source_id": str, "target_id": str,
+           "link_type": str, "created": bool}`` where ``created`` is
+        ``True`` for a fresh insert and ``False`` for an existing edge.
+    """
+    if link_type not in LINK_TYPES:
+        allowed = ", ".join(sorted(LINK_TYPES))
+        raise ValueError(
+            f"unknown link_type {link_type!r}; allowed: {allowed}"
+        )
+    if not source_id or not source_id.strip():
+        raise ValueError("source_id is empty")
+    if not target_id or not target_id.strip():
+        raise ValueError("target_id is empty")
+
+    source_id = source_id.strip()
+    target_id = target_id.strip()
+
+    cur = conn.cursor()
+    try:
+        if verify_source_exists:
+            cur.execute(
+                "SELECT 1 FROM brain.thoughts WHERE thought_id = %s AND user_id = %s",
+                (source_id, user_id),
+            )
+            if cur.fetchone() is None:
+                raise RuntimeError(
+                    f"add_link: source atom {source_id!r} does not exist "
+                    f"in user scope (user={user_id})"
+                )
+
+        prov = _build_link_prov(
+            prov_agent=prov_agent,
+            via=via,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        cur.execute(
+            """
+            INSERT INTO brain.atom_links
+                (source_id, target_id, link_type, prov, user_id)
+            VALUES (%s, %s, %s, %s::jsonb, %s)
+            ON CONFLICT ON CONSTRAINT atom_links_unique DO NOTHING
+            RETURNING link_id
+            """,
+            (source_id, target_id, link_type, json.dumps(prov), user_id),
+        )
+        row = cur.fetchone()
+        created = row is not None
+        if created:
+            link_id = row[0]
+        else:
+            # Re-fetch existing row's link_id for the idempotent path.
+            cur.execute(
+                """
+                SELECT link_id FROM brain.atom_links
+                WHERE source_id = %s AND target_id = %s
+                  AND link_type = %s AND user_id = %s
+                """,
+                (source_id, target_id, link_type, user_id),
+            )
+            row2 = cur.fetchone()
+            link_id = row2[0] if row2 else -1
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+    # Always emit the confirmation line per the fail-safe contract, even on
+    # the idempotent no-op path (caller still benefits from seeing the link_id).
+    sys.stderr.write(
+        f"Link added: source={source_id} type={link_type} "
+        f"target={target_id} link_id={link_id}\n"
+    )
+    return {
+        "link_id": link_id,
+        "source_id": source_id,
+        "target_id": target_id,
+        "link_type": link_type,
+        "created": created,
+    }
+
+
+def show_links(conn, atom_id: str, user_id: str) -> Dict[str, Any]:
+    """List outgoing AND incoming links for an atom.
+
+    Outgoing links are rows where ``source_id == atom_id``; incoming links
+    are rows where ``target_id == atom_id``. Each link gets a derived
+    ``target_kind`` (for outgoing) or ``source_kind`` (for incoming),
+    classified at query time via :func:`_classify_target_kind`.
+
+    Returns
+    -------
+    dict
+        ``{"atom_id": str, "outgoing": [...], "incoming": [...]}``
+    """
+    if not atom_id or not atom_id.strip():
+        raise ValueError("atom_id is empty")
+    atom_id = atom_id.strip()
+    cur = conn.cursor()
+    try:
+        # Outgoing
+        cur.execute(
+            """
+            SELECT link_id, source_id, target_id, link_type, prov, created_at
+            FROM brain.atom_links
+            WHERE source_id = %s AND user_id = %s
+            ORDER BY created_at ASC, link_id ASC
+            """,
+            (atom_id, user_id),
+        )
+        out_rows = cur.fetchall()
+        # Incoming
+        cur.execute(
+            """
+            SELECT link_id, source_id, target_id, link_type, prov, created_at
+            FROM brain.atom_links
+            WHERE target_id = %s AND user_id = %s
+            ORDER BY created_at ASC, link_id ASC
+            """,
+            (atom_id, user_id),
+        )
+        in_rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    def _row_to_dict(r, kind_field: str, classify_id: str) -> Dict[str, Any]:
+        prov = r[4]
+        # psycopg2 returns jsonb as either dict or str depending on the
+        # column type registration. Normalize to dict for JSON-serializable
+        # output without double-encoding.
+        if isinstance(prov, str):
+            try:
+                prov = json.loads(prov)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {
+            "link_id": r[0],
+            "source_id": r[1],
+            "target_id": r[2],
+            "link_type": r[3],
+            "prov": prov,
+            "created_at": str(r[5]) if r[5] else "",
+            kind_field: _classify_target_kind(conn, classify_id, user_id),
+        }
+
+    outgoing = [_row_to_dict(r, "target_kind", r[2]) for r in out_rows]
+    incoming = [_row_to_dict(r, "source_kind", r[1]) for r in in_rows]
+
+    return {
+        "atom_id": atom_id,
+        "outgoing": outgoing,
+        "incoming": incoming,
+    }
+
+
+_UNRESOLVED_KEYWORD_RE = re.compile(
+    r"\b(finding|bug|issue|defect|gap|regression|problem)\b",
+    re.IGNORECASE,
+)
+
+
+def query_unresolved_findings(
+    conn,
+    user_id: str,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Return atoms that look like unresolved findings.
+
+    An atom is considered an unresolved finding when ALL of the following hold:
+      1. Its ``user_id`` matches the caller.
+      2. EITHER ``thought_type = 'sentinel_relevant'`` OR the metadata
+         contains a Pearl ``kind = 'fact'``.
+      3. The ``summary`` or ``raw_text`` matches the finding/bug/issue
+         keyword regex.
+      4. NO atom_links row exists with ``target_id = atom.thought_id``
+         AND ``link_type = 'resolves'`` (under the caller's user_id).
+
+    The keyword filter is applied in Python after a SQL pre-filter (to
+    keep the SQL conservative and portable). Caps at ``limit`` results
+    (default 50).
+
+    Returns
+    -------
+    list of dict
+        Each dict carries ``thought_id``, ``thought_type``, ``summary``,
+        ``raw_text`` (first 500 chars), ``created_at``.
+    """
+    if limit <= 0:
+        limit = 50
+    cur = conn.cursor()
+    try:
+        # Conservative SQL pre-filter: ANY type that COULD be a finding +
+        # absence of any incoming resolves link. The keyword check is
+        # applied in Python.
+        cur.execute(
+            """
+            SELECT t.thought_id, t.thought_type, t.summary, t.raw_text,
+                   t.created_at, t.metadata
+            FROM brain.thoughts t
+            WHERE t.user_id = %s
+              AND (
+                    t.thought_type = 'sentinel_relevant'
+                    OR (t.metadata IS NOT NULL
+                        AND t.metadata::jsonb -> 'kind' = '"fact"'::jsonb)
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM brain.atom_links l
+                WHERE l.target_id = t.thought_id
+                  AND l.link_type = 'resolves'
+                  AND l.user_id = %s
+              )
+            ORDER BY t.created_at DESC
+            LIMIT %s
+            """,
+            (user_id, user_id, max(limit * 4, limit)),  # over-fetch to allow keyword filter
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        summary = r[2] or ""
+        raw = r[3] or ""
+        if not (_UNRESOLVED_KEYWORD_RE.search(summary)
+                or _UNRESOLVED_KEYWORD_RE.search(raw)):
+            continue
+        out.append({
+            "thought_id": r[0],
+            "thought_type": r[1],
+            "summary": summary,
+            "raw_text": raw[:500],
+            "created_at": str(r[4]) if r[4] else "",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def query_orphan_links(
+    conn,
+    user_id: str,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return links whose target_id is genuinely dangling.
+
+    A link is an orphan when ALL hold:
+      - target_id is NOT in ``brain.thoughts`` (under the caller's user_id);
+      - target_id does NOT match the ``gz-`` bead prefix.
+
+    Returns
+    -------
+    list of dict
+        Each dict carries ``link_id``, ``source_id``, ``target_id``,
+        ``link_type``, ``created_at``.
+    """
+    if limit <= 0:
+        limit = 100
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT l.link_id, l.source_id, l.target_id, l.link_type, l.created_at
+            FROM brain.atom_links l
+            WHERE l.user_id = %s
+              AND l.target_id NOT LIKE 'gz-%%'
+              AND NOT EXISTS (
+                SELECT 1 FROM brain.thoughts t
+                WHERE t.thought_id = l.target_id AND t.user_id = %s
+              )
+            ORDER BY l.created_at DESC, l.link_id DESC
+            LIMIT %s
+            """,
+            (user_id, user_id, limit),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+    return [
+        {
+            "link_id": r[0],
+            "source_id": r[1],
+            "target_id": r[2],
+            "link_type": r[3],
+            "created_at": str(r[4]) if r[4] else "",
+        }
+        for r in rows
+    ]
+
+
 # ─── Formatters (human-readable CLI output) ──────────────────────────────────
 
 def _format_capture_result(result: Dict) -> str:
@@ -3233,6 +3750,40 @@ def main():
     group.add_argument("--redact-test", type=str, metavar="TEXT", dest="redact_test",
                        help="Run the redaction pipeline against TEXT and show what gets caught")
 
+    # ─── Connected provenance graph (gz-0l68v) ───────────────────────────────
+    group.add_argument("--add-link", action="store_true", dest="add_link_op",
+                       help="Add a typed link between atoms post-hoc "
+                            "(combine with --source-id, --target-id, --link-type)")
+    group.add_argument("--show-links", type=str, metavar="ATOM_ID",
+                       dest="show_links_atom",
+                       help="List outgoing and incoming typed links for an atom")
+    group.add_argument("--query-unresolved-findings", action="store_true",
+                       dest="query_unresolved",
+                       help="List finding-like atoms with no incoming 'resolves' link "
+                            "(combine with --limit; default 50)")
+    group.add_argument("--query-orphan-links", action="store_true",
+                       dest="query_orphans",
+                       help="List atom_links whose target_id is genuinely dangling "
+                            "(not an atom, not a bead). For data-integrity audit.")
+
+    # Operands for the link commands
+    parser.add_argument("--source-id", type=str, default=None, dest="source_id",
+                        metavar="ATOM_ID",
+                        help="Source atom thought_id for --add-link")
+    parser.add_argument("--target-id", type=str, default=None, dest="target_id",
+                        metavar="ID",
+                        help="Target id for --add-link (atom thought_id OR bead id like gz-XXXXX)")
+    parser.add_argument("--link-type", type=str, default=None, dest="link_type",
+                        metavar="TYPE",
+                        help="Link type for --add-link (one of: "
+                             + ", ".join(sorted(LINK_TYPES)) + ")")
+    parser.add_argument("--link", action="append", default=[], dest="capture_links",
+                        metavar="TARGET_ID:LINK_TYPE",
+                        help="With --capture: add a typed link from the new atom to "
+                             "TARGET_ID. Repeatable for multiple links. Validated before "
+                             "the capture commits — an unknown link_type rejects the whole "
+                             "capture.")
+
     parser.add_argument("--from", type=str, default=None, dest="from_iso",
                         metavar="ISO",
                         help="Start of replay window (ISO 8601); used with --replay")
@@ -3331,6 +3882,21 @@ def main():
 
     try:
         if args.capture:
+            # gz-0l68v — pre-validate every --link spec BEFORE the capture
+            # commits, so an unknown link_type rejects the whole capture
+            # (no half-written atom + half-written links).
+            link_specs: List[tuple] = []
+            for raw in (args.capture_links or []):
+                try:
+                    link_specs.append(_parse_link_spec(raw))
+                except ValueError as e:
+                    msg = f"--link rejected: {e}"
+                    if args.json:
+                        print(json.dumps({"error": msg, "spec": raw}))
+                    else:
+                        print(f"Error: {msg}", file=sys.stderr)
+                    sys.exit(2)
+
             result = capture(
                 conn,
                 text=args.capture,
@@ -3342,10 +3908,47 @@ def main():
                 prov_activity=args.prov_activity,
                 was_derived_from=args.was_derived_from,
             )
+
+            # Write the validated links AFTER capture commits. Each row
+            # references the new atom's thought_id as source. We skip the
+            # `verify_source_exists` recheck here because we KNOW the atom
+            # was just inserted in the same connection.
+            written_links: List[Dict[str, Any]] = []
+            for target_id, link_type in link_specs:
+                try:
+                    lr = add_link(
+                        conn,
+                        source_id=result["thought_id"],
+                        target_id=target_id,
+                        link_type=link_type,
+                        user_id=user_id,
+                        via="capture-flag",
+                        prov_agent=args.prov_agent,
+                        session_id=args.session_id or None,
+                        verify_source_exists=False,
+                    )
+                    written_links.append(lr)
+                except Exception as e:
+                    # Link write failure is logged but does not roll back
+                    # the capture — the atom is durable, links are best-effort.
+                    sys.stderr.write(
+                        f"Link write failed (continuing): "
+                        f"source={result['thought_id']} target={target_id} "
+                        f"type={link_type} error={e}\n"
+                    )
+
+            if written_links:
+                result["links"] = written_links
+
             if args.json:
                 print(json.dumps(result))
             else:
                 print(_format_capture_result(result))
+                for lr in written_links:
+                    print(
+                        f"   Link: {lr['link_type']} -> {lr['target_id']} "
+                        f"(link_id={lr['link_id']})"
+                    )
 
         elif args.search:
             results = search(
@@ -3659,6 +4262,119 @@ def main():
                             f"[{r['created_at']}] "
                             f"{r['event_type']:<10} "
                             f"{tid:<32} {summary}"
+                        )
+
+        # ─── Connected provenance graph (gz-0l68v) ───────────────────────────
+        elif args.add_link_op:
+            missing = [
+                name for name, val in
+                [("--source-id", args.source_id),
+                 ("--target-id", args.target_id),
+                 ("--link-type", args.link_type)]
+                if not val
+            ]
+            if missing:
+                msg = f"--add-link requires {', '.join(missing)}"
+                if args.json:
+                    print(json.dumps({"error": msg}))
+                else:
+                    print(f"Error: {msg}", file=sys.stderr)
+                sys.exit(2)
+            try:
+                result = add_link(
+                    conn,
+                    source_id=args.source_id,
+                    target_id=args.target_id,
+                    link_type=args.link_type,
+                    user_id=user_id,
+                    via="post-hoc",
+                    prov_agent=args.prov_agent,
+                    session_id=args.session_id or None,
+                )
+            except (ValueError, RuntimeError) as e:
+                if args.json:
+                    print(json.dumps({"error": str(e)}))
+                else:
+                    print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                verb = "Created" if result.get("created") else "Existed"
+                print(
+                    f"{verb}: link_id={result['link_id']} "
+                    f"source={result['source_id']} "
+                    f"type={result['link_type']} "
+                    f"target={result['target_id']}"
+                )
+
+        elif args.show_links_atom:
+            result = show_links(
+                conn,
+                atom_id=args.show_links_atom,
+                user_id=user_id,
+            )
+            if args.json:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                print(f"Links for {result['atom_id']}:")
+                print(f"  Outgoing ({len(result['outgoing'])}):")
+                for lr in result["outgoing"]:
+                    print(
+                        f"    -> {lr['link_type']:24s} -> "
+                        f"{lr['target_id']:42s} [{lr['target_kind']}] "
+                        f"link_id={lr['link_id']}"
+                    )
+                print(f"  Incoming ({len(result['incoming'])}):")
+                for lr in result["incoming"]:
+                    print(
+                        f"    <- {lr['link_type']:24s} <- "
+                        f"{lr['source_id']:42s} [{lr['source_kind']}] "
+                        f"link_id={lr['link_id']}"
+                    )
+
+        elif args.query_unresolved:
+            limit = args.limit if args.limit and args.limit > 0 else 50
+            rows = query_unresolved_findings(
+                conn,
+                user_id=user_id,
+                limit=limit,
+            )
+            if args.json:
+                print(json.dumps(rows, indent=2, default=str))
+            else:
+                if not rows:
+                    print("No unresolved findings.")
+                else:
+                    print(f"Unresolved findings ({len(rows)} of max {limit}):")
+                    for r in rows:
+                        print(
+                            f"  • {r['thought_id']} "
+                            f"({r['thought_type']}, {r['created_at']})"
+                        )
+                        if r.get("summary"):
+                            print(f"      {r['summary'][:140]}")
+
+        elif args.query_orphans:
+            limit = args.limit if args.limit and args.limit > 0 else 100
+            rows = query_orphan_links(
+                conn,
+                user_id=user_id,
+                limit=limit,
+            )
+            if args.json:
+                print(json.dumps(rows, indent=2, default=str))
+            else:
+                if not rows:
+                    print("No orphan links.")
+                else:
+                    print(f"Orphan links ({len(rows)} of max {limit}):")
+                    for r in rows:
+                        print(
+                            f"  link_id={r['link_id']:6d} "
+                            f"{r['source_id']} -[{r['link_type']}]-> "
+                            f"{r['target_id']} (target missing) "
+                            f"created={r['created_at']}"
                         )
     finally:
         conn.close()

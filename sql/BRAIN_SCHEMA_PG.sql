@@ -160,6 +160,45 @@ CREATE INDEX IF NOT EXISTS idx_replay_log_user_time ON replay_log (user_id, crea
 CREATE INDEX IF NOT EXISTS idx_replay_log_thought ON replay_log (thought_id) WHERE thought_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_replay_log_event_type ON replay_log (event_type, created_at DESC);
 
+-- ============================================================================
+-- Connected provenance graph (gz-0l68v): typed many-to-many links between
+-- atoms (and from atoms to beads). ORTHOGONAL to the was_derived_from PROV-DM
+-- column on brain.thoughts — that column remains the PROV-DM scaffold; this
+-- table is the typed-graph layer on top.
+--
+-- DESIGN CHOICES:
+--  * No FK on target_id — targets can be bead IDs (gz-XXXXX) which are NOT
+--    in brain.thoughts. Queries handle heterogeneity by classifying targets
+--    at query time (atom / bead / unknown).
+--  * FK on source_id WITH ON DELETE CASCADE — when an atom is VF_eps-forgotten,
+--    its OUTGOING links go with it. INBOUND links to the forgotten atom become
+--    orphans (target = forgotten-id) which --query-orphan-links exposes.
+--  * link_type is VARCHAR not ENUM — the closed set lives in LINK_TYPES in
+--    scripts/open_brain.py so extending the vocabulary doesn't need a schema
+--    migration. CLI layer rejects unknown types BEFORE INSERT.
+--  * user_id tenant-scoped — PS (Principal Scoping) preserved on the link.
+--  * (source_id, target_id, link_type, user_id) UNIQUE — same edge can't be
+--    written twice; second write is an idempotent no-op (ON CONFLICT DO NOTHING
+--    in the writer).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS atom_links (
+    link_id     BIGSERIAL         NOT NULL PRIMARY KEY,
+    source_id   VARCHAR(64)       NOT NULL,
+    target_id   VARCHAR(64)       NOT NULL,
+    link_type   VARCHAR(32)       NOT NULL,
+    prov        JSONB,
+    user_id     VARCHAR(100)      NOT NULL,
+    created_at  TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
+    CONSTRAINT atom_links_unique UNIQUE (source_id, target_id, link_type, user_id),
+    CONSTRAINT atom_links_source_fk
+      FOREIGN KEY (source_id) REFERENCES thoughts(thought_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS atom_links_source_idx ON atom_links(source_id);
+CREATE INDEX IF NOT EXISTS atom_links_target_idx ON atom_links(target_id);
+CREATE INDEX IF NOT EXISTS atom_links_type_idx   ON atom_links(link_type);
+CREATE INDEX IF NOT EXISTS atom_links_user_idx   ON atom_links(user_id);
+
 -- Landing schema for activity logs
 CREATE SCHEMA IF NOT EXISTS landing;
 
