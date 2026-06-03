@@ -24,10 +24,12 @@ to submit.
 """
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -48,6 +50,21 @@ SEARCH_TIMEOUT_SECONDS = 8      # subprocess timeout on the brain search
 SUMMARY_MAX_CHARS = 200         # trim atom SUMMARY to N chars in output
 SHORT_ID_CHARS = 8              # last N chars of THOUGHT_ID for the short_id
 DATE_CHARS = 10                 # first N chars of CREATED_AT (YYYY-MM-DD)
+
+# ─── Stale-state guard (enhancement #2 — bead gz-ow0sp) ───────────────────────
+# After the recall pass, scan the prompt for bead IDs (gz-XXXXX) and brain atom
+# IDs (brain-N-hex). Closed/done beads and superseded/forgotten atoms surface a
+# "## Stale-state guard" section so the agent does not act on resolved work as
+# if it were open. Suppressed entirely when no stale references are found.
+BEAD_ID_PATTERN = re.compile(r"\bgz-[a-z0-9]{4,8}\b")
+ATOM_ID_PATTERN = re.compile(r"\bbrain-\d+-[a-f0-9]+\b")
+BEAD_ID_CAP = 10                 # max bead IDs per prompt to look up
+ATOM_ID_CAP = 5                  # max atom IDs per prompt to look up
+BEADS_SHOW_TIMEOUT_SECONDS = 8   # per-call timeout for `beads show`
+ATOM_INSPECT_TIMEOUT_SECONDS = 8  # per-call timeout for open_brain --inspect
+STALE_GUARD_BUDGET_SECONDS = 15  # total wall-clock budget for ALL bead lookups
+STALE_BEAD_STATES = {"closed", "done"}  # which states warrant a warning
+BEAD_TITLE_MAX_CHARS = 120       # trim bead title in the output section
 
 # Resolve open_brain.py location — mirrors brain_hook.py's resolution.
 # Post-install: both files in ~/.claude/hooks/ (same directory).
@@ -189,6 +206,244 @@ def _build_additional_context(atoms: List[dict]) -> Optional[str]:
     return f"{header}\n{body}"
 
 
+# ─── Stale-state guard — bead lookups ─────────────────────────────────────────
+
+def _extract_bead_ids(prompt: str) -> List[str]:
+    """Find unique bead IDs in the prompt, preserving first-seen order, capped.
+
+    Pattern: lower-case ``gz-`` followed by 4-8 alphanumeric chars. Dedup by
+    first occurrence; cap at BEAD_ID_CAP to bound subprocess cost.
+    """
+    seen = set()
+    ordered: List[str] = []
+    for match in BEAD_ID_PATTERN.finditer(prompt):
+        bid = match.group(0)
+        if bid in seen:
+            continue
+        seen.add(bid)
+        ordered.append(bid)
+        if len(ordered) >= BEAD_ID_CAP:
+            break
+    return ordered
+
+
+def _run_beads_show(bead_id: str) -> Optional[dict]:
+    """Call ``beads show <id> --json`` and return parsed dict, or None on any error."""
+    try:
+        proc = subprocess.run(
+            ["beads", "show", bead_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=BEADS_SHOW_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+    stdout = proc.stdout or ""
+    if not stdout.strip():
+        return None
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _collect_stale_beads(bead_ids: List[str]) -> List[Tuple[str, str, str]]:
+    """For each ID, look up via beads show; return only stale (closed/done) ones.
+
+    Returns list of ``(bead_id, status, title)`` tuples. Honors the wall-clock
+    budget — short-circuits the loop if total elapsed time exceeds
+    STALE_GUARD_BUDGET_SECONDS, emitting whatever was already collected.
+    """
+    stale: List[Tuple[str, str, str]] = []
+    start = time.monotonic()
+    for bid in bead_ids:
+        if time.monotonic() - start > STALE_GUARD_BUDGET_SECONDS:
+            break
+        data = _run_beads_show(bid)
+        if not data:
+            continue
+        status = str(data.get("status") or "").strip().lower()
+        if status not in STALE_BEAD_STATES:
+            continue
+        title = str(data.get("title") or "").strip()
+        if len(title) > BEAD_TITLE_MAX_CHARS:
+            title = title[:BEAD_TITLE_MAX_CHARS].rstrip() + "..."
+        stale.append((bid, status, title or "(no title)"))
+    return stale
+
+
+# ─── Stale-state guard — atom supersession lookups ────────────────────────────
+
+def _extract_atom_ids(prompt: str) -> List[str]:
+    """Find unique brain atom IDs in the prompt, preserving order, capped.
+
+    Pattern: ``brain-<digits>-<hex>``. Dedup; cap at ATOM_ID_CAP.
+    """
+    seen = set()
+    ordered: List[str] = []
+    for match in ATOM_ID_PATTERN.finditer(prompt):
+        aid = match.group(0)
+        if aid in seen:
+            continue
+        seen.add(aid)
+        ordered.append(aid)
+        if len(ordered) >= ATOM_ID_CAP:
+            break
+    return ordered
+
+
+def _run_open_brain_inspect(atom_id: str) -> Optional[dict]:
+    """Call ``open_brain.py --inspect <id> --json`` and return parsed dict, or None on error."""
+    if not OPEN_BRAIN_SCRIPT.exists():
+        return None
+    env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+    try:
+        proc = subprocess.run(
+            ["python3", str(OPEN_BRAIN_SCRIPT), "--inspect", atom_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=ATOM_INSPECT_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+    stdout = proc.stdout or ""
+    if not stdout.strip():
+        return None
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _extract_atom_supersession(data: dict) -> Optional[str]:
+    """Inspect the parsed atom payload for superseded_by / forgotten_at markers.
+
+    Returns a short human-readable reason string if the atom is stale, else
+    None. Tolerates several shapes since open_brain --inspect may wrap the
+    actual atom under a ``result`` key or surface ``prov`` at the top level.
+    """
+    candidates = [data]
+    result = data.get("result")
+    if isinstance(result, dict):
+        candidates.append(result)
+
+    for payload in candidates:
+        prov = payload.get("prov")
+        if isinstance(prov, dict):
+            superseded = prov.get("superseded_by")
+            forgotten = prov.get("forgotten_at")
+            if superseded:
+                return f"superseded_by={superseded}"
+            if forgotten:
+                return f"forgotten_at={forgotten}"
+        # Some shapes surface these at top level rather than nested under prov.
+        superseded = payload.get("superseded_by")
+        forgotten = payload.get("forgotten_at")
+        if superseded:
+            return f"superseded_by={superseded}"
+        if forgotten:
+            return f"forgotten_at={forgotten}"
+    return None
+
+
+def _collect_stale_atoms(atom_ids: List[str]) -> List[Tuple[str, str]]:
+    """For each atom ID, look up via open_brain --inspect; surface only stale ones.
+
+    Returns ``(atom_id, reason)`` tuples. Atoms without supersession/forget
+    metadata (the vast majority) are silently skipped — no warning needed.
+    """
+    stale: List[Tuple[str, str]] = []
+    for aid in atom_ids:
+        data = _run_open_brain_inspect(aid)
+        if not data:
+            continue
+        reason = _extract_atom_supersession(data)
+        if reason is None:
+            continue
+        stale.append((aid, reason))
+    return stale
+
+
+# ─── Stale-state guard — section formatting ───────────────────────────────────
+
+def _format_stale_guard_section(
+    stale_beads: List[Tuple[str, str, str]],
+    stale_atoms: List[Tuple[str, str]],
+) -> Optional[str]:
+    """Render the stale-state guard markdown block, or None if nothing to show.
+
+    Suppressed entirely when both lists are empty — no false-alarm header.
+    """
+    if not stale_beads and not stale_atoms:
+        return None
+
+    lines: List[str] = ["## Stale-state guard"]
+    if stale_beads:
+        lines.append("")
+        lines.append(
+            "The following work-items referenced in your prompt are already "
+            "CLOSED — verify your prompt's assumption against current state "
+            "before acting:"
+        )
+        for bid, status, title in stale_beads:
+            lines.append(f"- {bid} [{status}] — {title}")
+    if stale_atoms:
+        lines.append("")
+        lines.append(
+            "The following recalled brain atoms referenced in your prompt may "
+            "be stale — superseded or forgotten since capture:"
+        )
+        for aid, reason in stale_atoms:
+            lines.append(f"- {aid} — {reason}")
+    return "\n".join(lines)
+
+
+def _build_stale_guard_for_prompt(prompt: str) -> Optional[str]:
+    """End-to-end stale-state guard pipeline for a single prompt.
+
+    Wraps extraction + lookup + formatting in a fail-open envelope so any
+    exception (subprocess crash, parse failure, etc) yields None — the recall
+    block keeps emitting unaffected.
+    """
+    try:
+        bead_ids = _extract_bead_ids(prompt)
+        atom_ids = _extract_atom_ids(prompt)
+        if not bead_ids and not atom_ids:
+            return None
+        stale_beads = _collect_stale_beads(bead_ids) if bead_ids else []
+        stale_atoms = _collect_stale_atoms(atom_ids) if atom_ids else []
+        return _format_stale_guard_section(stale_beads, stale_atoms)
+    except Exception:
+        return None
+
+
 # ─── Hook stdin protocol ──────────────────────────────────────────────────────
 
 def _read_prompt_from_stdin() -> str:
@@ -219,21 +474,36 @@ def _read_prompt_from_stdin() -> str:
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Hook entry point. Always exits 0; emits stdout only when recall succeeds."""
+    """Hook entry point. Always exits 0; emits stdout only when recall succeeds.
+
+    Composition: the recall block (semantic prior-memories pull) runs first.
+    The stale-state guard then runs independently — its job is to surface
+    referenced bead-IDs that are already closed and recalled atoms that have
+    been superseded. If the recall block is silent (trigger missed or empty
+    result), the guard still runs against any IDs found in the prompt. Either
+    block alone is sufficient to emit additionalContext; both blocks together
+    are concatenated recall-first.
+    """
     try:
         prompt = _read_prompt_from_stdin()
         if not prompt:
             return
 
-        if not _should_fire(prompt):
-            return
+        recall_block: Optional[str] = None
+        if _should_fire(prompt):
+            atoms = _run_brain_search(prompt)
+            if atoms:
+                recall_block = _build_additional_context(atoms)
 
-        atoms = _run_brain_search(prompt)
-        if not atoms:  # None or empty list → silent
-            return
+        stale_block = _build_stale_guard_for_prompt(prompt)
 
-        context = _build_additional_context(atoms)
-        if not context:
+        if recall_block and stale_block:
+            context = f"{recall_block}\n\n{stale_block}"
+        elif recall_block:
+            context = recall_block
+        elif stale_block:
+            context = stale_block
+        else:
             return
 
         # Emit the additionalContext envelope. Claude Code prepends this to the

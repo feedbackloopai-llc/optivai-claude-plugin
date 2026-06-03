@@ -394,3 +394,305 @@ def _make_mock_run_callable(side_effect_callable):
     mock = MagicMock(name="subprocess_run_mock")
     mock.side_effect = side_effect_callable
     return mock
+
+
+# ─── Stale-state guard test helpers ───────────────────────────────────────────
+# The guard issues two new subprocess command shapes alongside the existing
+# brain-search one:
+#   ["beads", "show", "<id>", "--json"]                                  (bead lookup)
+#   ["python3", "<open_brain.py>", "--inspect", "<id>", "--json"]        (atom inspect)
+# A dispatching mock routes by argv[0]/argv[1] so we can assert per-command
+# behavior in isolation.
+
+
+def _make_dispatching_mock(
+    atoms_to_return=None,
+    bead_status_by_id=None,
+    bead_title_by_id=None,
+    bead_raises_for=None,
+    atom_prov_by_id=None,
+):
+    """Dispatch subprocess.run by command shape.
+
+    - atoms_to_return: list of atom dicts for open_brain --search (or None → empty)
+    - bead_status_by_id: {bead_id: status_str} — return JSON {"status": ..., "title": ...}
+    - bead_title_by_id: {bead_id: title_str} — paired with bead_status_by_id
+    - bead_raises_for: set of bead_ids whose lookup should raise an exception
+    - atom_prov_by_id: {atom_id: {"superseded_by": ...}} — open_brain --inspect payload
+    """
+    from unittest.mock import MagicMock
+
+    atoms_to_return = atoms_to_return or []
+    bead_status_by_id = bead_status_by_id or {}
+    bead_title_by_id = bead_title_by_id or {}
+    bead_raises_for = bead_raises_for or set()
+    atom_prov_by_id = atom_prov_by_id or {}
+
+    def dispatch(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", [])
+        if not argv:
+            return _FakeCompletedProcess(stdout="", returncode=2)
+
+        # beads show <id> --json
+        if argv[0] == "beads" and len(argv) >= 3 and argv[1] == "show":
+            bid = argv[2]
+            if bid in bead_raises_for:
+                raise subprocess.CalledProcessError(2, argv)
+            status = bead_status_by_id.get(bid)
+            if status is None:
+                return _FakeCompletedProcess(stdout="", returncode=2)
+            payload = {"id": bid, "status": status, "title": bead_title_by_id.get(bid, "")}
+            return _FakeCompletedProcess(stdout=json.dumps(payload), returncode=0)
+
+        # python3 <open_brain.py> --inspect <id> --json
+        # OR    python3 <open_brain.py> --search <query> ...
+        if argv[0] == "python3" and len(argv) >= 4:
+            if "--inspect" in argv:
+                aid_idx = argv.index("--inspect") + 1
+                aid = argv[aid_idx] if aid_idx < len(argv) else ""
+                payload = atom_prov_by_id.get(aid)
+                if payload is None:
+                    return _FakeCompletedProcess(stdout="", returncode=2)
+                return _FakeCompletedProcess(stdout=json.dumps(payload), returncode=0)
+            if "--search" in argv:
+                return _FakeCompletedProcess(
+                    stdout=json.dumps(atoms_to_return),
+                    returncode=0,
+                )
+
+        return _FakeCompletedProcess(stdout="", returncode=2)
+
+    mock = MagicMock(name="subprocess_run_dispatching_mock")
+    mock.side_effect = dispatch
+    return mock
+
+
+def _count_beads_show_calls(mock_run, bead_id=None):
+    """Count how many times `beads show [<bead_id>]` was invoked."""
+    count = 0
+    for call in mock_run.call_args_list:
+        argv = call.args[0] if call.args else call.kwargs.get("args", [])
+        if not argv or argv[0] != "beads" or len(argv) < 3 or argv[1] != "show":
+            continue
+        if bead_id is None or argv[2] == bead_id:
+            count += 1
+    return count
+
+
+# ─── Stale-state guard tests (enhancement #2 — bead gz-ow0sp) ─────────────────
+
+def test_stale_state_detects_closed_bead_in_prompt():
+    """Prompt referencing gz-abc123; bead is CLOSED → stale-state section emitted."""
+    prompt = (
+        "Please review the implementation in bead gz-abc123 — I think the "
+        "stale-state guard hook needs further work and design review now."
+    )
+    assert len(prompt) >= 50
+    assert "review" in prompt.lower()
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        bead_status_by_id={"gz-abc123": "closed"},
+        bead_title_by_id={"gz-abc123": "Stale-state guard for auto-recall hook"},
+    )
+
+    out, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+    assert out != ""
+
+    payload = json.loads(out)
+    ctx = payload["additionalContext"]
+    assert "## Stale-state guard" in ctx
+    assert "gz-abc123" in ctx
+    assert "[closed]" in ctx
+    assert "Stale-state guard for auto-recall hook" in ctx
+
+
+def test_stale_state_skips_open_bead():
+    """Prompt references gz-abc123 but the bead is OPEN → no stale-state section."""
+    prompt = (
+        "Please review and design the next steps for bead gz-abc123 right now "
+        "as part of this current planning session detail in depth."
+    )
+    assert len(prompt) >= 50
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        bead_status_by_id={"gz-abc123": "open"},
+        bead_title_by_id={"gz-abc123": "Open work item."},
+    )
+
+    out, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    payload = json.loads(out)
+    ctx = payload["additionalContext"]
+    # Recall block still emits, but no stale-state header
+    assert "## Recent neurosymbolic context" in ctx
+    assert "## Stale-state guard" not in ctx
+
+
+def test_stale_state_dedups_repeated_bead_id():
+    """Same bead ID mentioned 3 times → beads show called exactly once."""
+    prompt = (
+        "Please review gz-abc123 — gz-abc123 is the same bead — gz-abc123 "
+        "appears three times in this prompt and dedup is expected explicit."
+    )
+    assert len(prompt) >= 50
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        bead_status_by_id={"gz-abc123": "closed"},
+        bead_title_by_id={"gz-abc123": "Dedup test bead."},
+    )
+
+    _, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    assert _count_beads_show_calls(mock_run, bead_id="gz-abc123") == 1
+
+
+def test_stale_state_section_suppressed_when_no_closed_beads():
+    """Prompt with only OPEN beads → no `## Stale-state guard` header in output."""
+    prompt = (
+        "Please plan the review of gz-aaa111 and gz-bbb222 and gz-ccc333 — "
+        "all of these are still open and being actively worked on right now."
+    )
+    assert len(prompt) >= 50
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        bead_status_by_id={
+            "gz-aaa111": "open",
+            "gz-bbb222": "in_progress",
+            "gz-ccc333": "open",
+        },
+        bead_title_by_id={
+            "gz-aaa111": "Bead one.",
+            "gz-bbb222": "Bead two.",
+            "gz-ccc333": "Bead three.",
+        },
+    )
+
+    out, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    payload = json.loads(out)
+    ctx = payload["additionalContext"]
+    assert "## Stale-state guard" not in ctx
+    # But beads show WAS called — assert the lookups ran
+    assert _count_beads_show_calls(mock_run) == 3
+
+
+def test_stale_state_fail_open_on_subprocess_error():
+    """beads show raises → no stale-state section, but recall block still present."""
+    prompt = (
+        "Please review the design for bead gz-xyz999 — this should still "
+        "produce the recall block even when beads CLI is broken right now."
+    )
+    assert len(prompt) >= 50
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        bead_raises_for={"gz-xyz999"},
+    )
+
+    out, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    payload = json.loads(out)
+    ctx = payload["additionalContext"]
+    # Recall block still emits
+    assert "## Recent neurosymbolic context" in ctx
+    # Stale-state section absent (subprocess raised → fail-open silent skip)
+    assert "## Stale-state guard" not in ctx
+
+
+def test_stale_state_caps_at_10_bead_ids():
+    """Prompt with 12 distinct bead IDs → beads show called at most 10 times."""
+    bead_ids = [f"gz-id{i:04d}" for i in range(12)]
+    assert len(bead_ids) == 12
+    prompt = (
+        "Please review and plan the work for the following twelve distinct "
+        "beads in this big audit batch: " + " ".join(bead_ids) + " — done."
+    )
+    assert len(prompt) >= 50
+
+    # Status doesn't matter for this test; all OPEN so no stale section emitted
+    status_map = {bid: "open" for bid in bead_ids}
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        bead_status_by_id=status_map,
+    )
+
+    _, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    # The cap is BEAD_ID_CAP (10) — at most that many lookups
+    total_calls = _count_beads_show_calls(mock_run)
+    assert total_calls <= auto_recall_hook.BEAD_ID_CAP == 10
+    assert total_calls == 10  # all 10 first-seen IDs were looked up
+
+
+def test_stale_state_section_appears_after_recall_block():
+    """Both blocks populated → recall header appears BEFORE stale-state header."""
+    prompt = (
+        "Please review and decide on the architectural plan referenced in "
+        "bead gz-stale1 which I believe is still open and unresolved okay."
+    )
+    assert len(prompt) >= 50
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom(summary="A prior recalled memory.")],
+        bead_status_by_id={"gz-stale1": "closed"},
+        bead_title_by_id={"gz-stale1": "Already resolved work."},
+    )
+
+    out, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    payload = json.loads(out)
+    ctx = payload["additionalContext"]
+
+    recall_idx = ctx.find("## Recent neurosymbolic context")
+    stale_idx = ctx.find("## Stale-state guard")
+    assert recall_idx >= 0, "recall header missing"
+    assert stale_idx >= 0, "stale-state header missing"
+    assert recall_idx < stale_idx, (
+        f"recall header (idx={recall_idx}) must precede stale-state header "
+        f"(idx={stale_idx})"
+    )
+
+
+def test_atom_supersession_warning():
+    """Prompt mentions brain-1234-deadbeef; inspect returns prov.superseded_by → warning emitted."""
+    prompt = (
+        "Please review the prior recalled memory brain-1234-deadbeef and "
+        "decide whether to act on it — design and plan accordingly okay yes."
+    )
+    assert len(prompt) >= 50
+
+    superseded_payload = {
+        "thought_id": "brain-1234-deadbeef",
+        "result": {
+            "prov": {
+                "superseded_by": "brain-9999-cafef00d",
+                "agent": "test-agent",
+            },
+        },
+    }
+
+    mock_run = _make_dispatching_mock(
+        atoms_to_return=[_make_atom()],
+        atom_prov_by_id={"brain-1234-deadbeef": superseded_payload},
+    )
+
+    out, exit_code = _run_hook_with_prompt(prompt, mock_run=mock_run)
+    assert exit_code == 0
+
+    payload = json.loads(out)
+    ctx = payload["additionalContext"]
+    assert "## Stale-state guard" in ctx
+    assert "brain-1234-deadbeef" in ctx
+    assert "superseded_by" in ctx
+    assert "brain-9999-cafef00d" in ctx
