@@ -3300,6 +3300,338 @@ def query_orphan_links(
     ]
 
 
+# ─── Skill registration: composite capture + Hebbian +2.0 + derives_from ─────
+#
+# gz-nced6 — Enhancement #4 of the brain-substrate stream. The principle is
+# that *capture is the registration* but Hebbian promotion is what tells
+# future recall this is reusable knowledge worth surfacing. Today both are
+# manual + separate; --register-skill wires them together as ONE primitive so
+# the agent learns by registering instead of just capturing.
+#
+# Composition (atomic from the user's point of view):
+#   1. capture an atom with prov_activity='skill_register' + a SKILL header
+#   2. overwrite thought_type to 'skill_ref' + inject metadata.pearl_kind +
+#      metadata.skill_name (the LLM metadata extractor will classify the body
+#      as 'pattern' or 'insight' — we authoritatively override after the row
+#      is written, in the same connection, before promote/links fire)
+#   3. promote_thought(weight=2.0) — the "this is reusable knowledge" signal
+#      (double the standard +1.0 promote)
+#   4. add_link(link_type='derives_from') for each --from-pattern target
+#
+# Pre-validations (NOTHING is written if any fails):
+#   * name format: ^[a-z0-9][a-z0-9_-]{2,63}$
+#   * description length: 10–4000 chars (matches the v0.19 Level-B convention)
+#   * each from-pattern atom_id must exist in brain.thoughts under user_id
+#
+# Soft-warn (does NOT block):
+#   * duplicate skill name (same name + thought_type='skill_ref' + user_id) —
+#     stderr warning lists the existing skill_id; the user can rebuild or
+#     update post-hoc. We do not block because re-registering a skill is a
+#     legitimate intent (re-validation by Rule 4 promotion semantics).
+#
+# Returns a single dict shaped for both human and JSON output:
+#   {"skill_id": "...", "name": "...", "promoted_weight": 2.0,
+#    "linked_from_patterns": [...]}
+
+
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,63}$")
+SKILL_DESCRIPTION_MIN = 10
+SKILL_DESCRIPTION_MAX = 4000
+SKILL_PROMOTE_WEIGHT = 2.0  # double the standard +1.0 promote (reusable-knowledge signal)
+
+
+def _validate_skill_name(name: str) -> None:
+    """Raise ``ValueError`` if ``name`` does not match the canonical skill name
+    format ``^[a-z0-9][a-z0-9_-]{2,63}$`` (3–64 chars, lowercase
+    kebab/snake, starting with alphanumeric).
+    """
+    if not isinstance(name, str) or not SKILL_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid skill name {name!r}: must match "
+            f"^[a-z0-9][a-z0-9_-]{{2,63}}$ (3–64 chars, lowercase, "
+            f"kebab/snake, starting alnum)"
+        )
+
+
+def _validate_skill_description(description: str) -> None:
+    """Raise ``ValueError`` if ``description`` is outside
+    ``[SKILL_DESCRIPTION_MIN, SKILL_DESCRIPTION_MAX]`` chars after stripping
+    surrounding whitespace.
+    """
+    if not isinstance(description, str):
+        raise ValueError("skill description must be a string")
+    stripped = description.strip()
+    if len(stripped) < SKILL_DESCRIPTION_MIN:
+        raise ValueError(
+            f"skill description too short ({len(stripped)} chars); "
+            f"minimum {SKILL_DESCRIPTION_MIN}"
+        )
+    if len(stripped) > SKILL_DESCRIPTION_MAX:
+        raise ValueError(
+            f"skill description too long ({len(stripped)} chars); "
+            f"maximum {SKILL_DESCRIPTION_MAX}"
+        )
+
+
+def _find_existing_skill_by_name(
+    conn, user_id: str, name: str,
+) -> Optional[str]:
+    """Return the thought_id of an existing skill with the same canonical name,
+    or ``None`` if no such skill exists in the user's scope.
+
+    The match is exact on ``metadata->>'skill_name'`` (the authoritative
+    field, written by :func:`register_skill`). Both the skill name and the
+    raw_text SKILL: prefix are checked — the latter as defense-in-depth in
+    case an external INSERT bypassed the metadata stamp.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT thought_id
+            FROM brain.thoughts
+            WHERE user_id = %s
+              AND thought_type = 'skill_ref'
+              AND (
+                metadata->>'skill_name' = %s
+                OR raw_text LIKE %s
+              )
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (user_id, name, f"SKILL: {name}\n%"),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        cur.close()
+
+
+def _stamp_skill_metadata(
+    conn, thought_id: str, user_id: str, name: str,
+) -> None:
+    """Force ``thought_type='skill_ref'`` and merge
+    ``metadata.pearl_kind='skill_ref'`` + ``metadata.skill_name=name`` onto
+    the just-captured atom.
+
+    The LLM metadata extractor classifies the body autonomously — it will
+    typically return ``pattern`` or ``insight``. The composite
+    ``register_skill`` primitive's contract demands the row carry
+    ``skill_ref`` as the authoritative kind in BOTH the column (for index
+    scans) AND the metadata JSONB (for Pearl-aligned readers). This helper
+    is called from :func:`register_skill` immediately after :func:`capture`
+    returns, in the same connection, before promote or links fire — so the
+    composite operation is atomic from the user's point of view.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE brain.thoughts
+            SET thought_type = 'skill_ref',
+                metadata = COALESCE(metadata, '{}'::jsonb)
+                           || jsonb_build_object(
+                                'pearl_kind', 'skill_ref',
+                                'skill_name', %s::text
+                              ),
+                updated_at = NOW()
+            WHERE thought_id = %s AND user_id = %s
+            """,
+            (name, thought_id, user_id),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+
+def register_skill(
+    conn,
+    name: str,
+    description: str,
+    user_id: str,
+    from_patterns: Optional[List[str]] = None,
+    prov_agent: Optional[str] = None,
+    project: str = "",
+    session_id: str = "",
+) -> Dict[str, Any]:
+    """Composite primitive: capture + Hebbian +2.0 promote + derives_from links.
+
+    Atomic from the user's point of view, but implemented as a sequence
+    so each substep can be tested independently and so a downstream failure
+    does not silently leave half-written state.
+
+    Sequence (in this order; ALL pre-validations run BEFORE any DB write):
+      1. validate ``name`` format (``^[a-z0-9][a-z0-9_-]{2,63}$``)
+      2. validate ``description`` length (10–4000 chars)
+      3. validate every ``from_patterns`` atom exists in user scope
+      4. soft-warn (stderr) on duplicate name
+      5. capture(...) the atom with ``prov_activity='skill_register'``
+      6. overwrite ``thought_type='skill_ref'`` + inject metadata
+      7. promote_thought(weight=+2.0)
+      8. add_link(link_type='derives_from') for each from-pattern
+
+    Parameters
+    ----------
+    conn
+        Open psycopg2 connection.
+    name
+        Canonical skill name (lowercase kebab/snake, 3–64 chars).
+    description
+        Free-form description (10–4000 chars).
+    user_id
+        Caller PS scope.
+    from_patterns
+        Optional list of atom thought_ids this skill generalizes. Each
+        is written as a ``derives_from`` link from the new skill atom to
+        the named pattern. Every id is verified to exist in the caller's
+        scope BEFORE any write — a missing id rejects the whole register
+        (NOT silently skipped — we don't want orphan claims of derivation).
+    prov_agent
+        Override the default agent identifier. Defaults to
+        ``cli-user-{user_id}`` per :func:`_derive_prov_agent`.
+    project, session_id
+        Forwarded to :func:`capture`.
+
+    Returns
+    -------
+    dict
+        ``{"skill_id": str, "name": str, "promoted_weight": float,
+           "linked_from_patterns": [str, ...]}``
+
+    Raises
+    ------
+    ValueError
+        Invalid name format or description length.
+    RuntimeError
+        Any from-pattern atom_id does not exist in the user's scope.
+    """
+    # ─── Pre-validations (no DB writes) ──────────────────────────────────
+    _validate_skill_name(name)
+    _validate_skill_description(description)
+
+    from_patterns = list(from_patterns or [])
+    # Strip + dedupe while preserving order — repeated --from-pattern X X X
+    # is degenerate but should not double-write the same link.
+    seen: set = set()
+    cleaned_patterns: List[str] = []
+    for fp in from_patterns:
+        if fp is None:
+            continue
+        fp_s = fp.strip()
+        if not fp_s:
+            continue
+        if fp_s in seen:
+            continue
+        seen.add(fp_s)
+        cleaned_patterns.append(fp_s)
+    from_patterns = cleaned_patterns
+
+    # Verify every from-pattern target exists in user scope BEFORE any write.
+    if from_patterns:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT thought_id FROM brain.thoughts
+                WHERE user_id = %s AND thought_id = ANY(%s)
+                """,
+                (user_id, from_patterns),
+            )
+            existing = {row[0] for row in cur.fetchall()}
+        finally:
+            cur.close()
+        missing = [fp for fp in from_patterns if fp not in existing]
+        if missing:
+            raise RuntimeError(
+                f"register_skill: from-pattern atom(s) not in user scope "
+                f"(user={user_id}): {missing}"
+            )
+
+    # Duplicate-name soft-warn (does NOT block). Look up an existing skill
+    # by canonical name in the user's scope and surface the existing id.
+    existing_skill_id = _find_existing_skill_by_name(conn, user_id, name)
+    if existing_skill_id is not None:
+        sys.stderr.write(
+            f"Warning: a skill named {name!r} already exists "
+            f"(id={existing_skill_id}) — capturing anyway; consider "
+            f"--update-skill if you meant to replace.\n"
+        )
+
+    # ─── Composite write ─────────────────────────────────────────────────
+    # Redact PII from the description before composing the body so PII in
+    # skill descriptions never reaches the row. Fail-open: if redact_pii
+    # raises for any reason, fall back to the original text — the
+    # capture-path redactor (replay-log emitter) is still in play.
+    try:
+        redacted_description = redact_pii(description) or description
+    except Exception:
+        redacted_description = description
+
+    body = f"SKILL: {name}\n\n{redacted_description.strip()}"
+
+    # capture() handles embedding generation + LLM metadata extraction +
+    # PROV-DM stamping + replay-log emission. We pass prov_activity to
+    # mark this as a skill_register event (overrides the default 'capture').
+    cap = capture(
+        conn,
+        text=body,
+        user_id=user_id,
+        source="manual",
+        session_id=session_id,
+        project=project,
+        prov_agent=prov_agent,
+        prov_activity="skill_register",
+    )
+    skill_id = cap["thought_id"]
+
+    # Force thought_type='skill_ref' + inject pearl_kind + skill_name.
+    # The LLM metadata extractor will have classified the body as
+    # 'pattern' or 'insight' — we override authoritatively here so the
+    # column AND the metadata blob both carry 'skill_ref'.
+    _stamp_skill_metadata(conn, skill_id, user_id, name)
+
+    # Hebbian +2.0 promote — the "this is reusable knowledge" signal so
+    # future recall ranks it higher than a one-off pattern.
+    promote_thought(
+        conn,
+        thought_id=skill_id,
+        user_id=user_id,
+        weight=SKILL_PROMOTE_WEIGHT,
+        reason=f"skill registration: {name}",
+        prov_agent=prov_agent,
+    )
+
+    # derives_from links to each source pattern. Verify-source-exists is
+    # skipped (we just inserted the skill atom in this same connection).
+    linked: List[str] = []
+    for target_id in from_patterns:
+        add_link(
+            conn,
+            source_id=skill_id,
+            target_id=target_id,
+            link_type="derives_from",
+            user_id=user_id,
+            via="skill-register",
+            prov_agent=prov_agent,
+            session_id=session_id or None,
+            verify_source_exists=False,
+        )
+        linked.append(target_id)
+
+    return {
+        "skill_id": skill_id,
+        "name": name,
+        "promoted_weight": float(SKILL_PROMOTE_WEIGHT),
+        "linked_from_patterns": linked,
+    }
+
+
 # ─── Formatters (human-readable CLI output) ──────────────────────────────────
 
 def _format_capture_result(result: Dict) -> str:
@@ -3765,6 +4097,25 @@ def main():
                        dest="query_orphans",
                        help="List atom_links whose target_id is genuinely dangling "
                             "(not an atom, not a bead). For data-integrity audit.")
+
+    # ─── Skill registration (gz-nced6) ───────────────────────────────────────
+    group.add_argument("--register-skill", type=str, metavar="NAME",
+                       dest="register_skill_name",
+                       help="Composite primitive: capture an atom with "
+                            "thought_type='skill_ref', promote it via Hebbian "
+                            "+2.0, and add derives_from links to each "
+                            "--from-pattern. Requires --skill-description.")
+
+    parser.add_argument("--skill-description", type=str, default=None,
+                        dest="skill_description", metavar="TEXT",
+                        help="Required with --register-skill. "
+                             "Free-form description (10–4000 chars).")
+    parser.add_argument("--from-pattern", action="append", default=[],
+                        dest="from_patterns", metavar="ATOM_ID",
+                        help="With --register-skill: thought_id of a pattern "
+                             "this skill generalizes. Repeatable. Each id is "
+                             "validated to exist in the user's scope before "
+                             "any write.")
 
     # Operands for the link commands
     parser.add_argument("--source-id", type=str, default=None, dest="source_id",
@@ -4376,6 +4727,52 @@ def main():
                             f"{r['target_id']} (target missing) "
                             f"created={r['created_at']}"
                         )
+
+        # ─── Skill registration (gz-nced6) ───────────────────────────────────
+        elif args.register_skill_name:
+            if args.skill_description is None:
+                msg = "--register-skill requires --skill-description TEXT"
+                if args.json:
+                    print(json.dumps({"error": msg}))
+                else:
+                    print(f"Error: {msg}", file=sys.stderr)
+                sys.exit(2)
+            try:
+                result = register_skill(
+                    conn,
+                    name=args.register_skill_name,
+                    description=args.skill_description,
+                    user_id=user_id,
+                    from_patterns=args.from_patterns or [],
+                    prov_agent=args.prov_agent,
+                    project=args.project,
+                    session_id=args.session_id,
+                )
+            except ValueError as e:
+                if args.json:
+                    print(json.dumps({"error": str(e)}))
+                else:
+                    print(f"Error: {e}", file=sys.stderr)
+                sys.exit(2)
+            except RuntimeError as e:
+                if args.json:
+                    print(json.dumps({"error": str(e)}))
+                else:
+                    print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                print(f"✓ Skill registered: {result['name']}")
+                print(f"   skill_id: {result['skill_id']}")
+                print(f"   promoted_weight: +{result['promoted_weight']:.1f}")
+                if result["linked_from_patterns"]:
+                    print(
+                        f"   derives_from: "
+                        + ", ".join(result["linked_from_patterns"])
+                    )
+                else:
+                    print("   derives_from: (none)")
     finally:
         conn.close()
 
