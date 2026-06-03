@@ -15,10 +15,11 @@ Design decisions:
 
 import os
 import re
+import subprocess
 import sys
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 # Import secret redaction (fail silently if not available)
 try:
@@ -138,6 +139,79 @@ def _truncate(text: str, max_len: int = 100) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+
+def _detect_repo_label(cwd: str) -> Optional[str]:
+    """
+    Return ``repo:<basename>`` if ``cwd`` (or any ancestor) is inside a
+    git working tree, otherwise None.
+
+    Implementation: shell out to ``git rev-parse --show-toplevel`` from the
+    given cwd. This honors git's own resolution rules (worktrees, submodules,
+    GIT_DIR overrides) without re-implementing them. Failure (non-zero exit,
+    missing git binary, OSError) is treated as "not in a repo" and returns
+    None — never raises.
+    """
+    if not cwd:
+        return None
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    repo_root = (result.stdout or '').strip()
+    if not repo_root:
+        return None
+    basename = os.path.basename(repo_root)
+    if not basename:
+        return None
+    return f"repo:{basename}"
+
+
+def _apply_repo_label(bead_id: str, repo_label: str) -> bool:
+    """
+    Invoke ``beads label <bead_id> <repo_label>`` as a subprocess.
+
+    Returns True on exit 0 (which `beads label` also returns when the label
+    is already present — the command is idempotent). Returns False on
+    non-zero exit, missing binary, or any subprocess error. **Never raises.**
+
+    This is the "fail-open" application path called after a successful bead
+    creation. Per the labeling convention spec, label failures MUST NOT roll
+    back the bead — they are logged once to stderr and execution proceeds.
+    """
+    if not bead_id or not repo_label:
+        return False
+    try:
+        result = subprocess.run(
+            ['beads', 'label', bead_id, repo_label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as e:
+        print(
+            f"[beads_writer] Warning: failed to apply {repo_label} to "
+            f"{bead_id}: {e}",
+            file=sys.stderr,
+        )
+        return False
+    if result.returncode != 0:
+        stderr = (result.stderr or '').strip() or '(no stderr)'
+        print(
+            f"[beads_writer] Warning: `beads label {bead_id} {repo_label}` "
+            f"exited {result.returncode}: {stderr}",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _is_significant_operation(operation: str, details: Dict[str, Any]) -> bool:
@@ -334,13 +408,23 @@ class BeadsWriter:
             if subagent_context and subagent_context.get('is_subagent'):
                 labels.append('subagent')
 
-            self.db.create(
+            issue = self.db.create(
                 title=title,
                 type=bead_type,
                 description=description,
                 labels=labels,
                 created_by=f"hook:{session_id}"
             )
+
+            # Auto-label with repo:<basename> when running inside a git tree.
+            # Per the labeling convention (AGENTS.md), every bead created from
+            # within a repo carries a `repo:<basename>` label so beads can be
+            # filtered by source repo without polluting the ID. Fail-open:
+            # label errors are logged to stderr and never roll back creation.
+            new_id = getattr(issue, 'id', None)
+            repo_label = _detect_repo_label(cwd)
+            if new_id and repo_label:
+                _apply_repo_label(new_id, repo_label)
 
         except Exception as e:
             self._log_error(f"Failed to create bead: {e}")
@@ -375,13 +459,19 @@ class BeadsWriter:
             title = redact_secrets(_create_bead_title('user_prompt', details))
             description = redact_secrets(_create_bead_description('user_prompt', details, session_id, project, cwd))
 
-            self.db.create(
+            issue = self.db.create(
                 title=title,
                 type='note',  # User prompts are notes, not tasks
                 description=description,
                 labels=['auto', 'user_prompt'],
                 created_by=f"hook:{session_id}"
             )
+
+            # Auto-label with repo:<basename> (see on_tool_use for rationale).
+            new_id = getattr(issue, 'id', None)
+            repo_label = _detect_repo_label(cwd)
+            if new_id and repo_label:
+                _apply_repo_label(new_id, repo_label)
 
         except Exception as e:
             self._log_error(f"Failed to create user_prompt bead: {e}")

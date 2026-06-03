@@ -41,6 +41,29 @@ beads list --status done
 beads list --status closed
 ```
 
+## Filter by Repo Label
+
+Beads created inside a git tree carry a `repo:<basename>` label by
+convention (see `/bead-create` → "Repo-label convention"). Filter by it:
+
+```bash
+# All beads from this plugin
+beads list -l repo:optivai-claude-plugin
+
+# All beads from the Pi plugin (cross-cutting view)
+beads list -l repo:optivai-pi-plugin
+
+# Combine status + repo filters
+beads list --status open -l repo:optivai-claude-plugin
+
+# Multi-label intersection (AND): beads with BOTH labels
+beads list -l repo:optivai-claude-plugin -l repo:optivai-pi-plugin
+```
+
+Multi-label `-l` flags AND together — the bead must carry every label to
+appear in the result. This is what surfaces cross-cutting work like the
+HARNESS-RECALL epic.
+
 ## JSON Output (for processing)
 
 ```bash

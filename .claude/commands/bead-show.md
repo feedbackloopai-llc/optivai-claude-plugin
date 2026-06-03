@@ -49,7 +49,7 @@ Blocks: gz-def34, gz-ghi56
 
 ## Related Commands
 
-- `/bead-list` - List beads
-- `/bead-create` - Create new bead
+- `/bead-list` - List beads (and filter by `repo:<basename>` — see its "Filter by Repo Label" section)
+- `/bead-create` - Create new bead (see its "Repo-label convention" section — the canonical reference for the `repo:<basename>` labeling rule)
 - `/bead-link` - Add dependency
 - `/bead-ready` - Show ready beads
