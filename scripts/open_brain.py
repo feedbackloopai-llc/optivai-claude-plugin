@@ -2974,7 +2974,7 @@ def _classify_target_kind(conn, target_id: str, user_id: str) -> str:
             return "atom"
     finally:
         cur.close()
-    if target_id.startswith("gz-"):
+    if target_id.startswith(("gz-", "fblai-", "optivai-")):
         return "bead"
     return "unknown"
 

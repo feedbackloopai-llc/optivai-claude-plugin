@@ -56,7 +56,7 @@ DATE_CHARS = 10                 # first N chars of CREATED_AT (YYYY-MM-DD)
 # IDs (brain-N-hex). Closed/done beads and superseded/forgotten atoms surface a
 # "## Stale-state guard" section so the agent does not act on resolved work as
 # if it were open. Suppressed entirely when no stale references are found.
-BEAD_ID_PATTERN = re.compile(r"\bgz-[a-z0-9]{4,8}\b")
+BEAD_ID_PATTERN = re.compile(r"\b(?:gz|fblai|optivai)-[a-z0-9]{4,8}\b")
 ATOM_ID_PATTERN = re.compile(r"\bbrain-\d+-[a-f0-9]+\b")
 BEAD_ID_CAP = 10                 # max bead IDs per prompt to look up
 ATOM_ID_CAP = 5                  # max atom IDs per prompt to look up
