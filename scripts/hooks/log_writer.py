@@ -168,7 +168,6 @@ class AgentActivityLogger:
             "type": "teams",
             "model": os.environ.get("ANTHROPIC_MODEL", "unknown"),
             "organization": os.environ.get("CLAUDE_ORG_NAME", "FeedbackLoopAI"),
-            "user_email": os.environ.get("CLAUDE_USER_EMAIL", ""),
         }
 
     def _generate_session_id(self) -> str:

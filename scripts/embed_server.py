@@ -72,7 +72,7 @@ def make_handler(encode_fn, model_name, started_at, state):
                 return self._json(404, {"error": "not found"})
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                if length > MAX_BODY:
+                if length < 0 or length > MAX_BODY:
                     return self._json(413, {"error": "request too large"})
                 body = json.loads(self.rfile.read(length) or b"{}")
             except (ValueError, json.JSONDecodeError):

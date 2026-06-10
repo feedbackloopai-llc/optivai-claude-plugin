@@ -128,6 +128,32 @@ def test_oversized_body_returns_413_and_encode_fn_not_called():
     )
 
 
+def test_negative_content_length_returns_413_and_encode_fn_not_called():
+    """POST /embed with a NEGATIVE Content-Length must return 413 without calling encode_fn.
+
+    Regression guard for a real DoS: int("-1") = -1, and `-1 > MAX_BODY` is False,
+    so the old guard skipped the size check and reached rfile.read(-1), which reads
+    until socket close (unbounded). The hardened guard rejects length < 0.
+    """
+    encode_calls = []
+
+    def spy_encode(text):
+        encode_calls.append(text)
+        return [0.1] * 768
+
+    body = json.dumps({"text": "hello"}).encode("utf-8")
+
+    # Content-Length: -1 — the malicious header.
+    status, data = _call_do_post_and_parse(spy_encode, "/embed", -1, body)
+
+    assert status == 413, f"Expected 413 for negative Content-Length, got {status}"
+    assert "error" in data, f"Response body should contain 'error' key, got {data!r}"
+    assert len(encode_calls) == 0, (
+        f"encode_fn must NOT be called on negative Content-Length; "
+        f"was called {len(encode_calls)} time(s)"
+    )
+
+
 def test_exact_max_body_is_not_rejected():
     """A request with Content-Length == MAX_BODY must NOT return 413."""
     body = json.dumps({"text": "hello"}).encode("utf-8")
