@@ -35,6 +35,7 @@ IDLE_TIMEOUT_S = float(os.environ.get("OPEN_BRAIN_EMBED_IDLE_S", "1800"))
 TORCH_THREADS = int(os.environ.get("OPEN_BRAIN_EMBED_THREADS", "8"))
 WATCHDOG_POLL_S = 30.0
 MAX_TEXT = 8000  # mirrors open_brain._generate_embedding truncation
+MAX_BODY = 65536  # maximum accepted Content-Length in bytes; prevents unbounded reads
 
 
 def make_handler(encode_fn, model_name, started_at, state):
@@ -71,13 +72,18 @@ def make_handler(encode_fn, model_name, started_at, state):
                 return self._json(404, {"error": "not found"})
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length > MAX_BODY:
+                    return self._json(413, {"error": "request too large"})
                 body = json.loads(self.rfile.read(length) or b"{}")
             except (ValueError, json.JSONDecodeError):
                 return self._json(400, {"error": "invalid JSON or Content-Length"})
             text = body.get("text")
             if not isinstance(text, str) or not text.strip():
                 return self._json(400, {"error": "missing or empty 'text'"})
-            vec = encode_fn(text[:MAX_TEXT])
+            try:
+                vec = encode_fn(text[:MAX_TEXT])
+            except Exception:
+                return self._json(500, {"error": "embedding failed"})
             self._json(200, {"embedding": vec, "dim": len(vec)})
 
     return Handler

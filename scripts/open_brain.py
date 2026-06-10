@@ -515,19 +515,65 @@ def _extract_metadata(text: str) -> dict:
 # ─── PostgreSQL Connection ───────────────────────────────────────────────────
 
 def _get_database_url() -> str:
-    """Get PostgreSQL connection string from env or config."""
+    """Get PostgreSQL connection string with priority: env → Keychain → config file.
+
+    Resolution order:
+      (a) DATABASE_URL environment variable — highest priority, never overridden.
+      (b) macOS Keychain via ``security find-generic-password``.  The service name
+          is read from OPEN_BRAIN_DB_KEYCHAIN_SERVICE (default:
+          "optivai-neon-database-url") and the account from $USER.  Any subprocess
+          error or empty result is treated as a miss and falls through to (c).
+      (c) ~/.claude/hooks/auto-logger-config.json ``postgresql.connection_string``
+          — last resort; emits a deprecation WARNING to stderr so the operator
+          knows to migrate.
+    """
+    import subprocess
+
+    # (a) Env var — highest priority.
     url = os.environ.get("DATABASE_URL")
     if url:
         return url
+
+    # (b) macOS Keychain.
+    service = os.environ.get("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", "optivai-neon-database-url")
+    account = os.environ.get("USER") or os.environ.get("USERNAME") or os.environ.get("LOGNAME") or ""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", account, "-s", service, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            keychain_url = result.stdout.strip()
+            if keychain_url:
+                return keychain_url
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # security binary absent (non-macOS) or timed out — fall through.
+        pass
+
+    # (c) Config file — deprecated fallback.
     config_path = Path.home() / ".claude" / "hooks" / "auto-logger-config.json"
     if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        pg = config.get("destinations", {}).get("postgresql", {})
-        if pg.get("connection_string"):
-            return pg["connection_string"]
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            pg = config.get("destinations", {}).get("postgresql", {})
+            conn_str = pg.get("connection_string", "")
+            if conn_str:
+                print(
+                    "WARNING: auto-logger-config.json credential is deprecated; "
+                    "migrate to Keychain or DATABASE_URL env",
+                    file=sys.stderr,
+                )
+                return conn_str
+        except (json.JSONDecodeError, OSError):
+            pass
+
     raise RuntimeError(
-        "No DATABASE_URL env var and no postgresql.connection_string in auto-logger-config.json"
+        "No DATABASE_URL env var, no Keychain entry for service "
+        f"'{service}' (override via OPEN_BRAIN_DB_KEYCHAIN_SERVICE), "
+        "and no postgresql.connection_string in auto-logger-config.json"
     )
 
 
