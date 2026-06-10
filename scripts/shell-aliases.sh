@@ -2,7 +2,7 @@
 #
 # Install (one-time per shell config):
 #
-#   echo 'source $HOME/Documents/optivai-claude-plugin/scripts/shell-aliases.sh' >> ~/.zshrc
+#   echo 'source $HOME/dev/optivai-claude-plugin/scripts/shell-aliases.sh' >> ~/.zshrc
 #
 # Or copy the function bodies below into ~/.zshrc / ~/.bashrc directly.
 #

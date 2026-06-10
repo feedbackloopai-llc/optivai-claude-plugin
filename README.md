@@ -24,7 +24,7 @@ This plugin extends Claude Code with:
 ## Installation
 
 ```bash
-cd ~/Documents/optivai-claude-plugin
+cd ~/dev/optivai-claude-plugin
 bash scripts/install.sh
 ```
 
@@ -334,7 +334,7 @@ Hooks (PreToolUse, UserPromptSubmit, Stop)
 ## Updating
 
 ```bash
-cd ~/Documents/optivai-claude-plugin
+cd ~/dev/optivai-claude-plugin
 git pull
 bash scripts/install.sh
 ```
