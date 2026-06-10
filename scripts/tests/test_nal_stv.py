@@ -116,6 +116,33 @@ class TestNalRevise:
             f"dist to high={dist_high:.4f}, dist to low={dist_low:.4f}"
         )
 
+    def test_confidence_strictly_monotonic(self):
+        """(v) FOLD-IN: revision confidence is STRICTLY > max(c1, c2).
+
+        Evidence pooling can only increase confidence — the revised c must
+        exceed BOTH input confidences for any c1, c2 in (0.01, 0.99). This is
+        the formal monotonicity property: w_total = w1 + w2 > max(w1, w2),
+        and c = w_total/(w_total+1) is monotonic in w_total.
+        """
+        # Sweep a grid across the open interval (0.01, 0.99).
+        grid = [0.02, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.98]
+        freqs = [0.0, 0.3, 0.5, 0.7, 1.0]
+        for c1 in grid:
+            for c2 in grid:
+                for f1 in freqs:
+                    for f2 in freqs:
+                        _, c_out = open_brain.nal_revise(f1, c1, f2, c2)
+                        assert c_out > max(c1, c2) - 1e-9, (
+                            f"Revised c ({c_out:.6f}) must be strictly > "
+                            f"max(c1={c1}, c2={c2})={max(c1, c2)}"
+                        )
+                        # Stronger: strictly greater (not merely >=) for
+                        # in-range inputs where the second weight is positive.
+                        assert c_out > max(c1, c2), (
+                            f"Revised c ({c_out:.6f}) must STRICTLY exceed "
+                            f"max(c1={c1}, c2={c2})"
+                        )
+
     def test_confidence_map(self):
         """_stv_from_confidence maps labels to correct (f, c) pairs."""
         assert open_brain._stv_from_confidence("high")   == (1.0, 0.9)
@@ -583,6 +610,12 @@ class TestReviseThoughts:
         assert id_a in targets, f"derives_from link to {id_a} missing"
         assert id_b in targets, f"derives_from link to {id_b} missing"
 
+        # FOLD-IN (review): result now reports which links actually committed.
+        assert result.get("derives_from_created") == [True, True], (
+            f"Both derives_from links should report created=True; "
+            f"got {result.get('derives_from_created')}"
+        )
+
     @pytest.mark.integration
     def test_revise_resolves_when_contradicts_exists(self, conn, test_user):
         """When a contradicts link exists between A and B, resolves links are added."""
@@ -694,9 +727,32 @@ class TestEvidencePropagation:
 
     @pytest.mark.integration
     def test_verifies_creates_thought_versions_row(self, conn, test_user):
-        """verifies link creates a thought_versions row with prov_activity='nal_evidence'."""
+        """verifies link creates a thought_versions row with prov_activity='nal_evidence'
+        AND the snapshot captures the PRE-revision stv (proving the RB-order
+        invariant: snapshot precedes the live UPDATE).
+
+        HIGH-2 (review fix): the original test only asserted a version row with
+        the right prov_activity exists — it would PASS even if the snapshot were
+        taken AFTER the update (wrong order). Here we read the target's stv
+        BEFORE add_link, then assert the newest version row's stv equals that
+        PRE-update value and is STRICTLY DIFFERENT from the post-update live
+        value. That is only possible if the snapshot ran before the UPDATE.
+        """
         source = _plant_thought(conn, test_user, text="verifier source", stv_f=1.0, stv_c=0.9)
         target = _plant_thought(conn, test_user, text="target for versioning", stv_f=1.0, stv_c=0.5)
+
+        # Read the target's PRE-revision stv.
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT stv_frequency, stv_confidence FROM brain.thoughts "
+                "WHERE thought_id = %s",
+                (target,),
+            )
+            pre_f, pre_c = cur.fetchone()
+            pre_f, pre_c = float(pre_f), float(pre_c)
+        finally:
+            cur.close()
 
         open_brain.add_link(
             conn,
@@ -706,11 +762,13 @@ class TestEvidencePropagation:
             user_id=test_user,
         )
 
+        # Read the newest version row (the snapshot taken during add_link).
         cur = conn.cursor()
         try:
             cur.execute(
                 """
-                SELECT prov_activity, stv_confidence FROM brain.thought_versions
+                SELECT prov_activity, stv_frequency, stv_confidence
+                FROM brain.thought_versions
                 WHERE thought_id = %s
                 ORDER BY revision DESC
                 LIMIT 1
@@ -718,12 +776,42 @@ class TestEvidencePropagation:
                 (target,),
             )
             row = cur.fetchone()
+            # Read the post-update LIVE stv.
+            cur.execute(
+                "SELECT stv_frequency, stv_confidence FROM brain.thoughts "
+                "WHERE thought_id = %s",
+                (target,),
+            )
+            post_f, post_c = cur.fetchone()
+            post_f, post_c = float(post_f), float(post_c)
         finally:
             cur.close()
 
         assert row is not None, "thought_versions row should exist after verifies link"
         assert row[0] == "nal_evidence", (
             f"Expected prov_activity='nal_evidence', got {row[0]!r}"
+        )
+        snap_f, snap_c = float(row[1]), float(row[2])
+
+        # The snapshot must equal the PRE-revision stv (RB-order: snapshot first).
+        assert abs(snap_c - pre_c) < 1e-6, (
+            f"Snapshot stv_confidence ({snap_c}) should equal PRE-revision value "
+            f"({pre_c}), proving snapshot ran BEFORE the update. "
+            f"If it equals the post-update value ({post_c}), the order is wrong."
+        )
+        assert abs(snap_f - pre_f) < 1e-6, (
+            f"Snapshot stv_frequency ({snap_f}) should equal PRE-revision value ({pre_f})"
+        )
+        # And the live value must have actually changed (the revision happened).
+        assert abs(post_c - pre_c) > 1e-6, (
+            f"Live stv_confidence should have changed from {pre_c} to {post_c} "
+            f"(the verifies evidence was applied)"
+        )
+        # Therefore the snapshot is distinct from the post-update live value —
+        # the decisive proof that snapshot preceded update.
+        assert abs(snap_c - post_c) > 1e-6, (
+            f"Snapshot ({snap_c}) must differ from post-update live ({post_c}); "
+            f"equal values would mean the snapshot was taken AFTER the update."
         )
 
     @pytest.mark.integration
@@ -762,6 +850,104 @@ class TestEvidencePropagation:
 
         assert post_f < pre_f, (
             f"refutes link should drop target frequency: {pre_f:.4f} → {post_f:.4f}"
+        )
+
+    @pytest.mark.integration
+    def test_refuted_belief_zero_frequency_not_aliased(self, conn, test_user):
+        """CRIT-1: a target with stv_frequency=0.0 (fully-refuted) receiving a
+        refutes link revises FROM f=0.0, not from the aliased default f=1.0.
+
+        With the buggy `float(x or 1.0)` idiom, a stored 0.0 frequency reads back
+        as 1.0, so a second refutes would revise from 1.0 → ~0.55 instead of the
+        correct 0.0 → ~0.01. We plant a target at f=0.0, c=0.8 (already heavily
+        refuted), add a refutes link, and assert the propagated frequency stays
+        near 0.0 (well below 0.1), NOT ~0.55.
+        """
+        source = _plant_thought(conn, test_user, text="re-refuting source",
+                                stv_f=1.0, stv_c=0.8)
+        # Target is already fully refuted: f=0.0 is a VALID, meaningful value.
+        target = _plant_thought(conn, test_user, text="already refuted target",
+                                stv_f=0.0, stv_c=0.8)
+
+        # Sanity: the planted f really is 0.0 in the DB.
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT stv_frequency FROM brain.thoughts WHERE thought_id = %s",
+                (target,),
+            )
+            planted_f = float(cur.fetchone()[0])
+        finally:
+            cur.close()
+        assert planted_f == 0.0, f"Planted frequency should be 0.0, got {planted_f}"
+
+        open_brain.add_link(
+            conn, source_id=source, target_id=target,
+            link_type="refutes", user_id=test_user,
+        )
+
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT stv_frequency FROM brain.thoughts WHERE thought_id = %s",
+                (target,),
+            )
+            post_f = float(cur.fetchone()[0])
+        finally:
+            cur.close()
+
+        # Correct behavior: revising f=0.0 with refutes evidence (f=0.0) keeps
+        # f near 0.01 (clamp floor). The buggy aliasing would have produced ~0.55.
+        assert post_f < 0.1, (
+            f"Refuting an already-refuted (f=0.0) belief must keep f near 0.0; "
+            f"got {post_f:.4f}. A value near 0.55 means 0.0 was aliased to the "
+            f"default 1.0 (CRIT-1 zero-aliasing bug)."
+        )
+
+    @pytest.mark.integration
+    def test_revise_zero_frequency_premise_not_aliased(self, conn, test_user):
+        """CRIT-1: --revise over a premise with stv_frequency=0.0 revises from
+        f=0.0, not the aliased default 1.0.
+
+        We compute the expected fused f directly via nal_revise on the true
+        stored values and assert the derived atom matches — which is only
+        possible if the 0.0 was read as 0.0, not aliased to 1.0.
+        """
+        # Premise A: fully refuted (f=0.0), high confidence.
+        id_a = _plant_thought(conn, test_user, text="refuted premise A",
+                              stv_f=0.0, stv_c=0.9)
+        # Premise B: positive, lower confidence.
+        id_b = _plant_thought(conn, test_user, text="positive premise B",
+                              stv_f=1.0, stv_c=0.5)
+
+        # Expected fused stv using the TRUE values (0.0 for A's frequency).
+        expected_f, expected_c = open_brain.nal_revise(0.0, 0.9, 1.0, 0.5)
+        # The aliased-bug value would be nal_revise(1.0, 0.9, 1.0, 0.5) → f=1.0.
+        aliased_f, _ = open_brain.nal_revise(1.0, 0.9, 1.0, 0.5)
+
+        result = open_brain.revise_thoughts(
+            conn, id_a=id_a, id_b=id_b, user_id=test_user,
+        )
+        derived_id = result["thought_id"]
+
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT stv_frequency FROM brain.thoughts WHERE thought_id = %s",
+                (derived_id,),
+            )
+            actual_f = float(cur.fetchone()[0])
+        finally:
+            cur.close()
+
+        assert abs(actual_f - expected_f) < 1e-4, (
+            f"Derived f should be {expected_f:.4f} (computed from the true 0.0 "
+            f"frequency), got {actual_f:.4f}."
+        )
+        # Decisive: the actual value must NOT match the aliased-bug value.
+        assert abs(actual_f - aliased_f) > 1e-3, (
+            f"Derived f ({actual_f:.4f}) matches the zero-aliasing-bug value "
+            f"({aliased_f:.4f}) — 0.0 was silently replaced with the default 1.0."
         )
 
     @pytest.mark.integration

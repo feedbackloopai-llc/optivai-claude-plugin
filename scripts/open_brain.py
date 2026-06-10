@@ -3015,6 +3015,112 @@ def _extract_keywords(query: str, max_keywords: int = 5) -> List[str]:
     return keywords
 
 
+def _annotate_provenance(
+    conn,
+    results: List[Dict[str, Any]],
+    user_id: str,
+    sort_by: str = "similarity",
+) -> None:
+    """Apply atom_links provenance annotations to a result set IN PLACE.
+
+    Factored out of search() (fblai-lk4gt) so graph_search() applies the SAME
+    supersedes-suppression + disputed-annotation pass (HIGH-4: previously
+    graph-discovered atoms never got SUPERSEDED_BY/DISPUTED, making the
+    annotation handling in _format_graph_search_results dead code for them).
+
+    For each candidate (keyed on uppercased ``THOUGHT_ID``):
+      - SUPERSEDED_BY: target of a live ``supersedes`` link → list of source
+        ids; the result's HYBRID_SCORE is multiplied by the penalty factor.
+      - DISPUTED: target of a live ``refutes``/``contradicts`` link → annotated
+        with ``{by: [...], types: [...]}``; NO score change.
+
+    Design invariants (identical to the original search() block):
+      - BATCH: one SQL round-trip, not N per-result queries.
+      - USER-SCOPED: superseding source must belong to the SAME user_id (both
+        via atom_links.user_id AND via EXISTS on brain.thoughts).
+      - LIVE-SOURCE GUARD: a supersedes link whose source was forgotten does
+        NOT suppress (EXISTS sub-select enforces this).
+      - PENALTY: OPEN_BRAIN_SUPERSEDE_PENALTY env var, default 0.5, clamp [0,1].
+
+    Annotation failures never raise — provenance annotation is a scoring assist,
+    not a correctness invariant; on error the result set is returned unchanged.
+    """
+    if not results:
+        return
+    candidate_tids = [r.get("THOUGHT_ID") for r in results if r.get("THOUGHT_ID")]
+    if not candidate_tids:
+        return
+
+    _supersede_penalty = max(0.0, min(1.0, float(
+        os.environ.get("OPEN_BRAIN_SUPERSEDE_PENALTY", "0.5")
+    )))
+    try:
+        _links_cur = conn.cursor()
+        try:
+            _tid_placeholders = ",".join(["%s"] * len(candidate_tids))
+            # Single query: fetch all inbound supersedes + dispute links for the
+            # candidate set.  The EXISTS guard ensures only LIVE sources suppress.
+            _links_cur.execute(
+                f"""
+                SELECT al.target_id,
+                       al.source_id,
+                       al.link_type
+                  FROM brain.atom_links al
+                 WHERE al.target_id IN ({_tid_placeholders})
+                   AND al.user_id = %s
+                   AND al.link_type IN ('supersedes', 'refutes', 'contradicts')
+                   AND EXISTS (
+                       SELECT 1 FROM brain.thoughts t
+                        WHERE t.thought_id = al.source_id
+                          AND t.user_id = %s
+                   )
+                """,
+                candidate_tids + [user_id, user_id],
+            )
+            _link_rows = _links_cur.fetchall()
+        finally:
+            _links_cur.close()
+
+        _superseded_by_map: Dict[str, List[str]] = {}
+        _disputed_map: Dict[str, Dict[str, Any]] = {}
+        for _target_id, _source_id, _ltype in _link_rows:
+            if _ltype == "supersedes":
+                _superseded_by_map.setdefault(_target_id, []).append(_source_id)
+            else:  # refutes or contradicts
+                _entry = _disputed_map.setdefault(
+                    _target_id, {"by": [], "types": []}
+                )
+                _entry["by"].append(_source_id)
+                _entry["types"].append(_ltype)
+
+        _any_penalty = False
+        for r in results:
+            tid = r.get("THOUGHT_ID")
+            if tid in _superseded_by_map:
+                r["SUPERSEDED_BY"] = _superseded_by_map[tid]
+                old_score = float(r.get("HYBRID_SCORE", 0.0) or 0.0)
+                r["HYBRID_SCORE"] = round(old_score * _supersede_penalty, 4)
+                _any_penalty = True
+            if tid in _disputed_map:
+                r["DISPUTED"] = _disputed_map[tid]
+
+        # Re-sort after applying penalties (respects sort_by preference).
+        if _any_penalty and sort_by != "time":
+            results.sort(
+                key=lambda x: float(x.get("HYBRID_SCORE", 0.0) or 0.0),
+                reverse=True,
+            )
+    except Exception as _link_exc:
+        logger.warning(
+            f"atom_links provenance annotation failed ({_link_exc}); "
+            "results returned without suppression/dispute markers."
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def search(
     conn,
     query: str,
@@ -3146,8 +3252,13 @@ def search(
             d["keyword_boost"] = round(float(d.get("keyword_boost", 0)), 4)
             d["time_decay"] = round(float(d.get("time_decay", 0)), 4)
             # NAL stv: extract before uppercasing, normalize to STV dict.
-            _stv_f = float(d.pop("stv_frequency", 1.0) or 1.0)
-            _stv_c = float(d.pop("stv_confidence", 0.5) or 0.5)
+            # Use `if x is not None` (NOT `x or default`) — 0.0 is a VALID stv
+            # value (frequency=0.0 = fully-refuted; confidence=0.0 = no evidence)
+            # and `0.0 or default` would silently alias it to the default.
+            _raw_stv_f = d.pop("stv_frequency", None)
+            _raw_stv_c = d.pop("stv_confidence", None)
+            _stv_f = float(_raw_stv_f if _raw_stv_f is not None else 1.0)
+            _stv_c = float(_raw_stv_c if _raw_stv_c is not None else 0.5)
             d["stv"] = {"f": round(_stv_f, 4), "c": round(_stv_c, 4)}
             d["low_confidence"] = _stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
             # Remove intermediate columns not needed in output
@@ -3213,102 +3324,10 @@ def search(
                 )
 
     # ── atom_links provenance annotation (fblai-lk4gt) ───────────────────────
-    #
-    # SUPERSEDES SUPPRESSION + DISPUTED ANNOTATION
-    #
-    # After the Hebbian re-sort, do ONE batch query against brain.atom_links to
-    # find inbound supersedes / refutes / contradicts edges for the candidate
-    # set.  Results are annotated in-place; superseded atoms get a score
-    # penalty and the list is re-sorted so they sink.
-    #
-    # Design invariants:
-    #   - BATCH: one SQL round-trip, not N per-result queries.
-    #   - USER-SCOPED: the superseding source must belong to the SAME user_id
-    #     (both via user_id on atom_links AND via EXISTS on brain.thoughts).
-    #   - LIVE-SOURCE GUARD: a supersedes link whose source was subsequently
-    #     forgotten does NOT suppress (test case (b)); the EXISTS sub-select
-    #     enforces this.
-    #   - DISPUTED: refutes/contradicts links annotate only — no score change.
-    #   - PENALTY: configurable via OPEN_BRAIN_SUPERSEDE_PENALTY env var,
-    #     default 0.5, clamped to [0, 1].
-    if results:
-        candidate_tids = [r.get("THOUGHT_ID") for r in results if r.get("THOUGHT_ID")]
-        if candidate_tids:
-            _supersede_penalty = max(0.0, min(1.0, float(
-                os.environ.get("OPEN_BRAIN_SUPERSEDE_PENALTY", "0.5")
-            )))
-            try:
-                _links_cur = conn.cursor()
-                try:
-                    _tid_placeholders = ",".join(["%s"] * len(candidate_tids))
-                    # Single query: fetch all inbound supersedes + dispute links
-                    # for the candidate set.  The EXISTS guard on brain.thoughts
-                    # ensures only LIVE (non-forgotten) sources suppress.
-                    _links_cur.execute(
-                        f"""
-                        SELECT al.target_id,
-                               al.source_id,
-                               al.link_type
-                          FROM brain.atom_links al
-                         WHERE al.target_id IN ({_tid_placeholders})
-                           AND al.user_id = %s
-                           AND al.link_type IN ('supersedes', 'refutes', 'contradicts')
-                           AND EXISTS (
-                               SELECT 1 FROM brain.thoughts t
-                                WHERE t.thought_id = al.source_id
-                                  AND t.user_id = %s
-                           )
-                        """,
-                        candidate_tids + [user_id, user_id],
-                    )
-                    _link_rows = _links_cur.fetchall()
-                finally:
-                    _links_cur.close()
-
-                # Build annotation maps keyed by target_id.
-                # superseded_by_map: target_id -> [source_ids]
-                # disputed_map: target_id -> {by: [src_ids], types: [link_types]}
-                _superseded_by_map: Dict[str, List[str]] = {}
-                _disputed_map: Dict[str, Dict[str, Any]] = {}
-
-                for _target_id, _source_id, _ltype in _link_rows:
-                    if _ltype == "supersedes":
-                        _superseded_by_map.setdefault(_target_id, []).append(_source_id)
-                    else:  # refutes or contradicts
-                        _entry = _disputed_map.setdefault(
-                            _target_id, {"by": [], "types": []}
-                        )
-                        _entry["by"].append(_source_id)
-                        _entry["types"].append(_ltype)
-
-                # Annotate results and apply penalties.
-                _any_penalty = False
-                for r in results:
-                    tid = r.get("THOUGHT_ID")
-                    if tid in _superseded_by_map:
-                        r["SUPERSEDED_BY"] = _superseded_by_map[tid]
-                        old_score = float(r.get("HYBRID_SCORE", 0.0) or 0.0)
-                        r["HYBRID_SCORE"] = round(old_score * _supersede_penalty, 4)
-                        _any_penalty = True
-                    if tid in _disputed_map:
-                        r["DISPUTED"] = _disputed_map[tid]
-
-                # Re-sort after applying penalties (respects sort_by preference).
-                if _any_penalty and sort_by != "time":
-                    results.sort(
-                        key=lambda x: float(x.get("HYBRID_SCORE", 0.0) or 0.0),
-                        reverse=True,
-                    )
-            except Exception as _link_exc:
-                # atom_links annotation is a scoring assist — never block search.
-                logger.warning(
-                    f"atom_links provenance annotation failed ({_link_exc}); "
-                    "results returned without suppression/dispute markers."
-                )
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+    # SUPERSEDES SUPPRESSION + DISPUTED ANNOTATION — factored into
+    # _annotate_provenance() so graph_search() applies the identical pass
+    # (HIGH-4 review fix).
+    _annotate_provenance(conn, results, user_id, sort_by)
 
     # ── Memory reinforcement: touch updated_at on accessed thoughts ──
     # This resets the time_decay clock, making frequently-accessed memories
@@ -3621,9 +3640,12 @@ def graph_search(
                 d["graph_depth"] = depth
                 d["graph_source"] = True
 
-                # NAL stv: normalize before uppercasing.
-                _g_stv_f = float(d.pop("stv_frequency", 1.0) or 1.0)
-                _g_stv_c = float(d.pop("stv_confidence", 0.5) or 0.5)
+                # NAL stv: normalize before uppercasing. Use `if x is not None`
+                # (NOT `x or default`) — 0.0 is a VALID stv value.
+                _raw_g_stv_f = d.pop("stv_frequency", None)
+                _raw_g_stv_c = d.pop("stv_confidence", None)
+                _g_stv_f = float(_raw_g_stv_f if _raw_g_stv_f is not None else 1.0)
+                _g_stv_c = float(_raw_g_stv_c if _raw_g_stv_c is not None else 0.5)
                 d["stv"] = {"f": round(_g_stv_f, 4), "c": round(_g_stv_c, 4)}
                 d["low_confidence"] = _g_stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
 
@@ -3631,6 +3653,14 @@ def graph_search(
                 graph_results.append(d)
 
         cur.close()
+
+        # HIGH-4 (review fix): apply the SAME atom_links provenance annotation
+        # (supersedes-suppression + disputed) to GRAPH-ONLY results. Seed
+        # results were already annotated inside search(); annotating them again
+        # here would double-apply the supersede penalty. So we annotate only the
+        # graph-discovered set, then merge. After this call graph_results carry
+        # SUPERSEDED_BY/DISPUTED exactly like seeds do.
+        _annotate_provenance(conn, graph_results, user_id, sort_by)
 
         # Step 4: Merge seed results with graph-discovered results
         # Seeds that also appear in the graph get a proximity boost
@@ -4125,9 +4155,13 @@ def add_link(
                 _ev_cur.close()
 
             if _src_row is not None and _tgt_row is not None:
-                _src_c = float(_src_row[0] or 0.5)
-                _tgt_f = float(_tgt_row[0] or 1.0)
-                _tgt_c = float(_tgt_row[1] or 0.5)
+                # CRIT-1: 0.0 is a VALID stv value (a fully-refuted belief has
+                # stv_frequency=0.0). `float(0.0 or 1.0)` would silently alias
+                # it to 1.0, propagating evidence from the WRONG frequency.
+                # Use `if x is not None` for every stv read.
+                _src_c = float(_src_row[0] if _src_row[0] is not None else 0.5)
+                _tgt_f = float(_tgt_row[0] if _tgt_row[0] is not None else 1.0)
+                _tgt_c = float(_tgt_row[1] if _tgt_row[1] is not None else 0.5)
 
                 # Build evidence stv with 0.9 attenuation on source confidence.
                 _ev_c = min(0.99, _src_c * 0.9)
@@ -4328,10 +4362,12 @@ def revise_thoughts(
 
     row_a = rows_map[id_a]
     row_b = rows_map[id_b]
-    f_a = float(row_a[1] or 1.0)
-    c_a = float(row_a[2] or 0.5)
-    f_b = float(row_b[1] or 1.0)
-    c_b = float(row_b[2] or 0.5)
+    # CRIT-1: 0.0 is a VALID stv value — use `if x is not None` (NOT `x or default`)
+    # so a refuted premise (stv_frequency=0.0) revises from f=0.0, not f=1.0.
+    f_a = float(row_a[1] if row_a[1] is not None else 1.0)
+    c_a = float(row_a[2] if row_a[2] is not None else 0.5)
+    f_b = float(row_b[1] if row_b[1] is not None else 1.0)
+    c_b = float(row_b[2] if row_b[2] is not None else 0.5)
 
     # Revised stv
     rev_f, rev_c = nal_revise(f_a, c_a, f_b, c_b)
@@ -4362,6 +4398,9 @@ def revise_thoughts(
     derived_id = result["thought_id"]
 
     # Wire derives_from links to BOTH premises.
+    # FOLD-IN (review): track which links actually committed and log failures
+    # to stderr — don't silently swallow + then claim both were created.
+    derives_from_created: List[bool] = []
     for premise_id in (id_a, id_b):
         try:
             add_link(
@@ -4372,8 +4411,13 @@ def revise_thoughts(
                 user_id=user_id,
                 via="nal_revision",
             )
-        except Exception:
-            pass  # best-effort; capture succeeded
+            derives_from_created.append(True)
+        except Exception as _link_exc:
+            derives_from_created.append(False)
+            sys.stderr.write(
+                f"revise_thoughts: derives_from link failed "
+                f"({derived_id}→{premise_id}): {_link_exc}\n"
+            )
 
     # If a 'contradicts' link exists between A and B (either direction),
     # add 'resolves' links from derived atom to both premises.
@@ -4396,6 +4440,7 @@ def revise_thoughts(
     finally:
         _check_cur.close()
 
+    resolves_created: List[bool] = []
     if has_contradicts:
         for premise_id in (id_a, id_b):
             try:
@@ -4407,11 +4452,19 @@ def revise_thoughts(
                     user_id=user_id,
                     via="nal_revision",
                 )
-            except Exception:
-                pass  # best-effort
+                resolves_created.append(True)
+            except Exception as _link_exc:
+                resolves_created.append(False)
+                sys.stderr.write(
+                    f"revise_thoughts: resolves link failed "
+                    f"({derived_id}→{premise_id}): {_link_exc}\n"
+                )
 
     result["derives_from"] = [id_a, id_b]
+    result["derives_from_created"] = derives_from_created
     result["contradicts_resolved"] = has_contradicts
+    if has_contradicts:
+        result["resolves_created"] = resolves_created
     return result
 
 

@@ -719,6 +719,65 @@ class TestGraphSearchUnion:
             f"in graph_search via atom_links incoming walk; got: {graph_ids}"
         )
 
+    def test_graph_discovered_superseded_atom_carries_annotation(self, conn, test_user):
+        """HIGH-4 (review fix): an atom surfaced ONLY via graph_search's
+        atom_links union, that is also superseded by another atom, MUST carry
+        SUPERSEDED_BY.
+
+        Before the fix, the supersedes/disputed annotation pass ran only inside
+        search(), so graph-discovered atoms never got SUPERSEDED_BY/DISPUTED —
+        making _format_graph_search_results' annotation handling dead code for
+        them and hiding supersession from graph_search callers.
+
+        Setup:
+          - seed (has embedding) → appears in vector search.
+          - graph_only (NO embedding) → invisible to vector search, reachable
+            only via an atom_link from seed.
+          - superseder (has embedding) → supersedes graph_only.
+        Assert graph_only appears in graph_search results AND carries
+        SUPERSEDED_BY = [superseder].
+        """
+        seed_text = "quantum entanglement bell inequality nonlocal correlation baseline"
+        seed_id = _insert_thought_with_embedding(conn, test_user, seed_text)
+
+        # The atom we only reach via the graph (no embedding).
+        graph_only_text = "entanglement swapping protocol referenced but no embedding"
+        graph_only_id = _insert_thought_no_embedding(conn, test_user, graph_only_text)
+
+        # The superseding atom (has embedding; identity doesn't matter for the link).
+        superseder_text = "updated entanglement swapping protocol 2026 revision"
+        superseder_id = _insert_thought_with_embedding(conn, test_user, superseder_text)
+
+        # seed cites graph_only → makes graph_only reachable via atom_links.
+        open_brain.add_link(
+            conn, source_id=seed_id, target_id=graph_only_id,
+            link_type="cites", user_id=test_user, verify_source_exists=True,
+        )
+        # superseder supersedes graph_only.
+        open_brain.add_link(
+            conn, source_id=superseder_id, target_id=graph_only_id,
+            link_type="supersedes", user_id=test_user, verify_source_exists=True,
+        )
+
+        graph_results = open_brain.graph_search(
+            conn, "quantum entanglement bell inequality nonlocal", test_user,
+            limit=50, threshold=0.0,
+        )
+        by_id = {r["THOUGHT_ID"]: r for r in graph_results}
+        assert graph_only_id in by_id, (
+            f"Graph-only atom {graph_only_id} must appear in graph_search; "
+            f"got: {list(by_id.keys())}"
+        )
+        annotated = by_id[graph_only_id]
+        assert "SUPERSEDED_BY" in annotated, (
+            f"Graph-discovered superseded atom must carry SUPERSEDED_BY "
+            f"(HIGH-4). Keys present: {sorted(annotated.keys())}"
+        )
+        assert superseder_id in annotated["SUPERSEDED_BY"], (
+            f"SUPERSEDED_BY should list {superseder_id}; "
+            f"got {annotated['SUPERSEDED_BY']}"
+        )
+
 
 class TestFormattedOutputMarkers:
     """(f) _format_search_results contains SUPERSEDED_BY / DISPUTED text."""
