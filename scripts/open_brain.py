@@ -326,12 +326,21 @@ OPENAI_MODEL = "gpt-4o-mini"
 
 
 def _extract_metadata_via_claude(text: str) -> dict:
-    """Extract structured metadata using Claude API (primary)."""
+    """Extract structured metadata using Claude API (primary).
+
+    ``text`` MUST already be redacted before this is called.  The caller
+    (``_extract_metadata`` / ``capture``) is responsible for applying
+    ``redact_pii`` before dispatch.  This function trusts its input.
+    """
     try:
         import anthropic
         client = anthropic.Anthropic()
         safe_text = text[:4000]
-        prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=safe_text)
+        # Brace-escape the interpolated text so str.format() cannot
+        # misinterpret user content as format placeholders.  We escape
+        # BEFORE the slice so the slice length is consistent.
+        escaped_text = safe_text.replace("{", "{{").replace("}", "}}")
+        prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=escaped_text)
         response = client.messages.create(
             model=LLM_MODEL,
             max_tokens=256,
@@ -411,13 +420,19 @@ def _ensure_ollama_ready() -> bool:
 
 
 def _extract_metadata_via_ollama(text: str) -> dict:
-    """Extract structured metadata using local Ollama (fallback 1)."""
+    """Extract structured metadata using local Ollama (fallback 1).
+
+    ``text`` MUST already be redacted before this is called.  See
+    ``_extract_metadata_via_claude`` for the contract.
+    """
     try:
         if not _ensure_ollama_ready():
             return None
         import urllib.request
         safe_text = text[:4000]
-        prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=safe_text)
+        # Brace-escape to prevent KeyError / silent prompt-injection seam.
+        escaped_text = safe_text.replace("{", "{{").replace("}", "}}")
+        prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=escaped_text)
         payload = json.dumps({
             "model": OLLAMA_MODEL,
             "prompt": prompt,
@@ -440,14 +455,20 @@ def _extract_metadata_via_ollama(text: str) -> dict:
 
 
 def _extract_metadata_via_openai(text: str) -> dict:
-    """Extract structured metadata using OpenAI API (fallback 2)."""
+    """Extract structured metadata using OpenAI API (fallback 2).
+
+    ``text`` MUST already be redacted before this is called.  See
+    ``_extract_metadata_via_claude`` for the contract.
+    """
     try:
         import urllib.request
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             return None
         safe_text = text[:4000]
-        prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=safe_text)
+        # Brace-escape to prevent KeyError / silent prompt-injection seam.
+        escaped_text = safe_text.replace("{", "{{").replace("}", "}}")
+        prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=escaped_text)
         payload = json.dumps({
             "model": OPENAI_MODEL,
             "messages": [{"role": "user", "content": prompt}],
@@ -1917,16 +1938,55 @@ def capture(
                     f"(or wrong user scope): {was_derived_from} (user={user_id})"
                 )
 
-        # Step 1: Extract metadata via Claude API
-        metadata = _extract_metadata(text)
+        # ── fblai-y0zsb: Front-door redaction ────────────────────────────────
+        # Redact PII/secrets BEFORE any text reaches an external LLM or the DB.
+        #
+        # OPEN_BRAIN_STORE_RAW=true  →  escape hatch: store raw text in the DB
+        #   but STILL send only the redacted text to LLMs.  The atom is stamped
+        #   metadata['stored_raw']=True so consumers know it was stored raw.
+        #   A boot-WARN is emitted to stderr whenever the escape hatch is active.
+        #
+        # Default (env var absent or any value other than "true"):
+        #   both the DB raw_text column and all LLM calls receive the redacted
+        #   text.  No PII/secrets can leak to Neon or Anthropic/OpenAI/Ollama.
+        #
+        # Embedding note: the embedding is generated from the SAME text that is
+        #   stored (redacted in the default path, raw when escape hatch is on),
+        #   so the searchable vector representation always matches what is stored.
+        #   Trade-off: in the default path, token-level embeddings are computed on
+        #   the redacted text, meaning semantic neighbours of the redacted placeholder
+        #   strings may differ slightly from neighbours of the original secret tokens.
+        #   This is an acceptable loss — the alternative (embedding raw, storing
+        #   redacted) would make search results inconsistent with stored content.
+        store_raw = os.environ.get("OPEN_BRAIN_STORE_RAW", "").lower() == "true"
+        if store_raw:
+            import sys as _sys
+            print(
+                "WARNING: OPEN_BRAIN_STORE_RAW=true is active — "
+                "raw (unredacted) text will be stored in brain.thoughts.raw_text. "
+                "External LLMs still receive only redacted text. "
+                "This is an escape hatch; disable in production. (fblai-y0zsb)",
+                file=_sys.stderr,
+            )
+
+        redacted_text = redact_pii(text)
+        # text_for_storage: raw when escape hatch is active, else redacted.
+        text_for_storage = text if store_raw else redacted_text
+
+        # Step 1: Extract metadata via Claude API — ALWAYS uses redacted text.
+        metadata = _extract_metadata(redacted_text)
         if not metadata:
             metadata = {
                 "type": "insight",
                 "topics": [],
                 "people": [],
                 "action_items": [],
-                "summary": text[:200],
+                "summary": redacted_text[:200],
             }
+
+        # Stamp escape-hatch flag so consumers can distinguish raw-stored atoms.
+        if store_raw:
+            metadata["stored_raw"] = True
 
         thought_type = metadata.get("type", "insight")
         topics = metadata.get("topics", [])
@@ -1938,10 +1998,11 @@ def capture(
         # The `or` idiom catches both None and the empty string, so
         # downstream `summary[:1000]` slicing never trips
         # `TypeError: 'NoneType' object is not subscriptable`.
-        summary = metadata.get("summary") or text[:200]
+        summary = metadata.get("summary") or redacted_text[:200]
 
-        # Step 2: Generate embedding locally
-        embedding = _generate_embedding(text)
+        # Step 2: Generate embedding from text_for_storage so the vector
+        # representation is consistent with what is stored in raw_text.
+        embedding = _generate_embedding(text_for_storage)
 
         # Step 3: INSERT with PROV-DM fields. source_uri stays NULL for internal
         # captures (deferred to a later bead if/when ingesting from external URLs).
@@ -1966,7 +2027,7 @@ def capture(
             (
                 thought_id,
                 user_id,
-                text[:16384],
+                text_for_storage[:16384],
                 summary[:1000],
                 thought_type,
                 json.dumps(topics),
