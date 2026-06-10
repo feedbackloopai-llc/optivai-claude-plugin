@@ -127,19 +127,26 @@ pii_redactors: list[Redactor] = [
     #   conservative (no false negative on the IPv6 portion; slight boundary shift).
     #
     # FALSE POSITIVE tradeoff:
-    #   Any token that looks like hex_group::hex_group will be matched. In practice
-    #   the main risk is C++ qualified names where both parts are purely hex (e.g.
-    #   `abc::def`). Such names are uncommon in real code and even rarer in
-    #   brain-stored prose. Mitigation: Forms E and F require the surrounding tokens
-    #   NOT to be preceded by alphabetic chars using a negative lookbehind for a
-    #   plain letter (preventing `foo::bar` where foo is all alpha-only).
+    #   Any token that looks like hex_group::hex_group will be matched. The
+    #   PRIMARY defense against common C++ scope operators (`std::vector`,
+    #   `foo::bar`, `namespace::Class`) is the `[0-9A-Fa-f]{1,4}` hex character
+    #   class itself: those identifiers contain non-hex letters (g-z minus a-f,
+    #   and length > 4), so no form's hex group can match them and the recognizer
+    #   never fires. The `(?<!\w)` lookbehind does NOT reject `foo::bar`; its only
+    #   job is to prevent mid-word anchoring — e.g. it stops the recognizer from
+    #   matching the `fe80::1` substring inside a larger token like `xfe80::1` or
+    #   `cafefe80::1`. (Trailing `(?!\w)` does the same on the right edge.)
     #   We do NOT require surrounding whitespace because IPv6 frequently appears
     #   after `:` or `/` in URLs and config lines.
     #
-    #   Residual false positives (accepted, documented):
-    #     - `abc::def` where both segments happen to be 1-3 hex chars (rare in prose)
-    #     - C++ `0xabc::Method` (hex literal before ::) — we accept this as a
-    #       correctly-handled match (redacting crypto-looking tokens is safe)
+    #   Residual false positives (accepted, documented — all low-impact):
+    #     - `abc::def` where both segments happen to be all-hex (1-4 chars).
+    #     - The hex-English-word class: tokens spelled entirely from [0-9a-f]
+    #       that read like words, e.g. `cafe::babe`, `dead::beef`, `feed::face`,
+    #       `face::b00c`. These ARE valid compressed-IPv6 shapes and get redacted.
+    #       Accepted: rare in brain-stored prose, and redacting them is harmless.
+    #     - C++ `0xabc::Method` (hex literal before ::) — accepted as a
+    #       correctly-handled match (redacting crypto-looking tokens is safe).
     #
     #   Residual false negatives (accepted, documented):
     #     - Bare `::` with no surrounding hex groups is NOT matched (too broad)

@@ -87,7 +87,8 @@ def redact_pii(text: Optional[str]) -> Optional[str]:
       - 8+ secret categories (AWS, Anthropic, OpenAI, GitHub, Slack, Stripe,
         JWT, PEM private keys, plus GCP, HuggingFace, GitLab, Twilio, SendGrid,
         HubSpot, Atlassian, bearer headers, basic-auth URLs)
-      - 7 PII categories (email, phone, SSN, Luhn-validated PAN, IPv4, IPv6, DOB)
+      - 8 PII categories (email, phone, SSN, Luhn-validated PAN, IPv4,
+        IPv6 full, IPv6 compressed (::), DOB)
       - High-entropy unknown tokens near 'password' / 'api_key' / similar keywords
 
     Returns None if input is None (preserves the old contract).
