@@ -3129,8 +3129,11 @@ def search(
     # Query is PII-redacted at the emitter boundary. result_summary captures
     # the top result's preview + total count so audit trails are informative
     # without holding the full per-row payload.
-    top_thought_id = results[0].get("thought_id") if results else None
-    top_similarity = results[0].get("similarity") if results else None
+    # fblai-xhqfh: result dicts carry UPPERCASED keys (normalised at line ~3042
+    # above).  Reading lowercase "thought_id"/"similarity" always returned None,
+    # so every search replay row had null top_thought_id/top_similarity.
+    top_thought_id = results[0].get("THOUGHT_ID") if results else None
+    top_similarity = results[0].get("SIMILARITY") if results else None
     result_text_preview = (
         f"{len(results)} result(s); top={results[0].get('summary', '')[:80]}"
         if results
