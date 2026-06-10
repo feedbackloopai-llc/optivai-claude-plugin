@@ -57,6 +57,10 @@ class CitationNode:
     was_generated_by: str
     was_derived_from: Optional[str]
     source_uri: Optional[str]
+    # NAL-lite stv (T2.6 / fblai-eovhe): belief state at this node in the
+    # derivation chain.  None for sentinel nodes (orphan/cycle/max-depth).
+    stv_frequency: Optional[float] = None
+    stv_confidence: Optional[float] = None
     children: List["CitationNode"] = field(default_factory=list)
     # Sentinel cases (None for normal nodes):
     #   "orphaned"  — was_derived_from was set but the parent is not visible
@@ -178,7 +182,7 @@ def _walk(
         cur.execute(
             """
             SELECT raw_text, prov_agent, prov_activity, was_generated_by,
-                   was_derived_from, source_uri
+                   was_derived_from, source_uri, stv_frequency, stv_confidence
               FROM brain.thoughts
              WHERE thought_id=%s AND user_id=%s
             """,
@@ -210,7 +214,7 @@ def _walk(
             orphan_marker="orphaned",
         )
 
-    raw_text, prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri = row
+    raw_text, prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri, stv_f, stv_c = row
     preview = (raw_text or "")[:PREVIEW_CHARS]
 
     node = CitationNode(
@@ -222,6 +226,8 @@ def _walk(
         was_generated_by=was_generated_by or "",
         was_derived_from=was_derived_from,
         source_uri=source_uri,
+        stv_frequency=float(stv_f) if stv_f is not None else None,
+        stv_confidence=float(stv_c) if stv_c is not None else None,
     )
 
     # Recurse on the parent (was_derived_from) if present. The depth cap is

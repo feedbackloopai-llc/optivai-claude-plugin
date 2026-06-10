@@ -29,6 +29,15 @@ CREATE TABLE IF NOT EXISTS thoughts (
     project         VARCHAR(200),
     embedding       vector(768),
     metadata        JSONB,
+    -- NAL-lite truth values (T2.6 / fblai-eovhe): Non-Axiomatic Logic stv pair.
+    -- stv_frequency: degree of positive evidence [0,1] (1.0 = fully positive).
+    -- stv_confidence: evidential weight [0,1) (higher = more evidence pooled).
+    -- Seeded by capture() from metadata->>'confidence': high→0.9, medium→0.7,
+    -- low→0.5, absent→0.5. Updated by nal_revise() when verifies/refutes links
+    -- are added, and by --revise to create derived atoms. See revision math in
+    -- scripts/open_brain.py::nal_revise().
+    stv_frequency   REAL              NOT NULL DEFAULT 1.0,
+    stv_confidence  REAL              NOT NULL DEFAULT 0.5,
     created_at      TIMESTAMPTZ       DEFAULT NOW(),
     updated_at      TIMESTAMPTZ       DEFAULT NOW(),
     CONSTRAINT fk_thoughts_derived_from
@@ -77,6 +86,11 @@ CREATE TABLE IF NOT EXISTS thought_versions (
     prov_activity   VARCHAR(50)       NOT NULL,
     parent_version  BIGINT            REFERENCES thought_versions(version_id),
     diff_json       JSONB,
+    -- NAL-lite truth values carried per version so --trace shows belief evolution.
+    -- Values are snapshotted from brain.thoughts at snapshot time, then updated
+    -- by add_link (verifies/refutes) via snapshot_thought(prov_activity='nal_evidence').
+    stv_frequency   REAL              NOT NULL DEFAULT 1.0,
+    stv_confidence  REAL              NOT NULL DEFAULT 0.5,
     created_at      TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
     UNIQUE (thought_id, revision)
 );

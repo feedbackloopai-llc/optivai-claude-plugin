@@ -660,6 +660,82 @@ LINK_TYPES = {
     "cites",                    # source cites target as a source or quotation
 }
 
+# ─── NAL-lite truth-value primitives (T2.6 / fblai-eovhe) ────────────────────
+#
+# Non-Axiomatic Logic evidential-horizon revision:  k=1 (single-horizon)
+# Reference: Wang 1995 §5.1 "Revision rule", Lin/Li/Chen 2026 §12.1
+#
+# Truth value: (frequency, confidence) where
+#   frequency  ∈ [0,1]   — degree of positive evidence
+#   confidence ∈ [0,1)   — weight of evidence (approaches 1 asymptotically)
+#
+# Confidence map for capture seeding:
+#   "high"          → 0.9
+#   "medium"        → 0.7
+#   "low" / absent  → 0.5
+#
+# LOW_CONFIDENCE threshold: c < 0.35 (surfaced in search results as a marker)
+#
+NAL_CONFIDENCE_MAP = {"high": 0.9, "medium": 0.7, "low": 0.5}
+NAL_LOW_CONFIDENCE_THRESHOLD = 0.35
+
+
+def nal_revise(
+    f1: float, c1: float, f2: float, c2: float
+) -> tuple:
+    """NAL evidential-horizon revision (k=1).
+
+    Pools evidence from two independent observations of the SAME proposition.
+    Uses the evidential-horizon formula (Wang 1995 §5.1) with k=1.
+
+    All inputs are clamped to [0.01, 0.99] before computation to avoid
+    division-by-zero on boundary values.
+
+    Parameters
+    ----------
+    f1, c1 : float
+        Frequency and confidence of the first observation.
+    f2, c2 : float
+        Frequency and confidence of the second observation.
+
+    Returns
+    -------
+    (f, c) : tuple of float
+        Revised (frequency, confidence) pair.
+
+    Properties (verified by test_nal_stv.py):
+    (i)  Same-frequency revision raises confidence strictly.
+    (ii) Revision is commutative: revise(a,b) == revise(b,a).
+    (iii) Result f ∈ [0,1], c ∈ [0,1).
+    (iv)  A high-confidence belief dominates a low-confidence contradicting one.
+    """
+    # Clamp inputs to safe range — avoids div-by-zero when c == 1 or c == 0.
+    f1 = max(0.01, min(0.99, float(f1)))
+    c1 = max(0.01, min(0.99, float(c1)))
+    f2 = max(0.01, min(0.99, float(f2)))
+    c2 = max(0.01, min(0.99, float(c2)))
+
+    # Evidential weights: w = c / (1 - c)  (odds-ratio of confidence)
+    w1 = c1 / (1.0 - c1)
+    w2 = c2 / (1.0 - c2)
+    w_total = w1 + w2
+
+    # Revised frequency: evidence-weighted average
+    f = (w1 * f1 + w2 * f2) / w_total
+    # Revised confidence: w_total / (w_total + k),  k=1 (single horizon)
+    c = w_total / (w_total + 1.0)
+
+    # Clamp outputs to valid range (floating-point safety)
+    f = max(0.0, min(1.0, f))
+    c = max(0.0, min(0.9999, c))  # confidence is strictly < 1 in NAL
+    return (f, c)
+
+
+def _stv_from_confidence(confidence_label: Optional[str]) -> tuple:
+    """Map a metadata confidence label ('high'/'medium'/'low'/None) to (f, c)."""
+    c = NAL_CONFIDENCE_MAP.get(confidence_label or "", 0.5)
+    return (1.0, c)
+
 
 # Standalone DDL for the connected-provenance-graph table. Kept here as a
 # fallback so a fresh install without the sql/ tree (or with a stale tree)
@@ -833,7 +909,7 @@ def snapshot_thought(
         cur.execute(
             """
             SELECT raw_text, summary, thought_type, topics, people, action_items,
-                   embedding, metadata
+                   embedding, metadata, stv_frequency, stv_confidence
             FROM brain.thoughts
             WHERE thought_id = %s AND user_id = %s
             FOR UPDATE
@@ -846,7 +922,7 @@ def snapshot_thought(
                 f"snapshot_thought: thought {thought_id} not in user scope "
                 f"(user={user_id})"
             )
-        raw_text, summary, thought_type, topics, people, action_items, embedding, metadata = row
+        raw_text, summary, thought_type, topics, people, action_items, embedding, metadata, snap_stv_f, snap_stv_c = row
 
         # Determine next revision + previous version state (for diff).
         cur.execute(
@@ -897,11 +973,13 @@ def snapshot_thought(
             INSERT INTO brain.thought_versions (
                 thought_id, revision, raw_text, summary, thought_type,
                 topics, people, action_items, embedding, metadata,
-                prov_agent, prov_activity, parent_version, diff_json
+                prov_agent, prov_activity, parent_version, diff_json,
+                stv_frequency, stv_confidence
             ) VALUES (
                 %s, %s, %s, %s, %s,
                 %s::jsonb, %s::jsonb, %s::jsonb, %s::vector, %s::jsonb,
-                %s, %s, %s, %s::jsonb
+                %s, %s, %s, %s::jsonb,
+                %s, %s
             )
             RETURNING version_id
             """,
@@ -914,6 +992,8 @@ def snapshot_thought(
                 json.dumps(metadata) if metadata is not None else None,
                 prov_agent, prov_activity, parent_version,
                 json.dumps(diff_json) if diff_json is not None else None,
+                float(snap_stv_f) if snap_stv_f is not None else 1.0,
+                float(snap_stv_c) if snap_stv_c is not None else 0.5,
             ),
         )
         version_id = cur.fetchone()[0]
@@ -2552,6 +2632,8 @@ def capture(
     prov_agent: Optional[str] = None,
     prov_activity: Optional[str] = None,
     was_derived_from: Optional[str] = None,
+    stv_f: Optional[float] = None,
+    stv_c: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Capture a thought with local embedding + Claude metadata extraction.
 
@@ -2671,21 +2753,36 @@ def capture(
         # representation is consistent with what is stored in raw_text.
         embedding = _generate_embedding(text_for_storage)
 
-        # Step 3: INSERT with PROV-DM fields. source_uri stays NULL for internal
-        # captures (deferred to a later bead if/when ingesting from external URLs).
+        # Step 3a: Resolve NAL stv values.
+        # Priority: explicit stv_f/stv_c overrides > confidence label from metadata.
+        # Caller-supplied values must be validated in [0,1] before this point
+        # (CLI validation happens in main(); Pi-bridge validation in _run_from_pi()).
+        if stv_f is not None or stv_c is not None:
+            # Explicit overrides — clamp to valid range
+            final_stv_f = float(max(0.0, min(1.0, stv_f if stv_f is not None else 1.0)))
+            final_stv_c = float(max(0.0, min(0.9999, stv_c if stv_c is not None else 0.5)))
+        else:
+            # Seed from confidence label extracted by LLM metadata
+            confidence_label = metadata.get("confidence")
+            _, final_stv_c = _stv_from_confidence(confidence_label)
+            final_stv_f = 1.0  # default: positive evidence
+
+        # Step 3b: INSERT with PROV-DM fields + stv columns.
+        # source_uri stays NULL for internal captures (deferred to a later bead
+        # if/when ingesting from external URLs).
         insert_sql = """
             INSERT INTO brain.thoughts (
                 thought_id, user_id, raw_text, summary, thought_type,
                 topics, people, action_items, source, session_id, project,
                 prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri,
-                embedding, metadata, created_at, updated_at
+                embedding, metadata, stv_frequency, stv_confidence, created_at, updated_at
             )
             VALUES (
                 %s, %s, %s, %s, %s,
                 %s::jsonb, %s::jsonb, %s::jsonb,
                 %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s::vector, %s::jsonb,
+                %s::vector, %s::jsonb, %s, %s,
                 NOW(), NOW()
             )
         """
@@ -2710,6 +2807,8 @@ def capture(
                 None,  # source_uri — reserved for external-URL captures
                 str(embedding),
                 json.dumps(metadata),
+                final_stv_f,
+                final_stv_c,
             ),
         )
         conn.commit()
@@ -2756,6 +2855,7 @@ def capture(
         "topics": topics,
         "people": people,
         "action_items": action_items,
+        "stv": {"f": final_stv_f, "c": final_stv_c},
     }
 
 
@@ -3005,6 +3105,8 @@ def search(
                 source,
                 project,
                 created_at,
+                stv_frequency,
+                stv_confidence,
                 1 - (embedding <=> %s::vector) AS vec_similarity,
                 {keyword_boost_expr} AS keyword_boost,
                 GREATEST(0, 1.0 - EXTRACT(EPOCH FROM (NOW() - GREATEST(created_at, COALESCE(updated_at, created_at)))) / (90 * 86400.0)) AS time_decay
@@ -3043,6 +3145,11 @@ def search(
             d["hybrid_score"] = round(float(hybrid), 4) if hybrid is not None else 0.0
             d["keyword_boost"] = round(float(d.get("keyword_boost", 0)), 4)
             d["time_decay"] = round(float(d.get("time_decay", 0)), 4)
+            # NAL stv: extract before uppercasing, normalize to STV dict.
+            _stv_f = float(d.pop("stv_frequency", 1.0) or 1.0)
+            _stv_c = float(d.pop("stv_confidence", 0.5) or 0.5)
+            d["stv"] = {"f": round(_stv_f, 4), "c": round(_stv_c, 4)}
+            d["low_confidence"] = _stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
             # Remove intermediate columns not needed in output
             d.pop("vec_similarity", None)
             # Normalize to uppercase keys for compatibility with formatters/Pi bridge
@@ -3474,7 +3581,8 @@ def graph_search(
             fetch_sql = f"""
                 SELECT
                     thought_id, raw_text, summary, thought_type,
-                    topics, people, action_items, source, project, created_at
+                    topics, people, action_items, source, project, created_at,
+                    stv_frequency, stv_confidence
                 FROM {TABLE}
                 WHERE thought_id IN ({id_placeholders})
                   AND user_id = %s
@@ -3512,6 +3620,12 @@ def graph_search(
                 d["time_decay"] = 0.0
                 d["graph_depth"] = depth
                 d["graph_source"] = True
+
+                # NAL stv: normalize before uppercasing.
+                _g_stv_f = float(d.pop("stv_frequency", 1.0) or 1.0)
+                _g_stv_c = float(d.pop("stv_confidence", 0.5) or 0.5)
+                d["stv"] = {"f": round(_g_stv_f, 4), "c": round(_g_stv_c, 4)}
+                d["low_confidence"] = _g_stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
 
                 d = {k.upper(): v for k, v in d.items()}
                 graph_results.append(d)
@@ -3981,6 +4095,86 @@ def add_link(
     finally:
         cur.close()
 
+    # ── NAL evidence propagation (T2.6 / fblai-eovhe) ────────────────────────
+    # When a 'verifies' or 'refutes' link is added, revise the TARGET's stv.
+    #   verifies: evidence (f=1.0, c = source.stv_confidence * 0.9)
+    #   refutes:  evidence (f=0.0, c = source.stv_confidence * 0.9)
+    # The 0.9 attenuation prevents a chain of weak verifications manufacturing
+    # certainty.
+    # 'references_bead' links are EXEMPT — bead targets have no stv column.
+    # Only fires on created links (idempotent no-op on existing edges).
+    if created and link_type in ("verifies", "refutes"):
+        try:
+            _ev_cur = conn.cursor()
+            try:
+                # Read source stv for confidence attenuation.
+                _ev_cur.execute(
+                    "SELECT stv_confidence FROM brain.thoughts "
+                    "WHERE thought_id = %s AND user_id = %s",
+                    (source_id, user_id),
+                )
+                _src_row = _ev_cur.fetchone()
+                # Verify target is a real atom in user scope (not a bead ID).
+                _ev_cur.execute(
+                    "SELECT stv_frequency, stv_confidence FROM brain.thoughts "
+                    "WHERE thought_id = %s AND user_id = %s",
+                    (target_id, user_id),
+                )
+                _tgt_row = _ev_cur.fetchone()
+            finally:
+                _ev_cur.close()
+
+            if _src_row is not None and _tgt_row is not None:
+                _src_c = float(_src_row[0] or 0.5)
+                _tgt_f = float(_tgt_row[0] or 1.0)
+                _tgt_c = float(_tgt_row[1] or 0.5)
+
+                # Build evidence stv with 0.9 attenuation on source confidence.
+                _ev_c = min(0.99, _src_c * 0.9)
+                _ev_f = 1.0 if link_type == "verifies" else 0.0
+
+                # RB: snapshot target BEFORE modifying so belief change is
+                # rollback-able and visible in --trace.
+                snapshot_thought(
+                    conn,
+                    thought_id=target_id,
+                    user_id=user_id,
+                    prov_agent=prov_agent,
+                    prov_activity="nal_evidence",
+                )
+
+                # Revise target stv with the attenuated evidence.
+                new_f, new_c = nal_revise(_tgt_f, _tgt_c, _ev_f, _ev_c)
+
+                _upd_cur = conn.cursor()
+                try:
+                    _upd_cur.execute(
+                        "UPDATE brain.thoughts SET stv_frequency = %s, "
+                        "stv_confidence = %s, updated_at = NOW() "
+                        "WHERE thought_id = %s AND user_id = %s",
+                        (new_f, new_c, target_id, user_id),
+                    )
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    _upd_cur.close()
+        except Exception as _ep_exc:
+            # Evidence propagation is best-effort: never block link addition.
+            # Log the failure and proceed — the link itself was committed.
+            logger.warning(
+                f"NAL evidence propagation failed for {link_type} "
+                f"link {source_id!r}→{target_id!r}: {_ep_exc}"
+            )
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
     # Always emit the confirmation line per the fail-safe contract, even on
     # the idempotent no-op path (caller still benefits from seeing the link_id).
     sys.stderr.write(
@@ -4067,6 +4261,158 @@ def show_links(conn, atom_id: str, user_id: str) -> Dict[str, Any]:
         "outgoing": outgoing,
         "incoming": incoming,
     }
+
+
+def revise_thoughts(
+    conn,
+    id_a: str,
+    id_b: str,
+    user_id: str,
+    text: Optional[str] = None,
+    source: str = "manual",
+    session_id: str = "",
+    project: str = "",
+) -> Dict[str, Any]:
+    """NAL revision: create a derived atom whose stv = nal_revise(A.stv, B.stv).
+
+    Both premises must belong to ``user_id`` (PS scoping). The derived atom is
+    created via :func:`capture` (not a raw INSERT) so PROV-DM stamping, redaction,
+    embedding, and metadata extraction all apply.
+
+    Derived atom text: ``text`` if supplied, else the raw_text of the
+    higher-confidence premise.
+
+    After capture, adds:
+    - ``derives_from`` links from the derived atom to BOTH premises.
+    - If a ``contradicts`` link already exists between A and B (either direction),
+      also adds ``resolves`` links from the derived atom to both premises.
+
+    PROV-DM note: ``was_derived_from`` on brain.thoughts is a single-parent
+    column (the schema only stores one parent).  This function sets
+    ``was_derived_from`` to the higher-confidence premise (the dominant parent).
+    The second derivation link is expressed via an explicit ``derives_from``
+    atom_link, which is an acceptable trade-off given the single-parent schema
+    constraint (documented limitation).
+
+    Returns
+    -------
+    dict
+        Capture result dict augmented with ``stv`` and ``derives_from`` keys.
+    """
+    if not id_a or not id_b:
+        raise ValueError("revise_thoughts: id_a and id_b are required")
+    if id_a == id_b:
+        raise ValueError("revise_thoughts: id_a and id_b must be different atoms")
+
+    cur = conn.cursor()
+    try:
+        # PS scoping: both premises must belong to the caller's user_id.
+        cur.execute(
+            "SELECT thought_id, stv_frequency, stv_confidence, raw_text "
+            "FROM brain.thoughts "
+            "WHERE thought_id = ANY(%s) AND user_id = %s",
+            ([id_a, id_b], user_id),
+        )
+        rows_map = {r[0]: r for r in cur.fetchall()}
+    finally:
+        cur.close()
+
+    if id_a not in rows_map:
+        raise RuntimeError(
+            f"revise_thoughts: premise {id_a!r} not in user scope (user={user_id})"
+        )
+    if id_b not in rows_map:
+        raise RuntimeError(
+            f"revise_thoughts: premise {id_b!r} not in user scope (user={user_id})"
+        )
+
+    row_a = rows_map[id_a]
+    row_b = rows_map[id_b]
+    f_a = float(row_a[1] or 1.0)
+    c_a = float(row_a[2] or 0.5)
+    f_b = float(row_b[1] or 1.0)
+    c_b = float(row_b[2] or 0.5)
+
+    # Revised stv
+    rev_f, rev_c = nal_revise(f_a, c_a, f_b, c_b)
+
+    # Choose text: explicit override, else the higher-confidence premise's text.
+    if text is not None:
+        derived_text = text
+    else:
+        dominant_row = row_a if c_a >= c_b else row_b
+        derived_text = dominant_row[3] or ""  # raw_text of dominant premise
+
+    # Dominant premise = higher confidence (used as was_derived_from parent).
+    dominant_id = id_a if c_a >= c_b else id_b
+
+    # Capture through the normal path — preserves PROV-DM + redaction + embedding.
+    result = capture(
+        conn,
+        text=derived_text,
+        user_id=user_id,
+        source=source,
+        session_id=session_id,
+        project=project,
+        prov_activity="nal_revision",
+        was_derived_from=dominant_id,
+        stv_f=rev_f,
+        stv_c=rev_c,
+    )
+    derived_id = result["thought_id"]
+
+    # Wire derives_from links to BOTH premises.
+    for premise_id in (id_a, id_b):
+        try:
+            add_link(
+                conn,
+                source_id=derived_id,
+                target_id=premise_id,
+                link_type="derives_from",
+                user_id=user_id,
+                via="nal_revision",
+            )
+        except Exception:
+            pass  # best-effort; capture succeeded
+
+    # If a 'contradicts' link exists between A and B (either direction),
+    # add 'resolves' links from derived atom to both premises.
+    _check_cur = conn.cursor()
+    try:
+        _check_cur.execute(
+            """
+            SELECT 1 FROM brain.atom_links
+            WHERE link_type = 'contradicts'
+              AND user_id = %s
+              AND (
+                  (source_id = %s AND target_id = %s)
+                  OR (source_id = %s AND target_id = %s)
+              )
+            LIMIT 1
+            """,
+            (user_id, id_a, id_b, id_b, id_a),
+        )
+        has_contradicts = _check_cur.fetchone() is not None
+    finally:
+        _check_cur.close()
+
+    if has_contradicts:
+        for premise_id in (id_a, id_b):
+            try:
+                add_link(
+                    conn,
+                    source_id=derived_id,
+                    target_id=premise_id,
+                    link_type="resolves",
+                    user_id=user_id,
+                    via="nal_revision",
+                )
+            except Exception:
+                pass  # best-effort
+
+    result["derives_from"] = [id_a, id_b]
+    result["contradicts_resolved"] = has_contradicts
+    return result
 
 
 _UNRESOLVED_KEYWORD_RE = re.compile(
@@ -4588,6 +4934,14 @@ def _format_search_results(results: List[Dict], sort_by: str = "similarity") -> 
         else:
             lines.append(f"{i}. [{hybrid:.0%} hybrid] {summary}")
             lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  vec={sim:.0%}  |  {r.get('CREATED_AT', '')[:19]}")
+        # NAL stv surfacing (T2.6 / fblai-eovhe)
+        stv = r.get("STV") or r.get("stv")
+        if stv:
+            stv_tag = f"[stv f={stv.get('f', 1.0):.2f} c={stv.get('c', 0.5):.2f}]"
+            low_conf = r.get("LOW_CONFIDENCE") or r.get("low_confidence")
+            if low_conf:
+                stv_tag += " [LOW-CONFIDENCE]"
+            lines.append(f"   {stv_tag}")
         topics = r.get("TOPICS", [])
         if topics:
             lines.append(f"   Topics: {', '.join(str(t) for t in topics)}")
@@ -4734,10 +5088,10 @@ def _print_citation_tree(node, indent: int = 0) -> None:
 
     Format::
 
-        ● <thought_id> (d0)
+        ● <thought_id> (d0)  [stv f=.. c=..]
             prov: <prov_agent>/<prov_activity>
             text: <first 100 chars of raw_text_preview>
-          → <parent_thought_id> (d1)
+          → <parent_thought_id> (d1)  [stv f=.. c=..]
               prov: ...
               text: ...
 
@@ -4747,7 +5101,14 @@ def _print_citation_tree(node, indent: int = 0) -> None:
     """
     prefix = "  " * indent + ("→ " if indent > 0 else "● ")
     marker = f" [{node.orphan_marker}]" if node.orphan_marker else ""
-    print(f"{prefix}{node.thought_id} (d{node.depth}{marker})")
+    # NAL stv annotation — shows belief evolution along the derivation chain.
+    stv_tag = ""
+    if not node.orphan_marker:
+        _sf = node.stv_frequency
+        _sc = node.stv_confidence
+        if _sf is not None and _sc is not None:
+            stv_tag = f"  [stv f={_sf:.2f} c={_sc:.2f}]"
+    print(f"{prefix}{node.thought_id} (d{node.depth}{marker}){stv_tag}")
     if not node.orphan_marker:
         print(f"{'  ' * indent}    prov: {node.prov_agent}/{node.prov_activity}")
         if node.raw_text_preview:
@@ -4778,6 +5139,27 @@ def _run_from_pi():
     conn = _connect()
     try:
         if op == "capture":
+            # NAL stv validation: reject out-of-range values.
+            _pi_stv_f = args.get("stv", {}).get("f") if isinstance(args.get("stv"), dict) else None
+            _pi_stv_c = args.get("stv", {}).get("c") if isinstance(args.get("stv"), dict) else None
+            if _pi_stv_f is not None:
+                try:
+                    _pi_stv_f = float(_pi_stv_f)
+                    if not (0.0 <= _pi_stv_f <= 1.0):
+                        print(json.dumps({"error": "stv.f must be in [0, 1]"}))
+                        return
+                except (TypeError, ValueError):
+                    print(json.dumps({"error": "stv.f must be a float"}))
+                    return
+            if _pi_stv_c is not None:
+                try:
+                    _pi_stv_c = float(_pi_stv_c)
+                    if not (0.0 <= _pi_stv_c <= 1.0):
+                        print(json.dumps({"error": "stv.c must be in [0, 1]"}))
+                        return
+                except (TypeError, ValueError):
+                    print(json.dumps({"error": "stv.c must be a float"}))
+                    return
             result = capture(
                 conn,
                 text=args.get("text", ""),
@@ -4788,8 +5170,31 @@ def _run_from_pi():
                 prov_agent=args.get("prov_agent"),
                 prov_activity=args.get("prov_activity"),
                 was_derived_from=args.get("was_derived_from"),
+                stv_f=_pi_stv_f,
+                stv_c=_pi_stv_c,
             )
             print(json.dumps(result))
+        elif op == "revise":
+            # NAL revision: create derived atom with fused stv.
+            _rev_id_a = args.get("id_a", "")
+            _rev_id_b = args.get("id_b", "")
+            if not _rev_id_a or not _rev_id_b:
+                print(json.dumps({"error": "revise op requires id_a and id_b"}))
+                return
+            try:
+                result = revise_thoughts(
+                    conn,
+                    id_a=_rev_id_a,
+                    id_b=_rev_id_b,
+                    user_id=user_id,
+                    text=args.get("text"),
+                    source=args.get("source", "pi"),
+                    session_id=args.get("session_id", ""),
+                    project=args.get("project", ""),
+                )
+                print(json.dumps(result, default=str))
+            except (ValueError, RuntimeError) as e:
+                print(json.dumps({"error": str(e)}))
         elif op == "search":
             results = search(
                 conn,
@@ -5087,6 +5492,14 @@ def main():
                        help="List atom_links whose target_id is genuinely dangling "
                             "(not an atom, not a bead). For data-integrity audit.")
 
+    # ─── NAL revision (T2.6 / fblai-eovhe) ─────────────────────────────────────
+    group.add_argument("--revise", nargs=2, metavar=("ID_A", "ID_B"),
+                       dest="revise_ids",
+                       help="NAL revision: create a derived atom with stv = "
+                            "nal_revise(A.stv, B.stv). Both premises must be in "
+                            "your scope. Use --text to override the derived text "
+                            "(default: higher-confidence premise's text).")
+
     # ─── Skill registration (gz-nced6) ───────────────────────────────────────
     group.add_argument("--register-skill", type=str, metavar="NAME",
                        dest="register_skill_name",
@@ -5123,6 +5536,20 @@ def main():
                              "TARGET_ID. Repeatable for multiple links. Validated before "
                              "the capture commits — an unknown link_type rejects the whole "
                              "capture.")
+
+    # NAL stv overrides (T2.6 / fblai-eovhe)
+    parser.add_argument("--stv-f", type=float, default=None, dest="stv_f",
+                        metavar="FREQ",
+                        help="With --capture: override the NAL stv frequency (0.0–1.0). "
+                             "Default: 1.0 (or derived from metadata confidence label).")
+    parser.add_argument("--stv-c", type=float, default=None, dest="stv_c",
+                        metavar="CONF",
+                        help="With --capture: override the NAL stv confidence (0.0–1.0). "
+                             "Default: derived from metadata confidence (high=0.9, medium=0.7, low/absent=0.5).")
+    parser.add_argument("--text", type=str, default=None, dest="revise_text",
+                        metavar="TEXT",
+                        help="With --revise: override the derived atom's text. "
+                             "Default: higher-confidence premise's raw_text.")
 
     parser.add_argument("--from", type=str, default=None, dest="from_iso",
                         metavar="ISO",
@@ -5237,6 +5664,24 @@ def main():
                         print(f"Error: {msg}", file=sys.stderr)
                     sys.exit(2)
 
+            # Validate --stv-f / --stv-c CLI overrides (must be in [0, 1]).
+            _cli_stv_f = args.stv_f
+            _cli_stv_c = args.stv_c
+            if _cli_stv_f is not None and not (0.0 <= _cli_stv_f <= 1.0):
+                msg = f"--stv-f must be in [0, 1]; got {_cli_stv_f}"
+                if args.json:
+                    print(json.dumps({"error": msg}))
+                else:
+                    print(f"Error: {msg}", file=sys.stderr)
+                sys.exit(2)
+            if _cli_stv_c is not None and not (0.0 <= _cli_stv_c <= 1.0):
+                msg = f"--stv-c must be in [0, 1]; got {_cli_stv_c}"
+                if args.json:
+                    print(json.dumps({"error": msg}))
+                else:
+                    print(f"Error: {msg}", file=sys.stderr)
+                sys.exit(2)
+
             result = capture(
                 conn,
                 text=args.capture,
@@ -5247,6 +5692,8 @@ def main():
                 prov_agent=args.prov_agent,
                 prov_activity=args.prov_activity,
                 was_derived_from=args.was_derived_from,
+                stv_f=_cli_stv_f,
+                stv_c=_cli_stv_c,
             )
 
             # Write the validated links AFTER capture commits. Each row
@@ -5495,6 +5942,37 @@ def main():
                 )
                 if args.reason:
                     print(f"  reason: {args.reason}")
+
+        elif args.revise_ids:
+            # NAL revision: --revise ID_A ID_B [--text "..."]
+            id_a, id_b = args.revise_ids
+            try:
+                result = revise_thoughts(
+                    conn,
+                    id_a=id_a,
+                    id_b=id_b,
+                    user_id=user_id,
+                    text=args.revise_text,
+                    source=args.source,
+                    session_id=args.session_id,
+                    project=args.project,
+                )
+            except (ValueError, RuntimeError) as e:
+                if args.json:
+                    print(json.dumps({"error": str(e)}))
+                else:
+                    print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                stv = result.get("stv", {})
+                print(
+                    f"Revised: derived={result['thought_id']} "
+                    f"stv=f={stv.get('f', 0):.4f}/c={stv.get('c', 0):.4f} "
+                    f"derives_from={result.get('derives_from', [])} "
+                    f"contradicts_resolved={result.get('contradicts_resolved', False)}"
+                )
 
         elif args.trace:
             # Local import keeps citation_walker out of the cold-path imports
