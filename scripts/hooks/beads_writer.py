@@ -21,15 +21,86 @@ import hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-# Import secret redaction (fail silently if not available)
-try:
-    from redact_secrets import redact_secrets, redact_dict
-except ImportError:
-    # Fallback: no redaction if module unavailable
-    def redact_secrets(text):
+# Import composed redaction pipeline (fblai-1ybnr).
+# Primary path: use the full defense-in-depth pipeline from scripts/redact/
+# (same coverage as open_brain.py: secrets + PII + entropy).
+# Fallback: emit a loud WARNING to stderr — silent identity fallback is
+# intentionally replaced by an audible signal so redaction gaps are never hidden.
+import sys as _redact_sys
+import os as _redact_os
+
+
+def _bootstrap_redact_pipeline():
+    """Return (redact_fn, redact_dict_fn) from the composed pipeline if importable."""
+    _this_dir = _redact_os.path.dirname(_redact_os.path.abspath(__file__))
+    _candidates = [
+        _redact_os.path.dirname(_this_dir),  # repo: scripts/hooks/ -> scripts/
+        _this_dir,                            # flat: ~/.claude/hooks/ -> hooks/ (redact is sibling)
+    ]
+    for _p in _candidates:
+        if _p not in _redact_sys.path:
+            _redact_sys.path.insert(0, _p)
+    try:
+        from redact.default_pipeline import redact_pii as _rpii  # noqa: F401
+
+        def _redact_text(text):
+            return _rpii(text) if text is not None else text
+
+        def _redact_dict_fn(data, max_depth=10):
+            """Walk a dict/list and redact all string values."""
+            if isinstance(data, str):
+                return _rpii(data) or data
+            if isinstance(data, dict):
+                return {k: _redact_dict_fn(v, max_depth - 1) if max_depth > 0 else v
+                        for k, v in data.items()}
+            if isinstance(data, list):
+                return [_redact_dict_fn(item, max_depth - 1) if max_depth > 0 else item
+                        for item in data]
+            return data
+
+        return _redact_text, _redact_dict_fn
+    except Exception:
+        return None, None
+
+
+def _make_loud_fallbacks():
+    """Return loud-fallback redact functions that warn exactly once."""
+    _warned = [False]
+
+    def _loud_redact(text):
+        if not _warned[0]:
+            print(
+                "WARNING: redaction pipeline unavailable — redaction DISABLED",
+                file=_redact_sys.stderr,
+            )
+            _warned[0] = True
         return text
-    def redact_dict(data, max_depth=10):
+
+    def _loud_redact_dict(data, max_depth=10):
+        if not _warned[0]:
+            print(
+                "WARNING: redaction pipeline unavailable — redaction DISABLED",
+                file=_redact_sys.stderr,
+            )
+            _warned[0] = True
         return data
+
+    return _loud_redact, _loud_redact_dict
+
+
+_redact_fn, _redact_dict_fn = _bootstrap_redact_pipeline()
+if _redact_fn is None:
+    _redact_fn, _redact_dict_fn = _make_loud_fallbacks()
+
+
+def redact_secrets(text):
+    """Redact PII and secrets from text using the composed pipeline."""
+    return _redact_fn(text)
+
+
+def redact_dict(data, max_depth=10):
+    """Redact PII and secrets from all string values in a dict/list."""
+    return _redact_dict_fn(data, max_depth)
 
 # Global beads location
 GLOBAL_BEADS_DIR = Path.home() / ".claude" / "beads"

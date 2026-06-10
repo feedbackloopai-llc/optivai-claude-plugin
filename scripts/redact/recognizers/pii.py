@@ -84,12 +84,105 @@ pii_redactors: list[Redactor] = [
         confidence=0.75,
     ),
 
-    # pii.network.ipv6
+    # pii.network.ipv6 (full uncompressed)
     # Taxonomy pattern verbatim: matches full 8-group uncompressed IPv6 only.
-    # Abbreviated (::) forms are NOT matched (corpus rows updated to full form per T11.2).
+    # Abbreviated (::) forms are handled by the companion pii.network.ipv6_compressed
+    # recognizer below (T11.2 deviation reversed: we now support both forms).
     RegexRedactor(
         "pii.network.ipv6",
         re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b"),
+        confidence=0.95,
+    ),
+
+    # pii.network.ipv6_compressed
+    #
+    # Matches compressed (RFC 5952 `::`) IPv6 addresses. The full-form recognizer
+    # above catches 8-group uncompressed; this one catches all forms that use `::`.
+    #
+    # DESIGN — avoiding ReDoS:
+    #   No nested quantifiers. The pattern is a flat alternation of six structurally
+    #   distinct compressed forms. Each form uses at most one `(?:group:){n,m}`
+    #   quantifier without any surrounding repeat. Python's `re` module (backed by
+    #   a backtracking NFA) is still susceptible to catastrophic backtracking when
+    #   quantifiers are nested; flat alternation is safe.
+    #
+    #   Hex group = [0-9A-Fa-f]{1,4}   (abbreviated as HG below)
+    #
+    #   Form A: HG :: (one leading group, trailing ::)
+    #           e.g. fe80::, 2001::
+    #   Form B: HG:HG... :: (2–6 leading groups, trailing ::)
+    #           e.g. 2001:db8::
+    #   Form C: :: HG (leading ::, one trailing group)
+    #           e.g. ::1
+    #   Form D: :: HG:HG... (leading ::, 2–7 trailing groups)
+    #           e.g. ::ffff:192 (partially), ::1:2:3
+    #   Form E: HG :: HG (one leading group, ::, one trailing group)
+    #           e.g. fe80::1
+    #   Form F: HG:HG... :: HG:HG... (2–5 leading groups, ::, 1–5 trailing groups)
+    #           e.g. 2001:db8::85a3:0:0:1
+    #
+    #   IPv4-mapped addresses (::ffff:d.d.d.d) are incidentally matched by Form D
+    #   because the IPv4-decimal part is not pure hex; the match covers the hex
+    #   prefix (::ffff) and leaves the IPv4 suffix to the IPv4 recognizer. This is
+    #   conservative (no false negative on the IPv6 portion; slight boundary shift).
+    #
+    # FALSE POSITIVE tradeoff:
+    #   Any token that looks like hex_group::hex_group will be matched. In practice
+    #   the main risk is C++ qualified names where both parts are purely hex (e.g.
+    #   `abc::def`). Such names are uncommon in real code and even rarer in
+    #   brain-stored prose. Mitigation: Forms E and F require the surrounding tokens
+    #   NOT to be preceded by alphabetic chars using a negative lookbehind for a
+    #   plain letter (preventing `foo::bar` where foo is all alpha-only).
+    #   We do NOT require surrounding whitespace because IPv6 frequently appears
+    #   after `:` or `/` in URLs and config lines.
+    #
+    #   Residual false positives (accepted, documented):
+    #     - `abc::def` where both segments happen to be 1-3 hex chars (rare in prose)
+    #     - C++ `0xabc::Method` (hex literal before ::) — we accept this as a
+    #       correctly-handled match (redacting crypto-looking tokens is safe)
+    #
+    #   Residual false negatives (accepted, documented):
+    #     - Bare `::` with no surrounding hex groups is NOT matched (too broad)
+    #     - Addresses embedded inside larger numeric tokens without word boundaries
+    #       may not match if they start mid-word
+    #
+    # WORD BOUNDARY HANDLING:
+    #   IPv6 addresses can appear after `/` (CIDR), `:` (ports), `[` (URL brackets),
+    #   or at the start of a line. Standard `\b` anchors on the left and right sides
+    #   of the address handle the common cases. The negative lookbehind `(?<!\w)` is
+    #   used instead of `\b` on the left for forms that start with `::` (where `\b`
+    #   would not fire before `:`).
+    RegexRedactor(
+        "pii.network.ipv6_compressed",
+        re.compile(
+            r"(?<!\w)"
+            r"(?:"
+            # Form F: 2-5 leading hex groups, ::, 1-5 trailing hex groups
+            # e.g. 2001:db8::85a3:0:0:1
+            r"[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1,4}::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,4}"
+            r"|"
+            # Form E: exactly one leading group, ::, one trailing group
+            # e.g. fe80::1
+            r"[0-9A-Fa-f]{1,4}::[0-9A-Fa-f]{1,4}"
+            r"|"
+            # Form B: 2-6 leading groups, trailing ::
+            # e.g. 2001:db8::
+            r"[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1,5}::"
+            r"|"
+            # Form A: one leading group, trailing ::
+            # e.g. fe80::
+            r"[0-9A-Fa-f]{1,4}::"
+            r"|"
+            # Form D: leading ::, 2-7 trailing groups
+            # e.g. ::ffff:1, ::1:2:3:4:5:6:7
+            r"::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1,6}"
+            r"|"
+            # Form C: leading ::, exactly one trailing group
+            # e.g. ::1
+            r"::[0-9A-Fa-f]{1,4}"
+            r")"
+            r"(?!\w)"
+        ),
         confidence=0.95,
     ),
 
