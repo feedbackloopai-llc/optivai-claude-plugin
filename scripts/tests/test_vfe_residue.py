@@ -123,13 +123,40 @@ def _insert_thought(
     summary: Optional[str] = None,
     topics: Optional[List[str]] = None,
     people: Optional[List[str]] = None,
+    embedding: Optional[List[float]] = None,
 ) -> str:
-    """Insert a bare thought row (no LLM) and return thought_id."""
+    """Insert a bare thought row (no LLM) and return thought_id.
+
+    If ``embedding`` is provided (e.g. a 768-dim zeros vector), it is written to
+    the embedding column with a ::vector cast so the non-NULL restore path can
+    be exercised (H2 review fix)."""
     thought_id = open_brain._generate_thought_id()
+    if embedding is not None:
+        # Schema-qualify the vector type (public.vector) — Neon's pooler can reset
+        # search_path between statements, so an unqualified ::vector cast may fail
+        # with "type vector does not exist" mid-module. Qualifying is robust.
+        embedding_sql = "%s::public.vector"
+        embedding_literal = "[" + ",".join(str(float(v)) for v in embedding) + "]"
+    else:
+        embedding_sql = "NULL"
+        embedding_literal = None
     cur = conn.cursor()
     try:
+        params = [
+            thought_id,
+            user_id,
+            text[:16384],
+            (summary or text)[:1000],
+            thought_type,
+            json.dumps(topics or []),
+            json.dumps(people or []),
+            f"cli-user-{user_id}"[:100],
+            f"activity-{thought_id}",
+        ]
+        if embedding is not None:
+            params.append(embedding_literal)
         cur.execute(
-            """
+            f"""
             INSERT INTO brain.thoughts (
                 thought_id, user_id, raw_text, summary, thought_type,
                 topics, people, action_items, source, session_id, project,
@@ -140,22 +167,12 @@ def _insert_thought(
                 %s, %s, %s, %s, %s,
                 %s::jsonb, %s::jsonb, '[]'::jsonb,
                 'test', '', '',
-                %s, 'capture', %s, NULL, NULL,
-                NULL, NULL,
+                %s, 'capture', %s, NULL,
+                NULL, {embedding_sql}, NULL,
                 NOW(), NOW()
             )
             """,
-            (
-                thought_id,
-                user_id,
-                text[:16384],
-                (summary or text)[:1000],
-                thought_type,
-                json.dumps(topics or []),
-                json.dumps(people or []),
-                f"cli-user-{user_id}"[:100],
-                f"activity-{thought_id}",
-            ),
+            tuple(params),
         )
         conn.commit()
     except Exception:
@@ -303,6 +320,22 @@ def _thought_exists(conn, thought_id: str) -> bool:
             (thought_id,),
         )
         return int(cur.fetchone()[0]) > 0
+    finally:
+        cur.close()
+
+
+def _thought_embedding(conn, thought_id: str) -> Optional[List[float]]:
+    """Return the embedding vector for a thought as a list of floats, or None."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT embedding FROM brain.thoughts WHERE thought_id = %s",
+            (thought_id,),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return vf_probe._coerce_embedding(row[0])
     finally:
         cur.close()
 
@@ -482,22 +515,35 @@ class TestFailedCascadeDetection:
             "thought row must be restored after failed forget"
         )
 
-    def test_missed_replay_scrub_detected_and_restored(self, conn, test_user):
-        """If replay_log redaction is a no-op (tombstone missing), surface probe
-        detects the un-redacted thought_id text and restore fires."""
+    def test_missed_replay_scrub_detected_via_fk_not_idstring(self, conn, test_user):
+        """C1 review fix — the LOAD-BEARING test. If replay_log redaction is a
+        no-op, the surface probe must catch the surviving row via its thought_id
+        FK COLUMN, NOT via an id-string in the text. We plant id-FREE semantic
+        content (the realistic case) so this test ONLY passes through the
+        FK-count path. The prior id-string-in-text test was unrepresentative —
+        a fully-intact replay row with semantic text and no id-string would have
+        slipped through the old ILIKE-only probe."""
         tid = _insert_thought(conn, test_user, "replay scrub detection test E")
+        # IMPORTANT: the text does NOT contain the thought-id string. This is the
+        # realistic case — a real replay query is semantic ("what did we decide
+        # about caching?"), not the literal thought_id.
         event_id = _insert_replay_row(
             conn, test_user, tid,
-            query_text=f"query about {tid}",
-            result_text=f"result for {tid}",
+            query_text="what did we decide about the caching strategy",
+            result_text="we chose write-through with a 5 minute TTL window",
         )
+        # Sanity: confirm the planted text genuinely lacks the id-string, so the
+        # supplemental ILIKE path cannot be what catches it.
+        assert tid not in "what did we decide about the caching strategy"
+        assert tid not in "we chose write-through with a 5 minute TTL window"
 
         original_scrub = open_brain._scrub_residue_surfaces
 
         def scrub_noop_replay(c, thought_id, user_id):
-            """Call real scrub but revert the replay redaction afterward."""
+            """Call real scrub but revert the replay redaction afterward —
+            restoring the row to its full content INCLUDING the live thought_id
+            FK column. The text remains id-free, so only the FK path can catch it."""
             result = original_scrub(c, thought_id, user_id)
-            # Un-do the redaction so the probe finds the thought_id text still present.
             cur = c.cursor()
             try:
                 cur.execute(
@@ -505,10 +551,16 @@ class TestFailedCascadeDetection:
                     UPDATE brain.replay_log
                     SET query_redacted = %s,
                         result_summary = %s,
+                        thought_id = %s,
                         metadata = NULL
                     WHERE event_id = %s
                     """,
-                    (f"query about {thought_id}", f"result for {thought_id}", event_id),
+                    (
+                        "what did we decide about the caching strategy",
+                        "we chose write-through with a 5 minute TTL window",
+                        thought_id,  # FK column restored — this is the residue
+                        event_id,
+                    ),
                 )
                 c.commit()
             except Exception:
@@ -520,36 +572,95 @@ class TestFailedCascadeDetection:
         with patch.object(open_brain, "_scrub_residue_surfaces", side_effect=scrub_noop_replay):
             result = open_brain.forget_thought(conn, tid, test_user, n=4)
 
-        assert result["status"] in ("forget-failed-residue", "forget-failed-error"), (
-            f"Expected failure status but got: {result['status']}"
+        assert result["status"] in (
+            "forget-failed-residue", "forget-failed-error", "forget-failed-partial-restore",
+        ), (
+            f"Expected failure status (FK-residue must be caught) but got: {result['status']}"
         )
         assert _thought_exists(conn, tid), "thought row must be restored"
+
+    def test_nonnull_embedding_restored_on_failure(self, conn, test_user):
+        """H2 review fix — the _restore_thought non-NULL-vector path (the one we
+        fixed for the pgvector cast bug) must be integration-tested. Plant a
+        thought with a real 768-dim embedding, force verification failure via a
+        non-zero surface probe, and assert the thought is restored WITH its
+        vector column intact."""
+        # 768-dim vector with a couple of distinctive non-zero values so a bare
+        # zeros-vs-something comparison is meaningful.
+        embedding = [0.0] * 768
+        embedding[0] = 0.5
+        embedding[767] = -0.25
+
+        tid = _insert_thought(
+            conn, test_user, "thought with a real embedding vector",
+            embedding=embedding,
+        )
+        # Sanity: the embedding was written.
+        planted = _thought_embedding(conn, tid)
+        assert planted is not None, "pre-condition: embedding must be planted"
+        assert len(planted) == 768
+        assert abs(planted[0] - 0.5) < 1e-4
+        assert abs(planted[767] - (-0.25)) < 1e-4
+
+        # Force verification failure via a non-zero surface probe.
+        def fake_surface_probes(c, snapshot, scrub_snapshot):
+            return [
+                vf_probe.SurfaceProbeResult(
+                    surface="thought_versions",
+                    residue_count=1,
+                    surfaced_forgotten=True,
+                    detail="simulated residue to force restore",
+                ),
+            ]
+
+        with patch.object(vf_probe, "_run_surface_probes", side_effect=fake_surface_probes):
+            result = open_brain.forget_thought(conn, tid, test_user, n=4)
+
+        assert result["status"] in (
+            "forget-failed-residue", "forget-failed-partial-restore", "forget-failed-error",
+        ), (
+            f"Expected failure status but got: {result['status']}"
+        )
+        # The thought must be restored.
+        assert _thought_exists(conn, tid), "thought row must be restored"
+        # And CRUCIALLY the vector column must be intact (the path we fixed).
+        restored = _thought_embedding(conn, tid)
+        assert restored is not None, "restored thought must keep its embedding"
+        assert len(restored) == 768, "restored embedding must be 768-dim"
+        assert abs(restored[0] - 0.5) < 1e-4, "restored vector value [0] must match"
+        assert abs(restored[767] - (-0.25)) < 1e-4, "restored vector value [767] must match"
 
 
 # ─── Test class C: Shared-node protection ─────────────────────────────────────
 
 
 class TestSharedNodeProtection:
-    """Integration: a topic node referenced by TWO thoughts must NOT be deleted
-    when one thought is forgotten."""
+    """Integration: a topic node shared by thought A and thought C must survive
+    the forget of A — and CRUCIALLY its edge to the surviving thought C must
+    also remain intact (C2 review fix: the old test could never fail because the
+    scrub never looks up topic nodes at all; this asserts the REAL invariant)."""
 
-    def test_shared_topic_node_survives_forget(self, conn, test_user):
-        """Plant two thoughts with the same topic, forget one, verify topic node
-        still exists in KG (lifecycle_status='active')."""
+    def test_shared_topic_node_and_edge_to_survivor_intact(self, conn, test_user):
+        """Topic node shared by thought A and thought C. After forgetting A:
+        (1) the topic node still exists and is active, AND
+        (2) the TAGGED_WITH edge from thought C to the topic still exists.
+        Only A's own thought-node + A's edge to the topic should be gone."""
         tid_a = _insert_thought(
             conn, test_user, "first thought about shared_topic_xyz",
             topics=["shared_topic_xyz"],
         )
-        tid_b = _insert_thought(
-            conn, test_user, "second thought about shared_topic_xyz",
+        tid_c = _insert_thought(
+            conn, test_user, "survivor thought about shared_topic_xyz",
             topics=["shared_topic_xyz"],
         )
+
+        topic_nk = "topic:shared_topic_xyz"
+        edge_c_id = f"{test_user}|thought:{tid_c}|TAGGED_WITH|{topic_nk}"
 
         # Build KG for both thoughts.
         cur = conn.cursor()
         try:
             # Upsert the shared topic node.
-            topic_nk = "topic:shared_topic_xyz"
             cur.execute(
                 """
                 INSERT INTO brain.knowledge_graph_nodes
@@ -562,8 +673,8 @@ class TestSharedNodeProtection:
             )
             topic_node_id = cur.fetchone()[0]
 
-            # Upsert thought nodes.
-            for tid in (tid_a, tid_b):
+            # Upsert thought nodes + TAGGED_WITH edges.
+            for tid in (tid_a, tid_c):
                 cur.execute(
                     """
                     INSERT INTO brain.knowledge_graph_nodes
@@ -575,7 +686,6 @@ class TestSharedNodeProtection:
                     (f"thought:{tid}", tid[:200], test_user, tid),
                 )
                 thought_node_id = cur.fetchone()[0]
-                # Wire TAGGED_WITH edge.
                 edge_id = f"{test_user}|thought:{tid}|TAGGED_WITH|{topic_nk}"
                 cur.execute(
                     """
@@ -595,28 +705,54 @@ class TestSharedNodeProtection:
 
         # Forget thought A.
         result = open_brain.forget_thought(conn, tid_a, test_user, n=4)
-        # Accept either success or a failure that restores — we only care about the
-        # topic node. If the forget failed for some other reason that's a different bug.
-        assert result["status"] in ("forgotten", "forget-failed-residue", "forget-failed-error")
+        assert result["status"] == "forgotten", (
+            f"Forget of A should succeed cleanly; got {result['status']}"
+        )
 
-        # If forgotten: topic node must still be active.
-        if result["status"] == "forgotten":
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    """
-                    SELECT COUNT(*) FROM brain.knowledge_graph_nodes
-                    WHERE node_nk = %s AND user_id = %s AND lifecycle_status = 'active'
-                    """,
-                    (topic_nk, test_user),
-                )
-                count = int(cur.fetchone()[0])
-            finally:
-                cur.close()
-            assert count == 1, (
-                f"Shared topic node '{topic_nk}' must survive when only one of "
-                f"its thoughts is forgotten"
+        cur = conn.cursor()
+        try:
+            # (1) The shared topic node must still exist and be active.
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.knowledge_graph_nodes
+                WHERE node_nk = %s AND user_id = %s AND lifecycle_status = 'active'
+                """,
+                (topic_nk, test_user),
             )
+            topic_count = int(cur.fetchone()[0])
+            assert topic_count == 1, (
+                f"Shared topic node '{topic_nk}' must survive forgetting A"
+            )
+
+            # (2) The TAGGED_WITH edge from the SURVIVOR thought C to the topic
+            #     must still exist (this is the load-bearing assertion C2 adds).
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.knowledge_graph_edges
+                WHERE edge_id = %s AND user_id = %s
+                """,
+                (edge_c_id, test_user),
+            )
+            survivor_edge_count = int(cur.fetchone()[0])
+            assert survivor_edge_count == 1, (
+                f"Survivor thought C's edge to the shared topic must remain intact "
+                f"after forgetting A; edge '{edge_c_id}' is missing"
+            )
+
+            # (3) A's OWN thought-node must be gone (the thing we did scrub).
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.knowledge_graph_nodes
+                WHERE node_nk = %s AND user_id = %s
+                """,
+                (f"thought:{tid_a}", test_user),
+            )
+            a_node_count = int(cur.fetchone()[0])
+            assert a_node_count == 0, (
+                "Forgotten thought A's own KG node should have been deleted"
+            )
+        finally:
+            cur.close()
 
 
 # ─── Test class D: Paraphrase-degraded honesty (pure logic, no DB) ────────────
@@ -887,6 +1023,7 @@ class TestParaphraseDegradedHonesty:
         assert "versions_snapshot" in result
         assert "replay_rows_snapshot" in result
         assert "kg_node_id" in result
+        assert "kg_node_snapshot" in result  # H3: full node row for lossless restore
         assert "kg_edges_snapshot" in result
         assert "inbound_link_ids" in result
         assert "scrub_counts" in result
@@ -896,3 +1033,40 @@ class TestParaphraseDegradedHonesty:
         assert "atom_links_orphaned" in counts
         assert "kg_node_deleted" in counts
         assert "kg_edges_deleted" in counts
+
+    def test_restore_residue_surfaces_reports_restore_complete(self):
+        """H1 review fix (pure-logic): _restore_residue_surfaces returns a
+        restore_complete bool — True when no surface errored."""
+        class _StubCursor:
+            def execute(self, sql, params=None):
+                pass
+            def fetchone(self):
+                return None
+            def fetchall(self):
+                return []
+            def close(self):
+                pass
+
+        class _StubConn:
+            def cursor(self):
+                return _StubCursor()
+            def rollback(self):
+                pass
+            def commit(self):
+                pass
+
+        # Empty scrub_snapshot → nothing to restore → restore_complete True.
+        result = open_brain._restore_residue_surfaces(
+            _StubConn(), "fake-id", "fake-user",
+            {
+                "versions_snapshot": [],
+                "replay_rows_snapshot": [],
+                "kg_node_id": None,
+                "kg_node_snapshot": None,
+                "kg_edges_snapshot": [],
+                "inbound_link_ids": [],
+            },
+        )
+        assert "restore_complete" in result
+        assert result["restore_complete"] is True
+        assert result["errors"] == []

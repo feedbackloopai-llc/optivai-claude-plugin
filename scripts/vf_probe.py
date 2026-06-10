@@ -642,8 +642,10 @@ def _run_surface_probes(
     2. kg_node        — the thought's own KG node must not exist (if one was
                          present pre-scrub). Shared topic/person/project nodes
                          are not checked here (they are exempt from deletion).
-    3. replay_log     — ILIKE the thought_id against query_redacted AND
-                         result_summary (must be 0 live hits after redaction).
+    3. replay_log     — PRIMARY: any non-tombstoned row whose thought_id FK
+                         column equals the forgotten id IS residue (regardless
+                         of text content). SUPPLEMENTAL: ILIKE id-string scan
+                         catches FK-lost rows. Both must be 0 after scrub.
     4. atom_links_inbound — no link still resolves to the forgotten id as a
                          live target without the orphan tombstone flag set.
 
@@ -712,17 +714,42 @@ def _run_surface_probes(
             ))
 
         # ── 3. replay_log ─────────────────────────────────────────────────────
-        # After Half-A redaction, query_redacted should be NULL and
-        # result_summary should be '[redacted by VF_eps forget]'.
-        # Probe: ILIKE scan for the thought_id string in either field — if the
-        # redaction missed a row, this will find the thought_id embedded in the
-        # text. Also check if the non-tombstoned thought_id FK reference exists.
+        # PRIMARY check (C1 review fix): a SURVIVING non-tombstoned row whose
+        # thought_id FK column equals the forgotten id IS residue, regardless of
+        # whether its text contains the id-string. Real replay rows reference the
+        # forgotten thought via the FK column; their text is a semantic query that
+        # does NOT contain the thought-id string. The prior ILIKE-only check was a
+        # tautology — a fully-intact replay row with semantic text and no id-string
+        # returned 0. The FK-count path closes that hole.
+        #
+        # SUPPLEMENTAL check: ILIKE scan for the id-string catches rows that LOST
+        # their FK (thought_id became NULL via some path) but kept the id in their
+        # text. Both checks are unioned: a row is residue if it matches EITHER.
         try:
+            # PRIMARY: any non-tombstoned row with the FK column set.
             cur.execute(
                 """
                 SELECT COUNT(*) FROM brain.replay_log
                 WHERE user_id = %s
                   AND thought_id = %s
+                  AND NOT (
+                      metadata IS NOT NULL
+                      AND (metadata->>'vf_eps_tombstone')::boolean = true
+                  )
+                """,
+                (uid, tid),
+            )
+            fk_count = int(cur.fetchone()[0])
+
+            # SUPPLEMENTAL: rows that lost the FK but kept the id-string in text.
+            # Exclude rows already counted by the FK path (thought_id = tid) so we
+            # don't double-count; these are rows where thought_id != tid (or NULL)
+            # but the text still names the id.
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.replay_log
+                WHERE user_id = %s
+                  AND (thought_id IS DISTINCT FROM %s)
                   AND (
                       query_redacted ILIKE %s
                       OR result_summary ILIKE %s
@@ -734,13 +761,16 @@ def _run_surface_probes(
                 """,
                 (uid, tid, f"%{tid[:50]}%", f"%{tid[:50]}%"),
             )
-            count = int(cur.fetchone()[0])
+            text_count = int(cur.fetchone()[0])
+
+            count = fk_count + text_count
             results.append(SurfaceProbeResult(
                 surface="replay_log",
                 residue_count=count,
                 surfaced_forgotten=(count > 0),
                 detail=(
-                    f"{count} replay_log rows contain thought_id text after redaction"
+                    f"{fk_count} replay_log rows with FK to forgotten thought + "
+                    f"{text_count} rows with id-string in text (post-scrub residue)"
                     if count > 0 else None
                 ),
             ))

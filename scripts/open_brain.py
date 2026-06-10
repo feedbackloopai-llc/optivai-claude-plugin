@@ -1331,6 +1331,8 @@ def _scrub_residue_surfaces(
         versions_snapshot     list of dicts (one per thought_versions row)
         replay_rows_snapshot  list of dicts (one per replay_log row to redact)
         kg_node_id            str | None  (the thought's own KG node id, if any)
+        kg_node_snapshot      dict | None (full node row: node_type, definition,
+                              lifecycle_status, created_at, etc. for lossless restore)
         kg_edges_snapshot     list of dicts (edges involving the thought node)
         inbound_link_ids      list of int (atom_links.link_id for inbound targets)
         scrub_counts          dict of surface -> int (rows affected per surface)
@@ -1345,6 +1347,7 @@ def _scrub_residue_surfaces(
     versions_snapshot: list = []
     replay_rows_snapshot: list = []
     kg_node_id: Optional[str] = None
+    kg_node_snapshot: Optional[Dict[str, Any]] = None  # H3: full node row for restore
     kg_edges_snapshot: list = []
     inbound_link_ids: list = []
 
@@ -1487,7 +1490,10 @@ def _scrub_residue_surfaces(
                         "created_at": erow[6],
                     })
 
-                # Snapshot the node itself.
+                # Snapshot the node itself (H3 review fix: fetchone() the result —
+                # previously the SELECT ran but the row was discarded, so restore
+                # had to re-derive the node from thoughts.summary, losing
+                # node_type / definition / lifecycle_status / created_at).
                 cur.execute(
                     """
                     SELECT node_id, node_nk, node_type, name, definition,
@@ -1498,6 +1504,20 @@ def _scrub_residue_surfaces(
                     """,
                     (kg_node_id,),
                 )
+                node_snapshot_row = cur.fetchone()
+                if node_snapshot_row is not None:
+                    kg_node_snapshot = {
+                        "node_id": node_snapshot_row[0],
+                        "node_nk": node_snapshot_row[1],
+                        "node_type": node_snapshot_row[2],
+                        "name": node_snapshot_row[3],
+                        "definition": node_snapshot_row[4],
+                        "user_id": node_snapshot_row[5],
+                        "source_thought_id": node_snapshot_row[6],
+                        "lifecycle_status": node_snapshot_row[7],
+                        "created_at": node_snapshot_row[8],
+                        "updated_at": node_snapshot_row[9],
+                    }
 
                 # Delete edges first (FK source/target → nodes), then the node.
                 if kg_edges_snapshot:
@@ -1522,6 +1542,7 @@ def _scrub_residue_surfaces(
             conn.rollback()
             logger.debug(f"_scrub_residue_surfaces: KG scrub skipped: {kg_err}")
             kg_node_id = None
+            kg_node_snapshot = None
             kg_edges_snapshot = []
 
     except Exception:
@@ -1534,6 +1555,7 @@ def _scrub_residue_surfaces(
         "versions_snapshot": versions_snapshot,
         "replay_rows_snapshot": replay_rows_snapshot,
         "kg_node_id": kg_node_id,
+        "kg_node_snapshot": kg_node_snapshot,
         "kg_edges_snapshot": kg_edges_snapshot,
         "inbound_link_ids": inbound_link_ids,
         "scrub_counts": scrub_counts,
@@ -1552,7 +1574,11 @@ def _restore_residue_surfaces(
     must be unwound. GUARANTEED restore: thought_versions. BEST-EFFORT restore:
     KG node + edges, replay_log un-redaction, atom_links un-orphaning.
 
-    Returns a dict with per-surface restore counts and any errors encountered.
+    Returns a dict with per-surface restore counts, any errors encountered, and
+    a top-level ``restore_complete`` bool (H1 review fix): True iff every
+    surface restored without error. When False, the caller MUST surface a
+    distinct status ('forget-failed-partial-restore') so a consumer is not
+    misled into believing the graph is consistent.
     """
     restore_counts: Dict[str, Any] = {
         "thought_versions": 0,
@@ -1561,6 +1587,7 @@ def _restore_residue_surfaces(
         "kg_node_restored": 0,
         "kg_edges_restored": 0,
         "errors": [],
+        "restore_complete": True,  # H1: set False if any best-effort restore raises
     }
 
     cur = conn.cursor()
@@ -1568,10 +1595,19 @@ def _restore_residue_surfaces(
         # ── GUARANTEED: Re-insert thought_versions ────────────────────────────
         for v in scrub_snapshot.get("versions_snapshot", []):
             try:
+                # Conditional vector cast (H2 review fix): schema-qualify
+                # public.vector when non-NULL (Neon pooler search_path safety);
+                # use a bare NULL literal when the version had no embedding so
+                # NULL::vector cannot fail.
+                v_embedding = v.get("embedding")
+                if v_embedding is not None:
+                    v_emb_sql = "%s::public.vector"
+                else:
+                    v_emb_sql = "NULL"
                 # Re-insert with original version_id if bigserial allows it —
                 # use INSERT ... ON CONFLICT DO NOTHING to be idempotent.
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO brain.thought_versions (
                         version_id, thought_id, revision, raw_text, summary,
                         thought_type, topics, people, action_items,
@@ -1580,7 +1616,7 @@ def _restore_residue_surfaces(
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
-                        %s::vector, %s::jsonb, %s, %s,
+                        {v_emb_sql}, %s::jsonb, %s, %s,
                         %s, %s::jsonb, %s
                     )
                     ON CONFLICT (thought_id, revision) DO NOTHING
@@ -1591,7 +1627,10 @@ def _restore_residue_surfaces(
                         json.dumps(v["topics"]) if v["topics"] is not None else None,
                         json.dumps(v["people"]) if v["people"] is not None else None,
                         json.dumps(v["action_items"]) if v["action_items"] is not None else None,
-                        v["embedding"], json.dumps(v["metadata"]) if v["metadata"] is not None else None,
+                    )
+                    + ((v_embedding,) if v_embedding is not None else ())
+                    + (
+                        json.dumps(v["metadata"]) if v["metadata"] is not None else None,
                         v["prov_agent"], v["prov_activity"],
                         v["parent_version"],
                         json.dumps(v["diff_json"]) if v["diff_json"] is not None else None,
@@ -1649,6 +1688,7 @@ def _restore_residue_surfaces(
         # ── BEST-EFFORT: Restore KG node + edges ─────────────────────────────
         try:
             node_id = scrub_snapshot.get("kg_node_id")
+            node_snap = scrub_snapshot.get("kg_node_snapshot")
             if node_id is not None:
                 # Re-insert the thought node (it was deleted, so no conflict
                 # expected; use ON CONFLICT DO NOTHING for safety).
@@ -1660,26 +1700,53 @@ def _restore_residue_surfaces(
                     (node_id,),
                 )
                 if cur.fetchone() is None:
-                    # Node was deleted — look up thought row to get summary/nk.
-                    cur.execute(
-                        """
-                        SELECT summary FROM brain.thoughts
-                        WHERE thought_id = %s AND user_id = %s
-                        """,
-                        (thought_id, user_id),
-                    )
-                    summary_row = cur.fetchone()
-                    node_name = (summary_row[0] or thought_id)[:200] if summary_row else thought_id[:200]
-                    cur.execute(
-                        """
-                        INSERT INTO brain.knowledge_graph_nodes
-                               (node_id, node_nk, node_type, name, user_id,
-                                source_thought_id, lifecycle_status)
-                        VALUES (%s, %s, 'thought', %s, %s, %s, 'active')
-                        ON CONFLICT (node_nk, user_id) DO NOTHING
-                        """,
-                        (node_id, f"thought:{thought_id}", node_name, user_id, thought_id),
-                    )
+                    # H3 review fix: rebuild the node from the FULL snapshot
+                    # (node_type, definition, lifecycle_status, created_at,
+                    # updated_at), not re-derived from thoughts.summary. Fall
+                    # back to thoughts.summary only if the snapshot is missing.
+                    if node_snap is not None:
+                        cur.execute(
+                            """
+                            INSERT INTO brain.knowledge_graph_nodes
+                                   (node_id, node_nk, node_type, name, definition,
+                                    user_id, source_thought_id, lifecycle_status,
+                                    created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (node_nk, user_id) DO NOTHING
+                            """,
+                            (
+                                node_snap["node_id"], node_snap["node_nk"],
+                                node_snap["node_type"], node_snap["name"],
+                                node_snap["definition"], node_snap["user_id"],
+                                node_snap["source_thought_id"],
+                                node_snap["lifecycle_status"],
+                                node_snap["created_at"], node_snap["updated_at"],
+                            ),
+                        )
+                    else:
+                        # Defensive fallback: snapshot missing (older scrub path).
+                        cur.execute(
+                            """
+                            SELECT summary FROM brain.thoughts
+                            WHERE thought_id = %s AND user_id = %s
+                            """,
+                            (thought_id, user_id),
+                        )
+                        summary_row = cur.fetchone()
+                        node_name = (
+                            (summary_row[0] or thought_id)[:200]
+                            if summary_row else thought_id[:200]
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO brain.knowledge_graph_nodes
+                                   (node_id, node_nk, node_type, name, user_id,
+                                    source_thought_id, lifecycle_status)
+                            VALUES (%s, %s, 'thought', %s, %s, %s, 'active')
+                            ON CONFLICT (node_nk, user_id) DO NOTHING
+                            """,
+                            (node_id, f"thought:{thought_id}", node_name, user_id, thought_id),
+                        )
                     restore_counts["kg_node_restored"] = 1
 
                 # Re-insert edges.
@@ -1710,6 +1777,8 @@ def _restore_residue_surfaces(
     finally:
         cur.close()
 
+    # H1 review fix: restore_complete is True iff no best-effort restore raised.
+    restore_counts["restore_complete"] = len(restore_counts["errors"]) == 0
     return restore_counts
 
 
@@ -1851,11 +1920,18 @@ def forget_thought(
         # Restore thought row first (guaranteed), then residue surfaces (best-effort).
         _restore_thought(conn, thought_id, restore_row)
         restore_detail = _restore_residue_surfaces(conn, thought_id, user_id, scrub_snapshot)
+        # H1 review fix: if a best-effort restore raised, the graph is left
+        # inconsistent — surface a distinct status so consumers are not misled.
+        restore_complete = bool(restore_detail.get("restore_complete", True))
+        err_status = (
+            "forget-failed-error" if restore_complete
+            else "forget-failed-partial-restore"
+        )
         audit_id = _emit_forget_audit(
             conn,
             thought_id=thought_id,
             user_id=user_id,
-            status="forget-failed-error",
+            status=err_status,
             n=n,
             k=0,
             epsilon=epsilon,
@@ -1871,9 +1947,11 @@ def forget_thought(
             scrub_counts=scrub_snapshot.get("scrub_counts", {}),
             paraphrase_degraded=False,
             actual_distribution={},
+            restore_complete=restore_complete,
             diagnostic={
                 "verify_exception": str(e),
                 "restored": True,
+                "restore_complete": restore_complete,
                 "restore_detail": restore_detail,
             },
         )
@@ -1883,24 +1961,26 @@ def forget_thought(
             user_id=user_id,
             event_type="forget",
             thought_id=thought_id,
-            result_text=f"forget-failed-error audit_id={audit_id} error={str(e)[:80]}",
+            result_text=f"{err_status} audit_id={audit_id} error={str(e)[:80]}",
             prov_agent=prov_agent,
             metadata={
-                "status": "forget-failed-error",
+                "status": err_status,
                 "audit_id": int(audit_id),
                 "n": int(n),
                 "k": 0,
                 "epsilon": float(epsilon),
                 "restored": True,
+                "restore_complete": restore_complete,
             },
         )
         return {
             "thought_id": thought_id,
-            "status": "forget-failed-error",
+            "status": err_status,
             "audit_id": audit_id,
             "audit": {
                 "error": str(e),
                 "restored": True,
+                "restore_complete": restore_complete,
                 "n": n,
                 "k": 0,
                 "epsilon": epsilon,
@@ -1909,19 +1989,31 @@ def forget_thought(
 
     # Step 6 / 7: decision based on accepted flag.
     accepted = verify_result.accepted
+    restore_complete = True  # vacuously true on accept (nothing restored)
     if not accepted:
         # k > 0: residue detected — restore thought row first (guaranteed),
         # then residue surfaces (best-effort). Audit row is the durable record.
         _restore_thought(conn, thought_id, restore_row)
         restore_detail = _restore_residue_surfaces(conn, thought_id, user_id, scrub_snapshot)
+        # H1 review fix: a best-effort restore failure leaves the graph
+        # inconsistent — surface a distinct status so consumers know the
+        # rejected forget did not cleanly unwind.
+        restore_complete = bool(restore_detail.get("restore_complete", True))
     else:
         restore_detail = None
+
+    if accepted:
+        forget_status = "forgotten"
+    elif restore_complete:
+        forget_status = "forget-failed-residue"
+    else:
+        forget_status = "forget-failed-partial-restore"
 
     audit_id = _emit_forget_audit(
         conn,
         thought_id=thought_id,
         user_id=user_id,
-        status="forgotten" if accepted else "forget-failed-residue",
+        status=forget_status,
         n=verify_result.n,
         k=verify_result.k,
         epsilon=verify_result.epsilon,
@@ -1932,6 +2024,7 @@ def forget_thought(
         scrub_counts=scrub_snapshot.get("scrub_counts", {}),
         paraphrase_degraded=verify_result.probeQuality.get("paraphrase_degraded", False),
         actual_distribution=verify_result.probeQuality.get("actual_distribution", {}),
+        restore_complete=restore_complete,
         diagnostic=(
             None
             if accepted
@@ -1941,13 +2034,13 @@ def forget_thought(
                     if p.get("surfaced_forgotten")
                 ],
                 "restored": True,
+                "restore_complete": restore_complete,
                 "restore_detail": restore_detail,
             }
         ),
     )
 
     # brain-W2-S6: replay-log emission (verify-decision branch). Best-effort.
-    forget_status = "forgotten" if accepted else "forget-failed-residue"
     emit_replay_log(
         conn,
         user_id=user_id,
@@ -1964,12 +2057,13 @@ def forget_thought(
             "n": int(verify_result.n),
             "k": int(verify_result.k),
             "epsilon": float(verify_result.epsilon),
+            "restore_complete": restore_complete,
         },
     )
 
     return {
         "thought_id": thought_id,
-        "status": "forgotten" if accepted else "forget-failed-residue",
+        "status": forget_status,
         "audit_id": audit_id,
         "audit": {
             "n": verify_result.n,
@@ -1982,6 +2076,7 @@ def forget_thought(
             "probeQuality": verify_result.probeQuality,
             "prov_agent": prov_agent,
             "scrub_counts": scrub_snapshot.get("scrub_counts", {}),
+            "restore_complete": restore_complete,
         },
     }
 
@@ -2018,8 +2113,12 @@ def _restore_thought(conn, thought_id: str, restore_row: tuple) -> None:
     try:
         # Use a conditional cast for the vector column: NULL::vector fails when
         # pgvector is not in the current schema search_path; cast only when non-NULL.
+        # H2 review fix: schema-qualify as public.vector — Neon's connection pooler
+        # can reset search_path between statements mid-transaction, so an
+        # unqualified ::vector cast fails with "type vector does not exist" exactly
+        # on the restore path (proven by test_nonnull_embedding_restored_on_failure).
         if embedding is not None:
-            embedding_sql = "%s::vector"
+            embedding_sql = "%s::public.vector"
             embedding_val = embedding
         else:
             embedding_sql = "NULL"
@@ -2078,27 +2177,34 @@ def _emit_forget_audit(
     scrub_counts: Optional[Dict[str, Any]] = None,
     paraphrase_degraded: bool = False,
     actual_distribution: Optional[Dict[str, int]] = None,
+    restore_complete: bool = True,
     diagnostic: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Insert one row into ``brain.forget_audit``; return its ``audit_id``.
 
-    Procurement-grade audit (fblai-152r8 Half-C honesty additions):
+    Procurement-grade audit (fblai-152r8 Half-C + review-fix honesty additions):
     - BOTH bounds and confidences are stored as distinct labeled columns (R2).
     - probe_quality_json is augmented with scrub_counts (what surfaces were
       scrubbed), paraphrase_degraded flag (true when ANTHROPIC_API_KEY absent
       and paraphrase probes degrade to partial), and actual_distribution (the
       real probe counts executed, not the nominal 40/30/20/10).
+    - restore_complete (H1 review fix) records whether a rejected/errored forget
+      cleanly unwound. False means the graph is left inconsistent — the caller
+      surfaces status 'forget-failed-partial-restore' in that case. The flag is
+      a top-level key in probe_quality_json so a consumer reading the audit row
+      has an honest signal without reaching into diagnostic_json.
     - The binomial bound conditions on probe sensitivity across scrubbed
       surfaces; if paraphrase_degraded=True the actual distribution differs
       from the nominal and this is recorded explicitly.
     """
-    # Augment probe_quality with honesty fields (fblai-152r8 Half-C).
+    # Augment probe_quality with honesty fields (fblai-152r8 Half-C + review).
     probe_quality_full = dict(probe_quality)
     if scrub_counts is not None:
         probe_quality_full["scrub_counts"] = scrub_counts
     probe_quality_full["paraphrase_degraded"] = paraphrase_degraded
     if actual_distribution is not None:
         probe_quality_full["actual_distribution"] = actual_distribution
+    probe_quality_full["restore_complete"] = restore_complete
 
     cur = conn.cursor()
     try:
