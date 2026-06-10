@@ -1104,6 +1104,10 @@ def rollback_thought(
         new_version_id = cur.fetchone()[0]
 
         # Update the live brain.thoughts row to match the rolled-back content.
+        # RB completeness (fblai-aulcu): also SET prov_agent/prov_activity on
+        # the live row so it reflects the rollback event — without this the
+        # live row retains the original capture's PROV-DM fields, misleading
+        # callers (search/recent/timeline all read the live row).
         cur.execute(
             """
             UPDATE brain.thoughts
@@ -1114,6 +1118,8 @@ def rollback_thought(
                 people = %s::jsonb,
                 action_items = %s::jsonb,
                 metadata = %s::jsonb,
+                prov_agent = %s,
+                prov_activity = 'rollback',
                 updated_at = NOW()
             WHERE thought_id = %s
             """,
@@ -1123,6 +1129,7 @@ def rollback_thought(
                 json.dumps(people) if people is not None else None,
                 json.dumps(action_items) if action_items is not None else None,
                 json.dumps(metadata) if metadata is not None else None,
+                prov_agent,
                 thought_id,
             ),
         )
@@ -4313,6 +4320,28 @@ def register_skill(
         prov_activity="skill_register",
     )
     skill_id = cap["thought_id"]
+
+    # RB completeness (fblai-aulcu): snapshot the just-captured atom's
+    # pre-stamp state BEFORE _stamp_skill_metadata mutates the live row.
+    # This creates a thought_versions row so the skill registration is
+    # versioned and can be rolled back. prov_activity='skill_register'
+    # labels the snapshot for audit traceability.
+    try:
+        snapshot_thought(
+            conn,
+            thought_id=skill_id,
+            user_id=user_id,
+            prov_agent=prov_agent,
+            prov_activity="skill_register",
+        )
+    except Exception as _snap_err:
+        # Snapshot failure is non-fatal: the composite operation continues
+        # so a transient versioning error does not block skill registration.
+        # Log to stderr so the caller can observe and investigate.
+        sys.stderr.write(
+            f"Warning: snapshot_thought failed before skill stamp "
+            f"(skill_id={skill_id}): {_snap_err}\n"
+        )
 
     # Force thought_type='skill_ref' + inject pearl_kind + skill_name.
     # The LLM metadata extractor will have classified the body as
