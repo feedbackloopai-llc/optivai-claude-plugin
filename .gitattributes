@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.whl binary
+*.sh text eol=lf
+*.py text eol=lf
+*.ts text eol=lf
+*.md text eol=lf
