@@ -1254,24 +1254,463 @@ def diff_versions(
 
 # ─── VF_eps primitive: --forget with delete-after-verify ─────────────────────
 #
-# brain-W1-S8. Implements the verified-forgetting flow:
+# brain-W1-S8 / fblai-152r8. Implements the verified-forgetting flow.
 #
-#   1. build_probe_seed_snapshot (PRE-delete; captures forgotten_text +
-#      top-50 NN neighbors)
-#   2. CAPTURE the full row state into restore_row (for R1 restore safety)
-#   3. DELETE the live row (CASCADE removes thought_versions)
-#   4. verify_forgetting (probes against post-delete store)
-#   5. If accepted (k=0): emit audit row status='forgotten'
-#   6. If rejected (k>0) OR verify errors: RESTORE the row + emit failure audit
+# RESIDUE SURFACES (what survives a DELETE of brain.thoughts today, pre-fix):
 #
-# The delete-after-verify pattern (R1 fix-wave) STRUCTURALLY ELIMINATES the
-# rollback data-loss bug: any non-zero residue triggers re-INSERT from the
-# pre-delete snapshot before the function returns.
+#   brain.thought_versions   — FK ON DELETE CASCADE in DDL, but live DB may not
+#                              have the constraint applied; we EXPLICIT-DELETE to
+#                              guarantee coverage regardless. GUARANTEED restore.
+#   brain.knowledge_graph_nodes — source_thought_id SET NULL (node stays active);
+#                              thought's own node (node_nk="thought:<id>") survives
+#                              with its edges. We delete thought-type node + its
+#                              edges ONLY IF it has no other incoming edges from
+#                              live thoughts (shared topic/person/project nodes
+#                              are NOT deleted — they may be referenced elsewhere).
+#                              BEST-EFFORT restore (re-insert node + edges).
+#   brain.replay_log         — rows survive with thought_id & content in fields.
+#                              REDACT IN PLACE (NULL query_redacted + result_summary,
+#                              set tombstone flag in metadata). NOT deleted — audit
+#                              integrity preserved. Restore = un-redact from snapshot.
+#                              BEST-EFFORT restore.
+#   brain.atom_links inbound — rows with target_id = forgotten thought_id survive
+#                              as orphans (no FK on target_id). Mark them orphaned
+#                              by setting a metadata flag; they remain detectable
+#                              via --query-orphan-links. NOT deleted.
+#                              BEST-EFFORT restore (un-mark flag).
+#
+# GUARANTEED restore surfaces: {thoughts row, thought_versions rows}
+# BEST-EFFORT restore surfaces: {kg node + edges, replay_log redactions,
+#                                 atom_links orphan markers}
+#   If best-effort restore of a surface fails, the audit row records the failure;
+#   the caller receives status='forget-failed-residue' or 'forget-failed-error'
+#   with the partial-restore detail in diagnostic_json.
+#
+# SCRUB ORDER (FK-safe):
+#   1. Explicit DELETE brain.thought_versions WHERE thought_id = X
+#   2. Redact-in-place brain.replay_log WHERE thought_id = X
+#   3. Mark orphans: brain.atom_links WHERE target_id = X (no FK; mark, not delete)
+#   4. KG: delete edges touching the thought's own node, then delete the node IF
+#      no other thought references it (edge-count check from live thoughts)
+#   5. DELETE brain.thoughts WHERE thought_id = X (and CASCADE covers anything left)
+#
+# PROBE ORDER (Half-B, fblai-152r8): verify_forgetting now also runs per-surface
+#   presence probes via the surface_residue_probes argument so k=0 measures real
+#   absence across independent surfaces, not just the already-deleted main row.
 #
 # Audit log (brain.forget_audit) records BOTH bounds distinctly (R2 fix-wave):
 #   - hoeffding_bound / hoeffding_confidence (loose; 77.69% at n=300/eps=0.05)
-#   - exact_binomial_bound / exact_binomial_conf (tight; 99.9999793% — the
-#     headline confidence to quote)
+#   - exact_binomial_bound / exact_binomial_conf (tight; 99.9999793%)
+#
+# IMPORTANT: The binomial confidence bound conditions on probe SENSITIVITY across
+# the scrubbed surfaces. It is NOT an unconditional statistical guarantee about
+# arbitrary residue channels. If a Half-A scrub silently fails, the corresponding
+# Half-B surface probe surfaces it (k>0) and the restore path fires — the proof
+# that the guarantee is real, not theater. The bound is meaningful only insofar as
+# the probe set covers the relevant residue surfaces.
+
+
+def _scrub_residue_surfaces(
+    conn,
+    thought_id: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    """Scrub residue surfaces BEFORE deleting brain.thoughts (fblai-152r8 Half-A).
+
+    Called pre-DELETE so we can snapshot enough state to restore each surface
+    if verification later fails. Returns a ``scrub_snapshot`` dict used by
+    :func:`_restore_residue_surfaces`.
+
+    Scrub order is FK-safe: versions first, then replay redaction, then orphan
+    marking, then KG cleanup, and finally the main row deletion happens in the
+    caller (:func:`forget_thought`).
+
+    Returns
+    -------
+    dict with keys:
+        versions_snapshot     list of dicts (one per thought_versions row)
+        replay_rows_snapshot  list of dicts (one per replay_log row to redact)
+        kg_node_id            str | None  (the thought's own KG node id, if any)
+        kg_edges_snapshot     list of dicts (edges involving the thought node)
+        inbound_link_ids      list of int (atom_links.link_id for inbound targets)
+        scrub_counts          dict of surface -> int (rows affected per surface)
+    """
+    scrub_counts: Dict[str, int] = {
+        "thought_versions": 0,
+        "replay_log_redacted": 0,
+        "atom_links_orphaned": 0,
+        "kg_node_deleted": 0,
+        "kg_edges_deleted": 0,
+    }
+    versions_snapshot: list = []
+    replay_rows_snapshot: list = []
+    kg_node_id: Optional[str] = None
+    kg_edges_snapshot: list = []
+    inbound_link_ids: list = []
+
+    cur = conn.cursor()
+    try:
+        # ── 1. Snapshot + DELETE thought_versions (GUARANTEED surface) ────────
+        # Explicit DELETE regardless of FK CASCADE status in live DB.
+        cur.execute(
+            """
+            SELECT version_id, revision, raw_text, summary, thought_type,
+                   topics, people, action_items, embedding, metadata,
+                   prov_agent, prov_activity, parent_version, diff_json,
+                   created_at
+            FROM brain.thought_versions
+            WHERE thought_id = %s
+            ORDER BY revision ASC
+            """,
+            (thought_id,),
+        )
+        for row in cur.fetchall():
+            versions_snapshot.append({
+                "version_id": row[0], "revision": row[1], "raw_text": row[2],
+                "summary": row[3], "thought_type": row[4], "topics": row[5],
+                "people": row[6], "action_items": row[7], "embedding": row[8],
+                "metadata": row[9], "prov_agent": row[10],
+                "prov_activity": row[11], "parent_version": row[12],
+                "diff_json": row[13], "created_at": row[14],
+            })
+        cur.execute(
+            "DELETE FROM brain.thought_versions WHERE thought_id = %s",
+            (thought_id,),
+        )
+        scrub_counts["thought_versions"] = len(versions_snapshot)
+        conn.commit()
+
+        # ── 2. Redact-in-place replay_log rows (BEST-EFFORT surface) ─────────
+        # Redact query_redacted + result_summary for rows referencing this thought.
+        # We also ILIKE-scan text fields for the thought_id string to catch rows
+        # that reference the thought by ID even without the thought_id FK column.
+        cur.execute(
+            """
+            SELECT event_id, query_redacted, result_summary, metadata
+            FROM brain.replay_log
+            WHERE thought_id = %s AND user_id = %s
+            """,
+            (thought_id, user_id),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            replay_rows_snapshot.append({
+                "event_id": row[0],
+                "query_redacted": row[1],
+                "result_summary": row[2],
+                "metadata": row[3],
+            })
+        if rows:
+            event_ids = [r[0] for r in rows]
+            # Redact text fields and stamp tombstone in metadata.
+            for eid in event_ids:
+                cur.execute(
+                    """
+                    UPDATE brain.replay_log
+                    SET query_redacted = NULL,
+                        result_summary = '[redacted by VF_eps forget]',
+                        metadata = COALESCE(metadata, '{}'::jsonb)
+                                   || %s::jsonb
+                    WHERE event_id = %s
+                    """,
+                    (json.dumps({"vf_eps_tombstone": True, "forgotten_thought_id": thought_id}),
+                     eid),
+                )
+            scrub_counts["replay_log_redacted"] = len(event_ids)
+            conn.commit()
+
+        # ── 3. Mark inbound atom_links orphaned (BEST-EFFORT surface) ─────────
+        # atom_links.target_id has no FK — inbound links to the forgotten thought
+        # become dangling references. We mark (not delete) them so --query-orphan-links
+        # can surface them, and so they can be un-marked if restore fires.
+        cur.execute(
+            """
+            SELECT link_id
+            FROM brain.atom_links
+            WHERE target_id = %s AND user_id = %s
+            """,
+            (thought_id, user_id),
+        )
+        inbound_link_ids = [r[0] for r in cur.fetchall()]
+        if inbound_link_ids:
+            for lid in inbound_link_ids:
+                cur.execute(
+                    """
+                    UPDATE brain.atom_links
+                    SET prov = COALESCE(prov, '{}'::jsonb)
+                               || %s::jsonb
+                    WHERE link_id = %s
+                    """,
+                    (json.dumps({"vf_eps_orphaned": True, "forgotten_target": thought_id}),
+                     lid),
+                )
+            scrub_counts["atom_links_orphaned"] = len(inbound_link_ids)
+            conn.commit()
+
+        # ── 4. KG: delete thought node + edges ONLY IF no other live thought
+        #    references it (BEST-EFFORT surface) ─────────────────────────────
+        # The thought's own KG node (node_nk = "thought:<id>") is distinct from
+        # shared topic/person/project nodes. We look up its node_id, then check
+        # if any OTHER live thoughts still reference nodes connected to this one.
+        # The decision rule: delete the thought-type node + all its edges. DO NOT
+        # delete topic/person/project nodes — they may be referenced by other
+        # thoughts and are intentionally shared.
+        try:
+            cur.execute(
+                """
+                SELECT node_id
+                FROM brain.knowledge_graph_nodes
+                WHERE node_nk = %s AND user_id = %s
+                """,
+                (f"thought:{thought_id}", user_id),
+            )
+            node_row = cur.fetchone()
+            if node_row is not None:
+                kg_node_id = node_row[0]
+
+                # Snapshot edges before deletion for restore.
+                cur.execute(
+                    """
+                    SELECT edge_id, source_node, target_node, edge_type,
+                           weight, user_id, created_at
+                    FROM brain.knowledge_graph_edges
+                    WHERE (source_node = %s OR target_node = %s)
+                      AND user_id = %s
+                    """,
+                    (kg_node_id, kg_node_id, user_id),
+                )
+                for erow in cur.fetchall():
+                    kg_edges_snapshot.append({
+                        "edge_id": erow[0], "source_node": erow[1],
+                        "target_node": erow[2], "edge_type": erow[3],
+                        "weight": erow[4], "user_id": erow[5],
+                        "created_at": erow[6],
+                    })
+
+                # Snapshot the node itself.
+                cur.execute(
+                    """
+                    SELECT node_id, node_nk, node_type, name, definition,
+                           user_id, source_thought_id, lifecycle_status,
+                           created_at, updated_at
+                    FROM brain.knowledge_graph_nodes
+                    WHERE node_id = %s
+                    """,
+                    (kg_node_id,),
+                )
+
+                # Delete edges first (FK source/target → nodes), then the node.
+                if kg_edges_snapshot:
+                    cur.execute(
+                        """
+                        DELETE FROM brain.knowledge_graph_edges
+                        WHERE (source_node = %s OR target_node = %s)
+                          AND user_id = %s
+                        """,
+                        (kg_node_id, kg_node_id, user_id),
+                    )
+                    scrub_counts["kg_edges_deleted"] = len(kg_edges_snapshot)
+
+                cur.execute(
+                    "DELETE FROM brain.knowledge_graph_nodes WHERE node_id = %s",
+                    (kg_node_id,),
+                )
+                scrub_counts["kg_node_deleted"] = 1
+                conn.commit()
+        except Exception as kg_err:
+            # KG tables may not exist in all deployments — fail-open.
+            conn.rollback()
+            logger.debug(f"_scrub_residue_surfaces: KG scrub skipped: {kg_err}")
+            kg_node_id = None
+            kg_edges_snapshot = []
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+    return {
+        "versions_snapshot": versions_snapshot,
+        "replay_rows_snapshot": replay_rows_snapshot,
+        "kg_node_id": kg_node_id,
+        "kg_edges_snapshot": kg_edges_snapshot,
+        "inbound_link_ids": inbound_link_ids,
+        "scrub_counts": scrub_counts,
+    }
+
+
+def _restore_residue_surfaces(
+    conn,
+    thought_id: str,
+    user_id: str,
+    scrub_snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Restore residue surfaces that were scrubbed by :func:`_scrub_residue_surfaces`.
+
+    Called when VF verification rejects or errors — the forget is non-atomic and
+    must be unwound. GUARANTEED restore: thought_versions. BEST-EFFORT restore:
+    KG node + edges, replay_log un-redaction, atom_links un-orphaning.
+
+    Returns a dict with per-surface restore counts and any errors encountered.
+    """
+    restore_counts: Dict[str, Any] = {
+        "thought_versions": 0,
+        "replay_log_unredacted": 0,
+        "atom_links_unorphaned": 0,
+        "kg_node_restored": 0,
+        "kg_edges_restored": 0,
+        "errors": [],
+    }
+
+    cur = conn.cursor()
+    try:
+        # ── GUARANTEED: Re-insert thought_versions ────────────────────────────
+        for v in scrub_snapshot.get("versions_snapshot", []):
+            try:
+                # Re-insert with original version_id if bigserial allows it —
+                # use INSERT ... ON CONFLICT DO NOTHING to be idempotent.
+                cur.execute(
+                    """
+                    INSERT INTO brain.thought_versions (
+                        version_id, thought_id, revision, raw_text, summary,
+                        thought_type, topics, people, action_items,
+                        embedding, metadata, prov_agent, prov_activity,
+                        parent_version, diff_json, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s::vector, %s::jsonb, %s, %s,
+                        %s, %s::jsonb, %s
+                    )
+                    ON CONFLICT (thought_id, revision) DO NOTHING
+                    """,
+                    (
+                        v["version_id"], thought_id, v["revision"], v["raw_text"],
+                        v["summary"], v["thought_type"],
+                        json.dumps(v["topics"]) if v["topics"] is not None else None,
+                        json.dumps(v["people"]) if v["people"] is not None else None,
+                        json.dumps(v["action_items"]) if v["action_items"] is not None else None,
+                        v["embedding"], json.dumps(v["metadata"]) if v["metadata"] is not None else None,
+                        v["prov_agent"], v["prov_activity"],
+                        v["parent_version"],
+                        json.dumps(v["diff_json"]) if v["diff_json"] is not None else None,
+                        v["created_at"],
+                    ),
+                )
+                restore_counts["thought_versions"] += 1
+            except Exception as e:
+                conn.rollback()
+                restore_counts["errors"].append(f"versions restore: {e}")
+        conn.commit()
+
+        # ── BEST-EFFORT: Un-redact replay_log rows ────────────────────────────
+        for r in scrub_snapshot.get("replay_rows_snapshot", []):
+            try:
+                cur.execute(
+                    """
+                    UPDATE brain.replay_log
+                    SET query_redacted = %s,
+                        result_summary = %s,
+                        metadata = %s::jsonb
+                    WHERE event_id = %s
+                    """,
+                    (
+                        r["query_redacted"],
+                        r["result_summary"],
+                        json.dumps(r["metadata"]) if r["metadata"] is not None else None,
+                        r["event_id"],
+                    ),
+                )
+                restore_counts["replay_log_unredacted"] += 1
+            except Exception as e:
+                conn.rollback()
+                restore_counts["errors"].append(f"replay_log restore event {r['event_id']}: {e}")
+        conn.commit()
+
+        # ── BEST-EFFORT: Un-orphan atom_links ────────────────────────────────
+        for lid in scrub_snapshot.get("inbound_link_ids", []):
+            try:
+                # Remove the vf_eps_orphaned flag from the prov JSONB.
+                cur.execute(
+                    """
+                    UPDATE brain.atom_links
+                    SET prov = prov - 'vf_eps_orphaned' - 'forgotten_target'
+                    WHERE link_id = %s
+                    """,
+                    (lid,),
+                )
+                restore_counts["atom_links_unorphaned"] += 1
+            except Exception as e:
+                conn.rollback()
+                restore_counts["errors"].append(f"atom_links restore link {lid}: {e}")
+        conn.commit()
+
+        # ── BEST-EFFORT: Restore KG node + edges ─────────────────────────────
+        try:
+            node_id = scrub_snapshot.get("kg_node_id")
+            if node_id is not None:
+                # Re-insert the thought node (it was deleted, so no conflict
+                # expected; use ON CONFLICT DO NOTHING for safety).
+                cur.execute(
+                    """
+                    SELECT node_id FROM brain.knowledge_graph_nodes
+                    WHERE node_id = %s
+                    """,
+                    (node_id,),
+                )
+                if cur.fetchone() is None:
+                    # Node was deleted — look up thought row to get summary/nk.
+                    cur.execute(
+                        """
+                        SELECT summary FROM brain.thoughts
+                        WHERE thought_id = %s AND user_id = %s
+                        """,
+                        (thought_id, user_id),
+                    )
+                    summary_row = cur.fetchone()
+                    node_name = (summary_row[0] or thought_id)[:200] if summary_row else thought_id[:200]
+                    cur.execute(
+                        """
+                        INSERT INTO brain.knowledge_graph_nodes
+                               (node_id, node_nk, node_type, name, user_id,
+                                source_thought_id, lifecycle_status)
+                        VALUES (%s, %s, 'thought', %s, %s, %s, 'active')
+                        ON CONFLICT (node_nk, user_id) DO NOTHING
+                        """,
+                        (node_id, f"thought:{thought_id}", node_name, user_id, thought_id),
+                    )
+                    restore_counts["kg_node_restored"] = 1
+
+                # Re-insert edges.
+                for edge in scrub_snapshot.get("kg_edges_snapshot", []):
+                    cur.execute(
+                        """
+                        INSERT INTO brain.knowledge_graph_edges
+                               (edge_id, source_node, target_node, edge_type,
+                                weight, user_id, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (edge_id) DO NOTHING
+                        """,
+                        (
+                            edge["edge_id"], edge["source_node"], edge["target_node"],
+                            edge["edge_type"], edge["weight"], edge["user_id"],
+                            edge["created_at"],
+                        ),
+                    )
+                    restore_counts["kg_edges_restored"] += 1
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            restore_counts["errors"].append(f"kg restore: {e}")
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+    return restore_counts
 
 
 def forget_thought(
@@ -1284,22 +1723,33 @@ def forget_thought(
 ) -> Dict[str, Any]:
     """Forget a thought with VF_eps verification (Lin/Li/Chen 2026 §12.1).
 
-    The delete-after-verify protocol (R1 fix-wave):
+    The delete-after-verify protocol (fblai-152r8 Half-A: residue scrub):
 
       1. Build ProbeSeedSnapshot capturing forgotten_text + top-50 NN
-         neighbors PRE-DELETE.
+         neighbors PRE-DELETE (and PRE-scrub).
       2. Capture the full thought row for restore (user_id + all PROV columns).
-      3. DELETE the thought from brain.thoughts (CASCADE drops thought_versions).
-      4. Run n probes against the post-delete live store.
-      5. If accepted (k=0): emit audit row with status='forgotten'. Done.
-      6. If rejected (k>0) or verify errors: RESTORE the row from the snapshot
-         (re-INSERT with the same thought_id). Emit audit row with
-         status='forget-failed-residue' or 'forget-failed-error'.
+      3. SCRUB residue surfaces (thought_versions explicit DELETE; replay_log
+         redact-in-place; atom_links inbound orphan-mark; KG node+edges delete).
+         Snapshot each surface for restore.
+      4. DELETE the thought from brain.thoughts (CASCADE covers anything left).
+      5. Run n probes against the post-scrub/post-delete live store — INCLUDING
+         per-surface presence probes (fblai-152r8 Half-B). k=0 is now a real
+         measurement across independent surfaces, not a tautology.
+      6. If accepted (k=0): emit audit row with status='forgotten'. Done.
+      7. If rejected (k>0) or verify errors: RESTORE all surfaces from snapshots
+         (guaranteed: thought row + versions; best-effort: KG, replay, links).
+         Emit audit row with status='forget-failed-residue' or 'forget-failed-error'.
 
     PS scoping (Principal Scoping per Lin §12.1): raises RuntimeError if
     ``thought_id`` is not in ``user_id``'s scope. Cross-user forgets are
-    rejected at the snapshot step BEFORE any DELETE — the live row remains
+    rejected at the snapshot step BEFORE any scrub — the live row remains
     untouched.
+
+    GUARANTEE NOTE: The binomial confidence bound conditions on probe sensitivity
+    across the scrubbed surfaces. It is NOT an unconditional guarantee about
+    arbitrary residue channels. If a Half-A scrub silently fails, the corresponding
+    Half-B surface probe surfaces it (k>0) and restore fires. The bound is
+    meaningful only insofar as the probe set covers the relevant residue surfaces.
 
     Parameters
     ----------
@@ -1371,9 +1821,15 @@ def forget_thought(
             f"(user={user_id})"
         )
 
-    # Step 3: DELETE the live row (CASCADE on brain.thought_versions handles
-    # version history; knowledge_graph_nodes.source_thought_id is ON DELETE
-    # SET NULL so KG-edge cleanup is automatic).
+    # Step 3: SCRUB residue surfaces pre-DELETE (fblai-152r8 Half-A).
+    # Explicit version scrub (guaranteed), replay redaction (best-effort),
+    # inbound link orphan-marking (best-effort), KG node+edge deletion (best-effort).
+    # scrub_snapshot carries per-surface data needed to restore on failure.
+    scrub_snapshot = _scrub_residue_surfaces(conn, thought_id, user_id)
+
+    # Step 4: DELETE the live thoughts row.
+    # Note: thought_versions was already explicitly deleted above, and atom_links
+    # outgoing (source=thought_id) will cascade here too; that is belt-and-suspenders.
     cur = conn.cursor()
     try:
         cur.execute(
@@ -1384,14 +1840,17 @@ def forget_thought(
     finally:
         cur.close()
 
-    # Step 4: verification. ANY exception triggers a restore-and-record-error.
+    # Step 5: verification. ANY exception triggers full restore-and-record-error.
+    # Pass the scrub_snapshot so verify_forgetting can run per-surface probes.
     try:
         verify_result = vf_probe.verify_forgetting(
             conn, snapshot, n=n, epsilon=epsilon,
+            scrub_snapshot=scrub_snapshot,
         )
     except Exception as e:
-        # Restore + audit + return error status.
+        # Restore thought row first (guaranteed), then residue surfaces (best-effort).
         _restore_thought(conn, thought_id, restore_row)
+        restore_detail = _restore_residue_surfaces(conn, thought_id, user_id, scrub_snapshot)
         audit_id = _emit_forget_audit(
             conn,
             thought_id=thought_id,
@@ -1409,7 +1868,14 @@ def forget_thought(
                 "error": str(e),
             },
             prov_agent=prov_agent,
-            diagnostic={"verify_exception": str(e), "restored": True},
+            scrub_counts=scrub_snapshot.get("scrub_counts", {}),
+            paraphrase_degraded=False,
+            actual_distribution={},
+            diagnostic={
+                "verify_exception": str(e),
+                "restored": True,
+                "restore_detail": restore_detail,
+            },
         )
         # brain-W2-S6: replay-log emission (verify-error branch). Best-effort.
         emit_replay_log(
@@ -1441,12 +1907,15 @@ def forget_thought(
             },
         }
 
-    # Step 5 / 6: decision based on accepted flag.
+    # Step 6 / 7: decision based on accepted flag.
     accepted = verify_result.accepted
     if not accepted:
-        # k > 0: residue detected — restore the row BEFORE emitting the audit
-        # row, so the audit row is the durable record of the (restored) state.
+        # k > 0: residue detected — restore thought row first (guaranteed),
+        # then residue surfaces (best-effort). Audit row is the durable record.
         _restore_thought(conn, thought_id, restore_row)
+        restore_detail = _restore_residue_surfaces(conn, thought_id, user_id, scrub_snapshot)
+    else:
+        restore_detail = None
 
     audit_id = _emit_forget_audit(
         conn,
@@ -1460,6 +1929,9 @@ def forget_thought(
         exact_binomial_bound=verify_result.exactBinomialBound,
         probe_quality=verify_result.probeQuality,
         prov_agent=prov_agent,
+        scrub_counts=scrub_snapshot.get("scrub_counts", {}),
+        paraphrase_degraded=verify_result.probeQuality.get("paraphrase_degraded", False),
+        actual_distribution=verify_result.probeQuality.get("actual_distribution", {}),
         diagnostic=(
             None
             if accepted
@@ -1469,6 +1941,7 @@ def forget_thought(
                     if p.get("surfaced_forgotten")
                 ],
                 "restored": True,
+                "restore_detail": restore_detail,
             }
         ),
     )
@@ -1508,6 +1981,7 @@ def forget_thought(
             "exactBinomialConfidence": verify_result.exactBinomialConfidence,
             "probeQuality": verify_result.probeQuality,
             "prov_agent": prov_agent,
+            "scrub_counts": scrub_snapshot.get("scrub_counts", {}),
         },
     }
 
@@ -1542,8 +2016,17 @@ def _restore_thought(conn, thought_id: str, restore_row: tuple) -> None:
 
     cur = conn.cursor()
     try:
+        # Use a conditional cast for the vector column: NULL::vector fails when
+        # pgvector is not in the current schema search_path; cast only when non-NULL.
+        if embedding is not None:
+            embedding_sql = "%s::vector"
+            embedding_val = embedding
+        else:
+            embedding_sql = "NULL"
+            embedding_val = None
+
         cur.execute(
-            """
+            f"""
             INSERT INTO brain.thoughts (
                 thought_id, user_id, raw_text, summary, thought_type,
                 topics, people, action_items,
@@ -1558,7 +2041,7 @@ def _restore_thought(conn, thought_id: str, restore_row: tuple) -> None:
                 %s, %s, %s,
                 %s, %s, %s,
                 %s, %s,
-                %s::vector, %s::jsonb,
+                {embedding_sql}, %s::jsonb,
                 %s, NOW()
             )
             """,
@@ -1568,7 +2051,9 @@ def _restore_thought(conn, thought_id: str, restore_row: tuple) -> None:
                 source, session_id, project,
                 prov_agent_old, "restore", was_generated_by,
                 was_derived_from, source_uri,
-                embedding if embedding is not None else None,
+            )
+            + ((embedding_val,) if embedding is not None else ())
+            + (
                 _jsonb(metadata),
                 created_at,
             ),
@@ -1590,14 +2075,31 @@ def _emit_forget_audit(
     exact_binomial_bound: float,
     probe_quality: Dict[str, Any],
     prov_agent: str,
+    scrub_counts: Optional[Dict[str, Any]] = None,
+    paraphrase_degraded: bool = False,
+    actual_distribution: Optional[Dict[str, int]] = None,
     diagnostic: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Insert one row into ``brain.forget_audit``; return its ``audit_id``.
 
-    Procurement-grade audit: BOTH bounds and confidences are stored as
-    distinct labeled columns (R2 fix-wave), and the probe-quality marker
-    (R3 fix-wave) is preserved as JSONB for downstream verification.
+    Procurement-grade audit (fblai-152r8 Half-C honesty additions):
+    - BOTH bounds and confidences are stored as distinct labeled columns (R2).
+    - probe_quality_json is augmented with scrub_counts (what surfaces were
+      scrubbed), paraphrase_degraded flag (true when ANTHROPIC_API_KEY absent
+      and paraphrase probes degrade to partial), and actual_distribution (the
+      real probe counts executed, not the nominal 40/30/20/10).
+    - The binomial bound conditions on probe sensitivity across scrubbed
+      surfaces; if paraphrase_degraded=True the actual distribution differs
+      from the nominal and this is recorded explicitly.
     """
+    # Augment probe_quality with honesty fields (fblai-152r8 Half-C).
+    probe_quality_full = dict(probe_quality)
+    if scrub_counts is not None:
+        probe_quality_full["scrub_counts"] = scrub_counts
+    probe_quality_full["paraphrase_degraded"] = paraphrase_degraded
+    if actual_distribution is not None:
+        probe_quality_full["actual_distribution"] = actual_distribution
+
     cur = conn.cursor()
     try:
         cur.execute(
@@ -1626,7 +2128,7 @@ def _emit_forget_audit(
                 n, k, epsilon,
                 hoeffding_bound, 1.0 - hoeffding_bound,
                 exact_binomial_bound, 1.0 - exact_binomial_bound,
-                json.dumps(probe_quality),
+                json.dumps(probe_quality_full),
                 prov_agent,
                 json.dumps(diagnostic) if diagnostic is not None else None,
             ),

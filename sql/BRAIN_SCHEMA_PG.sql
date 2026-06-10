@@ -54,7 +54,12 @@ CREATE INDEX IF NOT EXISTS idx_thoughts_generated_by
 -- RB primitive (brain-W1-S4): versioning substrate for snapshot/rollback/diff
 -- See sql/migrations/2026-05-21-rb-versions.sql for the migration version.
 -- W3C PROV-DM 1.3 conformant at the version level (per-snapshot PROV event).
--- ON DELETE CASCADE: forgetting a thought (VF_eps) removes its versions too.
+--
+-- ON DELETE CASCADE declared here. fblai-152r8 audit verified that thought_versions
+-- rows survive a thoughts DELETE in some deployment configurations (live DB may
+-- lack the CASCADE constraint from the migration). forget_thought() therefore
+-- issues an EXPLICIT DELETE of thought_versions before deleting brain.thoughts.
+-- The CASCADE is belt-and-suspenders; the explicit scrub is the guarantee.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS thought_versions (
     version_id      BIGSERIAL         NOT NULL PRIMARY KEY,
@@ -80,9 +85,27 @@ CREATE INDEX IF NOT EXISTS idx_thought_versions_thought ON thought_versions (tho
 CREATE INDEX IF NOT EXISTS idx_thought_versions_created ON thought_versions (created_at DESC);
 
 -- ============================================================================
--- VF_eps audit log (brain-W1-S8): procurement-grade trail for every --forget.
--- See sql/migrations/2026-05-21-vf-audit.sql for the migration version.
--- Records BOTH Hoeffding (loose) and exact-binomial (tight) bounds (R2 fix-wave).
+-- VF_eps audit log (brain-W1-S8 / fblai-152r8): procurement-grade trail for
+-- every --forget. Records BOTH Hoeffding (loose) and exact-binomial (tight)
+-- bounds (R2 fix-wave).
+--
+-- fblai-152r8 honesty additions (Half-C): probe_quality_json now records:
+--   scrub_counts        — rows affected per residue surface (versions, replay,
+--                         atom_links_orphaned, kg_node, kg_edges)
+--   paraphrase_degraded — true when ANTHROPIC_API_KEY absent and paraphrase
+--                         probes degraded to partial; the actual_distribution
+--                         field records what was really executed
+--   actual_distribution — real probe counts (may differ from nominal 40/30/20/10
+--                         when degraded)
+--   surface_probes_run  — true when per-surface presence probes also ran
+--   k_standard          — probes from text/vector portion
+--   k_surface           — probes from per-surface presence portion
+--
+-- IMPORTANT: The binomial confidence bound (exact_binomial_conf) conditions on
+-- probe SENSITIVITY across the scrubbed surfaces. It is NOT an unconditional
+-- guarantee about arbitrary residue channels. The bound is meaningful only when
+-- the probe set covers the relevant residue surfaces — verified by surface_probes_run
+-- and k_surface = 0 in the audit row.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS forget_audit (
     audit_id              BIGSERIAL         NOT NULL PRIMARY KEY,

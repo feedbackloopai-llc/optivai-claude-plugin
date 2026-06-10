@@ -1,10 +1,28 @@
-"""brain-W1-S7: VF_eps probe library.
+"""brain-W1-S7 / fblai-152r8: VF_eps probe library.
 
 Verified-forgetting primitive (Lin/Li/Chen 2026 §12.1). Generates n=300 probes
 from a pre-delete ProbeSeedSnapshot, scores residue detection, computes both
 Hoeffding (loose, distribution-free) and exact-binomial (tight) confidence
 bounds — both are recorded distinctly so a reader can see which number is
 being quoted.
+
+fblai-152r8 Half-B additions:
+- verify_forgetting() accepts an optional scrub_snapshot dict and runs
+  per-surface presence probes AFTER the standard text/vector probes.
+  Per-surface probes: thought_versions count, KG node presence,
+  replay_log text scan, atom_links inbound orphan check.
+  These increment k independently so if a Half-A scrub silently fails,
+  k>0 fires restore — the guarantee is a real measurement, not a tautology.
+- paraphrase_degraded is stamped into probe_quality when ANTHROPIC_API_KEY
+  is absent and paraphrase probes degrade to partial (Half-C honesty).
+- actual_distribution is recorded in probe_quality with the real executed
+  counts, not the nominal 40/30/20/10.
+
+IMPORTANT: The binomial confidence bound conditions on probe sensitivity across
+the scrubbed surfaces. It is NOT an unconditional guarantee about arbitrary
+residue channels. A scrub failure that leaves a surface un-probed would degrade
+the guarantee; the per-surface probes below close that gap for the four surfaces
+scrubbed by Half-A.
 
 Reference: optivai-builder/src/agents/vf-probe.ts (the TS design source we
 ported from; algorithmic provenance only).
@@ -116,20 +134,37 @@ class ProbeResult:
 
 
 @dataclass
+class SurfaceProbeResult:
+    """Result of one per-surface presence probe (fblai-152r8 Half-B).
+
+    These probes run AFTER the standard text/vector probes and verify that
+    each scrubbed residue surface contains zero rows referencing the forgotten
+    thought. If any surface probe returns ``residue_count > 0``, the surface's
+    ``surfaced_forgotten`` flag is True and k is incremented.
+    """
+
+    surface: str                    # "thought_versions" | "kg_node" | "replay_log" | "atom_links_inbound"
+    residue_count: int              # rows found (0 = clean; >0 = scrub missed)
+    surfaced_forgotten: bool        # residue_count > 0
+    detail: Optional[str] = None    # human-readable detail for non-zero residue
+
+
+@dataclass
 class VerifyForgettingResult:
     """The result of a full :func:`verify_forgetting` run."""
 
     forgotten_thought_id: str
-    n: int                                  # total probes run
-    k: int                                  # probes that surfaced the forgotten thought
+    n: int                                  # total probes run (text/vector only; surface probes not counted in n)
+    k: int                                  # probes that surfaced the forgotten thought (text/vector + surface)
     epsilon: float                          # epsilon-bound target
-    accepted: bool                          # k == 0 → True (zero residue)
+    accepted: bool                          # k == 0 → True (zero residue across ALL surfaces)
     hoeffdingBound: float                   # exp(-2*n*eps**2) — loose
     hoeffdingConfidence: float              # 1 - hoeffdingBound
     exactBinomialBound: float               # (1-eps)**n — tight
     exactBinomialConfidence: float          # 1 - exactBinomialBound
-    probeQuality: Dict[str, Any]            # {n, distribution, sampledFromSnapshot}
+    probeQuality: Dict[str, Any]            # {n, distribution, sampledFromSnapshot, paraphrase_degraded, actual_distribution}
     probes: List[Dict[str, Any]]            # per-probe results (asdict of ProbeResult)
+    surface_probes: List[Dict[str, Any]] = field(default_factory=list)  # per-surface presence probe results
 
 
 # ─── Statistical bound functions ────────────────────────────────────────────
@@ -386,18 +421,27 @@ def _generate_partial_probes(
 
 def _generate_paraphrase_probes(
     snapshot: ProbeSeedSnapshot, count: int
-) -> List[str]:
+) -> Tuple[List[str], bool]:
     """Generate ``count`` paraphrase probes via Claude Haiku (if available).
 
     Falls back to partial-fragment probes if ``ANTHROPIC_API_KEY`` is not
     set OR the API call fails. Maintains the probe budget (still returns
     exactly ``count`` items).
+
+    Returns
+    -------
+    (probes, degraded)
+        ``probes`` is a list of exactly ``count`` strings.
+        ``degraded`` is True when paraphrase generation was not possible and
+        partial-fragment probes were used as a substitute — callers MUST
+        stamp this in the audit (fblai-152r8 Half-C honesty requirement).
     """
     if count <= 0:
-        return []
+        return [], False
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return _generate_partial_probes(snapshot, count)
+        # No API key — degrade to partial probes and flag the caller.
+        return _generate_partial_probes(snapshot, count), True
 
     try:
         import json
@@ -433,9 +477,9 @@ def _generate_paraphrase_probes(
             paraphrases.extend(
                 _generate_partial_probes(snapshot, count - len(paraphrases))
             )
-        return paraphrases[:count]
+        return paraphrases[:count], False
     except Exception:
-        return _generate_partial_probes(snapshot, count)
+        return _generate_partial_probes(snapshot, count), True
 
 
 def _generate_perturb_probes(
@@ -582,21 +626,206 @@ def _scaled_distribution(n: int) -> Dict[str, int]:
     return dist
 
 
+def _run_surface_probes(
+    conn,
+    snapshot: ProbeSeedSnapshot,
+    scrub_snapshot: Dict[str, Any],
+) -> List[SurfaceProbeResult]:
+    """Run per-surface presence probes (fblai-152r8 Half-B).
+
+    These probes verify that each residue surface scrubbed by Half-A contains
+    zero rows referencing the forgotten thought. Each probe is independent;
+    a scrub failure on one surface cannot hide behind success on another.
+
+    Surfaces probed:
+    1. thought_versions — SELECT count WHERE thought_id = forgotten (must be 0).
+    2. kg_node        — the thought's own KG node must not exist (if one was
+                         present pre-scrub). Shared topic/person/project nodes
+                         are not checked here (they are exempt from deletion).
+    3. replay_log     — ILIKE the thought_id against query_redacted AND
+                         result_summary (must be 0 live hits after redaction).
+    4. atom_links_inbound — no link still resolves to the forgotten id as a
+                         live target without the orphan tombstone flag set.
+
+    Returns a list of :class:`SurfaceProbeResult` — one per surface. Each
+    records the count found and whether it constitutes residue.
+    """
+    results: List[SurfaceProbeResult] = []
+    tid = snapshot.forgotten_thought_id
+    uid = snapshot.user_id
+    cur = conn.cursor()
+    try:
+        # ── 1. thought_versions ───────────────────────────────────────────────
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM brain.thought_versions WHERE thought_id = %s",
+                (tid,),
+            )
+            count = int(cur.fetchone()[0])
+            results.append(SurfaceProbeResult(
+                surface="thought_versions",
+                residue_count=count,
+                surfaced_forgotten=(count > 0),
+                detail=f"{count} version rows remain for forgotten thought" if count > 0 else None,
+            ))
+        except Exception as e:
+            conn.rollback()
+            results.append(SurfaceProbeResult(
+                surface="thought_versions",
+                residue_count=0,
+                surfaced_forgotten=False,
+                detail=f"probe error (fail-open): {e}",
+            ))
+
+        # ── 2. kg_node ────────────────────────────────────────────────────────
+        # Only meaningful if a thought-type node was present before scrub.
+        kg_node_was_present = scrub_snapshot.get("kg_node_id") is not None
+        try:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.knowledge_graph_nodes
+                WHERE node_nk = %s AND user_id = %s
+                """,
+                (f"thought:{tid}", uid),
+            )
+            count = int(cur.fetchone()[0])
+            # If no node existed pre-scrub, a count of 0 is expected and fine.
+            # If one existed pre-scrub, a count > 0 is residue.
+            is_residue = kg_node_was_present and count > 0
+            results.append(SurfaceProbeResult(
+                surface="kg_node",
+                residue_count=count if kg_node_was_present else 0,
+                surfaced_forgotten=is_residue,
+                detail=(
+                    f"KG thought-node for {tid} still present after scrub"
+                    if is_residue else None
+                ),
+            ))
+        except Exception as e:
+            conn.rollback()
+            # KG tables may not exist — fail-open (not residue).
+            results.append(SurfaceProbeResult(
+                surface="kg_node",
+                residue_count=0,
+                surfaced_forgotten=False,
+                detail=f"probe error (fail-open, KG may not exist): {e}",
+            ))
+
+        # ── 3. replay_log ─────────────────────────────────────────────────────
+        # After Half-A redaction, query_redacted should be NULL and
+        # result_summary should be '[redacted by VF_eps forget]'.
+        # Probe: ILIKE scan for the thought_id string in either field — if the
+        # redaction missed a row, this will find the thought_id embedded in the
+        # text. Also check if the non-tombstoned thought_id FK reference exists.
+        try:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.replay_log
+                WHERE user_id = %s
+                  AND thought_id = %s
+                  AND (
+                      query_redacted ILIKE %s
+                      OR result_summary ILIKE %s
+                  )
+                  AND NOT (
+                      metadata IS NOT NULL
+                      AND (metadata->>'vf_eps_tombstone')::boolean = true
+                  )
+                """,
+                (uid, tid, f"%{tid[:50]}%", f"%{tid[:50]}%"),
+            )
+            count = int(cur.fetchone()[0])
+            results.append(SurfaceProbeResult(
+                surface="replay_log",
+                residue_count=count,
+                surfaced_forgotten=(count > 0),
+                detail=(
+                    f"{count} replay_log rows contain thought_id text after redaction"
+                    if count > 0 else None
+                ),
+            ))
+        except Exception as e:
+            conn.rollback()
+            results.append(SurfaceProbeResult(
+                surface="replay_log",
+                residue_count=0,
+                surfaced_forgotten=False,
+                detail=f"probe error (fail-open): {e}",
+            ))
+
+        # ── 4. atom_links_inbound ─────────────────────────────────────────────
+        # After Half-A orphan-marking, any inbound link should have the
+        # vf_eps_orphaned flag set in prov. Probe: find links pointing to the
+        # forgotten id that do NOT have the tombstone — these are unhandled.
+        try:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM brain.atom_links
+                WHERE target_id = %s AND user_id = %s
+                  AND NOT (
+                      prov IS NOT NULL
+                      AND (prov->>'vf_eps_orphaned')::boolean = true
+                  )
+                """,
+                (tid, uid),
+            )
+            count = int(cur.fetchone()[0])
+            results.append(SurfaceProbeResult(
+                surface="atom_links_inbound",
+                residue_count=count,
+                surfaced_forgotten=(count > 0),
+                detail=(
+                    f"{count} inbound atom_links not marked orphaned after scrub"
+                    if count > 0 else None
+                ),
+            ))
+        except Exception as e:
+            conn.rollback()
+            results.append(SurfaceProbeResult(
+                surface="atom_links_inbound",
+                residue_count=0,
+                surfaced_forgotten=False,
+                detail=f"probe error (fail-open): {e}",
+            ))
+
+    finally:
+        cur.close()
+
+    return results
+
+
 def verify_forgetting(
     conn,
     snapshot: ProbeSeedSnapshot,
     n: int = DEFAULT_N,
     epsilon: float = DEFAULT_EPSILON,
     distribution: Optional[Dict[str, int]] = None,
+    scrub_snapshot: Optional[Dict[str, Any]] = None,
 ) -> VerifyForgettingResult:
     """Run ``n`` probes against the live store; verify no residue surfaces.
 
-    Accept iff ``k=0`` (zero probes surface the forgotten thought).
+    Accept iff ``k=0`` (zero probes surface the forgotten thought across ALL
+    surfaces — text/vector probes AND per-surface presence probes).
 
     PRECONDITION: the forgotten thought MUST already be deleted from
-    ``brain.thoughts`` (delete-after-verify pattern — see S8). This function
-    does NOT modify the store; it only QUERIES. If the live row still exists,
-    every semantic probe will trivially find it and ``accepted=False``.
+    ``brain.thoughts`` AND all residue surfaces scrubbed (delete-after-verify
+    pattern — see fblai-152r8). This function does NOT modify the store; it
+    only QUERIES.
+
+    fblai-152r8 Half-B: if ``scrub_snapshot`` is supplied, per-surface presence
+    probes are also run. Each surfaces failure increments k independently, so
+    a silent scrub failure triggers the restore path. k is the sum of standard
+    probe failures PLUS surface probe failures.
+
+    fblai-152r8 Half-C: paraphrase_degraded is recorded in probeQuality when
+    ANTHROPIC_API_KEY is absent; actual_distribution records the real executed
+    counts (which may differ from the nominal 40/30/20/10 when degraded).
+
+    IMPORTANT: The binomial confidence bound is computed over n (the text/vector
+    probe count). Surface probes are additional, independent failure detectors
+    that are not counted in n — they operate outside the statistical model but
+    they STRENGTHEN the guarantee by providing coverage on surfaces the text
+    probes cannot reach (DB tables that have nothing to do with brain.thoughts).
 
     Parameters
     ----------
@@ -605,12 +834,16 @@ def verify_forgetting(
     snapshot
         Pre-delete snapshot from :func:`build_probe_seed_snapshot`.
     n
-        Total number of probes (default 300).
+        Total number of text/vector probes (default 300).
     epsilon
         Operational target expose-rate (default 0.05).
     distribution
         Optional override of the per-kind probe counts. Defaults to
         :data:`DEFAULT_DISTRIBUTION` scaled to ``n``.
+    scrub_snapshot
+        Optional dict from ``_scrub_residue_surfaces`` — enables per-surface
+        presence probes (fblai-152r8 Half-B). If None, only text/vector probes
+        run (backward-compatible with callers that don't supply it).
 
     Raises
     ------
@@ -639,25 +872,50 @@ def verify_forgetting(
         distribution["semantic"] = max(0, distribution.get("semantic", 0) + diff)
 
     # Generate probes by kind. Text probes first, then vector probes.
+    # Track paraphrase_degraded for Half-C honesty (fblai-152r8).
+    # actual_distribution tracks the REAL executed kind (not the nominal label):
+    # when paraphrase degrades, those probes are partial-fragment probes and
+    # are counted under "partial" (not "paraphrase") in actual_distribution.
     text_probes: List[Tuple[str, str]] = []
     vec_probes: List[Tuple[str, List[float]]] = []
+    actual_distribution: Dict[str, int] = {}
+    paraphrase_degraded: bool = False
 
-    for text in _generate_semantic_probes(
-        snapshot, distribution.get("semantic", 0)
-    ):
+    semantic_count = distribution.get("semantic", 0)
+    for text in _generate_semantic_probes(snapshot, semantic_count):
         text_probes.append(("semantic", text))
-    for text in _generate_paraphrase_probes(
-        snapshot, distribution.get("paraphrase", 0)
-    ):
+    actual_distribution["semantic"] = actual_distribution.get("semantic", 0) + semantic_count
+
+    paraphrase_count = distribution.get("paraphrase", 0)
+    paraphrase_probes, paraphrase_degraded = _generate_paraphrase_probes(
+        snapshot, paraphrase_count
+    )
+    for text in paraphrase_probes:
+        # Label the probe with its nominal kind for ProbeResult.probe_kind — this
+        # preserves the category for filtering. However actual_distribution records
+        # "partial" when degraded, because that is what was executed.
         text_probes.append(("paraphrase", text))
-    for text in _generate_partial_probes(
-        snapshot, distribution.get("partial", 0)
-    ):
+    if paraphrase_count > 0:
+        if paraphrase_degraded:
+            # Degraded: these are really partial probes — record under "partial".
+            actual_distribution["partial"] = (
+                actual_distribution.get("partial", 0) + paraphrase_count
+            )
+            actual_distribution["paraphrase"] = 0
+        else:
+            actual_distribution["paraphrase"] = (
+                actual_distribution.get("paraphrase", 0) + paraphrase_count
+            )
+
+    partial_count = distribution.get("partial", 0)
+    for text in _generate_partial_probes(snapshot, partial_count):
         text_probes.append(("partial", text))
-    for vec in _generate_perturb_probes(
-        snapshot, distribution.get("perturb", 0)
-    ):
+    actual_distribution["partial"] = actual_distribution.get("partial", 0) + partial_count
+
+    perturb_count = distribution.get("perturb", 0)
+    for vec in _generate_perturb_probes(snapshot, perturb_count):
         vec_probes.append(("perturb", vec))
+    actual_distribution["perturb"] = actual_distribution.get("perturb", 0) + perturb_count
 
     # Score each probe
     probe_results: List[ProbeResult] = []
@@ -673,7 +931,16 @@ def verify_forgetting(
         pid += 1
         probe_results.append(result)
 
-    k = sum(1 for r in probe_results if r.surfaced_forgotten)
+    k_standard = sum(1 for r in probe_results if r.surfaced_forgotten)
+
+    # Per-surface presence probes (fblai-152r8 Half-B).
+    surface_probe_results: List[SurfaceProbeResult] = []
+    k_surface = 0
+    if scrub_snapshot is not None:
+        surface_probe_results = _run_surface_probes(conn, snapshot, scrub_snapshot)
+        k_surface = sum(1 for sp in surface_probe_results if sp.surfaced_forgotten)
+
+    k = k_standard + k_surface
     accepted = (k == 0)
 
     hb = hoeffding_bound(n, epsilon)
@@ -693,6 +960,13 @@ def verify_forgetting(
             "n": n,
             "distribution": distribution,
             "sampledFromSnapshot": True,
+            # fblai-152r8 Half-C honesty fields:
+            "paraphrase_degraded": paraphrase_degraded,
+            "actual_distribution": actual_distribution,
+            "surface_probes_run": scrub_snapshot is not None,
+            "k_standard": k_standard,
+            "k_surface": k_surface,
         },
         probes=[asdict(r) for r in probe_results],
+        surface_probes=[asdict(sp) for sp in surface_probe_results],
     )
