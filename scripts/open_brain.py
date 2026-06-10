@@ -336,9 +336,11 @@ def _extract_metadata_via_claude(text: str) -> dict:
         import anthropic
         client = anthropic.Anthropic()
         safe_text = text[:4000]
-        # Brace-escape the interpolated text so str.format() cannot
-        # misinterpret user content as format placeholders.  We escape
-        # BEFORE the slice so the slice length is consistent.
+        # Slice first (cap at 4000 chars), then brace-escape the slice so
+        # str.format() cannot misinterpret user content as format
+        # placeholders. Escaping after the slice is correct: the cap bounds
+        # the prompt cost on the original text; the escape only expands
+        # brace chars, which str.format() collapses back to single braces.
         escaped_text = safe_text.replace("{", "{{").replace("}", "}}")
         prompt = METADATA_EXTRACTION_PROMPT.format(thought_text=escaped_text)
         response = client.messages.create(
@@ -2073,8 +2075,11 @@ def capture(
         conn,
         user_id=user_id,
         event_type="capture",
-        thought_id=thought_id,
-        result_text=text,
+        # Pass the stored representation, not the raw `text`. emit_replay_log
+        # redacts internally so `text` would also be safe, but using
+        # text_for_storage makes the no-raw-bypass intent unambiguous and
+        # keeps this call consistent with what landed in raw_text. (fblai-y0zsb)
+        result_text=text_for_storage,
         session_id=session_id or None,
         prov_agent=prov_agent,
     )
