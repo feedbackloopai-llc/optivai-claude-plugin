@@ -3105,6 +3105,104 @@ def search(
                     reverse=True,
                 )
 
+    # ── atom_links provenance annotation (fblai-lk4gt) ───────────────────────
+    #
+    # SUPERSEDES SUPPRESSION + DISPUTED ANNOTATION
+    #
+    # After the Hebbian re-sort, do ONE batch query against brain.atom_links to
+    # find inbound supersedes / refutes / contradicts edges for the candidate
+    # set.  Results are annotated in-place; superseded atoms get a score
+    # penalty and the list is re-sorted so they sink.
+    #
+    # Design invariants:
+    #   - BATCH: one SQL round-trip, not N per-result queries.
+    #   - USER-SCOPED: the superseding source must belong to the SAME user_id
+    #     (both via user_id on atom_links AND via EXISTS on brain.thoughts).
+    #   - LIVE-SOURCE GUARD: a supersedes link whose source was subsequently
+    #     forgotten does NOT suppress (test case (b)); the EXISTS sub-select
+    #     enforces this.
+    #   - DISPUTED: refutes/contradicts links annotate only — no score change.
+    #   - PENALTY: configurable via OPEN_BRAIN_SUPERSEDE_PENALTY env var,
+    #     default 0.5, clamped to [0, 1].
+    if results:
+        candidate_tids = [r.get("THOUGHT_ID") for r in results if r.get("THOUGHT_ID")]
+        if candidate_tids:
+            _supersede_penalty = max(0.0, min(1.0, float(
+                os.environ.get("OPEN_BRAIN_SUPERSEDE_PENALTY", "0.5")
+            )))
+            try:
+                _links_cur = conn.cursor()
+                try:
+                    _tid_placeholders = ",".join(["%s"] * len(candidate_tids))
+                    # Single query: fetch all inbound supersedes + dispute links
+                    # for the candidate set.  The EXISTS guard on brain.thoughts
+                    # ensures only LIVE (non-forgotten) sources suppress.
+                    _links_cur.execute(
+                        f"""
+                        SELECT al.target_id,
+                               al.source_id,
+                               al.link_type
+                          FROM brain.atom_links al
+                         WHERE al.target_id IN ({_tid_placeholders})
+                           AND al.user_id = %s
+                           AND al.link_type IN ('supersedes', 'refutes', 'contradicts')
+                           AND EXISTS (
+                               SELECT 1 FROM brain.thoughts t
+                                WHERE t.thought_id = al.source_id
+                                  AND t.user_id = %s
+                           )
+                        """,
+                        candidate_tids + [user_id, user_id],
+                    )
+                    _link_rows = _links_cur.fetchall()
+                finally:
+                    _links_cur.close()
+
+                # Build annotation maps keyed by target_id.
+                # superseded_by_map: target_id -> [source_ids]
+                # disputed_map: target_id -> {by: [src_ids], types: [link_types]}
+                _superseded_by_map: Dict[str, List[str]] = {}
+                _disputed_map: Dict[str, Dict[str, Any]] = {}
+
+                for _target_id, _source_id, _ltype in _link_rows:
+                    if _ltype == "supersedes":
+                        _superseded_by_map.setdefault(_target_id, []).append(_source_id)
+                    else:  # refutes or contradicts
+                        _entry = _disputed_map.setdefault(
+                            _target_id, {"by": [], "types": []}
+                        )
+                        _entry["by"].append(_source_id)
+                        _entry["types"].append(_ltype)
+
+                # Annotate results and apply penalties.
+                _any_penalty = False
+                for r in results:
+                    tid = r.get("THOUGHT_ID")
+                    if tid in _superseded_by_map:
+                        r["SUPERSEDED_BY"] = _superseded_by_map[tid]
+                        old_score = float(r.get("HYBRID_SCORE", 0.0) or 0.0)
+                        r["HYBRID_SCORE"] = round(old_score * _supersede_penalty, 4)
+                        _any_penalty = True
+                    if tid in _disputed_map:
+                        r["DISPUTED"] = _disputed_map[tid]
+
+                # Re-sort after applying penalties (respects sort_by preference).
+                if _any_penalty and sort_by != "time":
+                    results.sort(
+                        key=lambda x: float(x.get("HYBRID_SCORE", 0.0) or 0.0),
+                        reverse=True,
+                    )
+            except Exception as _link_exc:
+                # atom_links annotation is a scoring assist — never block search.
+                logger.warning(
+                    f"atom_links provenance annotation failed ({_link_exc}); "
+                    "results returned without suppression/dispute markers."
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
     # ── Memory reinforcement: touch updated_at on accessed thoughts ──
     # This resets the time_decay clock, making frequently-accessed memories
     # stay "fresh" longer. The more you recall a memory, the more it persists.
@@ -3213,72 +3311,144 @@ def graph_search(
         if tid:
             seed_by_id[tid] = s
 
+    # Collect top seed ids once (reused by both kg_neighborhood and atom_links).
+    top_seed_ids = list(seed_by_id.keys())[:5]
+
     # Step 2-3: Expand top seeds through the knowledge graph
     graph_thought_ids: Dict[str, int] = {}  # thought_id -> min_depth from any seed
     try:
         cur = conn.cursor()
 
-        # Check if the knowledge graph tables exist and have data
+        # Check if the knowledge graph tables exist and have data.
+        # When empty, skip kg_neighborhood expansion but still fall through
+        # to the atom_links expansion below (fblai-lk4gt: atom_links must be
+        # consulted even when kg_neighborhood has no data for this user).
+        kg_expanded = False
         cur.execute(
             "SELECT COUNT(*) FROM brain.knowledge_graph_nodes WHERE user_id = %s LIMIT 1",
             (user_id,),
         )
         node_count = cur.fetchone()[0]
-        if node_count == 0:
-            cur.close()
-            return seeds[:limit]
-
-        # Collect node_ids for the top seeds (limit expansion to top 5 for performance)
-        top_seed_ids = list(seed_by_id.keys())[:5]
-        if not top_seed_ids:
-            cur.close()
-            return seeds[:limit]
-
-        # Batch lookup: find graph node_ids for all top seed thoughts at once
-        seed_node_nks = [f"thought:{tid}" for tid in top_seed_ids]
-        nk_placeholders = ",".join(["%s"] * len(seed_node_nks))
-        cur.execute(
-            f"""SELECT node_id, node_nk
-                FROM brain.knowledge_graph_nodes
-                WHERE node_nk IN ({nk_placeholders})
-                  AND user_id = %s
-                  AND lifecycle_status = 'active'""",
-            seed_node_nks + [user_id],
-        )
-        seed_node_rows = cur.fetchall()
-
-        if not seed_node_rows:
-            cur.close()
-            return seeds[:limit]
-
-        # For each seed node, expand neighborhood and collect thought node IDs
-        for graph_node_id, _node_nk in seed_node_rows:
+        if node_count > 0 and top_seed_ids:
+            # Batch lookup: find graph node_ids for all top seed thoughts at once
+            seed_node_nks = [f"thought:{tid}" for tid in top_seed_ids]
+            nk_placeholders = ",".join(["%s"] * len(seed_node_nks))
             cur.execute(
-                "SELECT node_id, node_nk, node_type, name, min_depth "
-                "FROM brain.kg_neighborhood(%s, %s, %s)",
-                (graph_node_id, user_id, graph_hops),
+                f"""SELECT node_id, node_nk
+                    FROM brain.knowledge_graph_nodes
+                    WHERE node_nk IN ({nk_placeholders})
+                      AND user_id = %s
+                      AND lifecycle_status = 'active'""",
+                seed_node_nks + [user_id],
             )
-            for neighbor_row in cur.fetchall():
-                n_node_id, n_node_nk, n_node_type, n_name, n_min_depth = neighbor_row
+            seed_node_rows = cur.fetchall()
 
-                # Extract thought_id from thought-type nodes (node_nk = "thought:<id>")
-                if n_node_type == "thought" and n_node_nk and n_node_nk.startswith("thought:"):
-                    connected_tid = n_node_nk[len("thought:"):]
-                    if connected_tid not in graph_thought_ids or n_min_depth < graph_thought_ids[connected_tid]:
-                        graph_thought_ids[connected_tid] = n_min_depth
+            # For each seed node, expand neighborhood and collect thought node IDs
+            for graph_node_id, _node_nk in seed_node_rows:
+                cur.execute(
+                    "SELECT node_id, node_nk, node_type, name, min_depth "
+                    "FROM brain.kg_neighborhood(%s, %s, %s)",
+                    (graph_node_id, user_id, graph_hops),
+                )
+                for neighbor_row in cur.fetchall():
+                    n_node_id, n_node_nk, n_node_type, n_name, n_min_depth = neighbor_row
 
-                # Non-thought nodes may have source_thought_id linking back to a thought
-                if n_node_type != "thought":
-                    cur.execute(
-                        "SELECT source_thought_id FROM brain.knowledge_graph_nodes "
-                        "WHERE node_id = %s AND source_thought_id IS NOT NULL AND user_id = %s",
-                        (n_node_id, user_id),
-                    )
-                    src_row = cur.fetchone()
-                    if src_row and src_row[0]:
-                        src_tid = src_row[0]
-                        if src_tid not in graph_thought_ids or n_min_depth < graph_thought_ids[src_tid]:
-                            graph_thought_ids[src_tid] = n_min_depth
+                    # Extract thought_id from thought-type nodes (node_nk = "thought:<id>")
+                    if n_node_type == "thought" and n_node_nk and n_node_nk.startswith("thought:"):
+                        connected_tid = n_node_nk[len("thought:"):]
+                        if connected_tid not in graph_thought_ids or n_min_depth < graph_thought_ids[connected_tid]:
+                            graph_thought_ids[connected_tid] = n_min_depth
+
+                    # Non-thought nodes may have source_thought_id linking back to a thought
+                    if n_node_type != "thought":
+                        cur.execute(
+                            "SELECT source_thought_id FROM brain.knowledge_graph_nodes "
+                            "WHERE node_id = %s AND source_thought_id IS NOT NULL AND user_id = %s",
+                            (n_node_id, user_id),
+                        )
+                        src_row = cur.fetchone()
+                        if src_row and src_row[0]:
+                            src_tid = src_row[0]
+                            if src_tid not in graph_thought_ids or n_min_depth < graph_thought_ids[src_tid]:
+                                graph_thought_ids[src_tid] = n_min_depth
+            kg_expanded = True
+
+        # Step 2b (fblai-lk4gt): Walk atom_links 1 hop from seed thoughts.
+        #
+        # Runs UNCONDITIONALLY — regardless of whether kg_neighborhood had data.
+        # This ensures graph_search consults BOTH graphs, not just the KG.
+        #
+        # Augments the kg_neighborhood expansion with typed atom_links edges so
+        # graph_search consults BOTH graphs.  Depth is always 1 (YAGNI — no
+        # recursive atom_links traversal).  Both OUTGOING and INCOMING edges are
+        # walked; linked atoms must belong to the same user_id.
+        #
+        # Link-type-weighted proximity: "strong" semantic links (supersedes,
+        # derives_from, verifies) get proximity=0.85; "weak" informational links
+        # (cites, references_bead, contradicts, refutes, resolves,
+        # rationale_for, alternative_rejected_by) get proximity=0.55.  Unknown
+        # types default to 0.55.  The proximity value is multiplied by
+        # graph_weight downstream (same formula as kg_neighborhood results).
+        _ATOM_LINK_PROXIMITY = {
+            "supersedes": 0.85,
+            "derives_from": 0.85,
+            "verifies": 0.85,
+            "refutes": 0.70,
+            "contradicts": 0.70,
+            "resolves": 0.70,
+            "rationale_for": 0.55,
+            "alternative_rejected_by": 0.55,
+            "cites": 0.55,
+            "references_bead": 0.40,
+        }
+        if top_seed_ids:
+            try:
+                _al_placeholders = ",".join(["%s"] * len(top_seed_ids))
+                cur.execute(
+                    f"""
+                    SELECT al.source_id, al.target_id, al.link_type
+                      FROM brain.atom_links al
+                     WHERE al.user_id = %s
+                       AND (
+                           al.source_id IN ({_al_placeholders})
+                           OR al.target_id IN ({_al_placeholders})
+                       )
+                    """,
+                    [user_id] + top_seed_ids + top_seed_ids,
+                )
+                _al_rows = cur.fetchall()
+                for _src, _tgt, _ltype in _al_rows:
+                    # Walk both directions: collect the atom that is NOT the seed.
+                    for _linked_tid in (_src, _tgt):
+                        if _linked_tid in top_seed_ids:
+                            continue  # skip the seed itself
+                        # Existence check is deferred to the batch fetch in Step 3
+                        # (WHERE user_id clause filters ghost atoms).
+                        _prox = _ATOM_LINK_PROXIMITY.get(_ltype, 0.55)
+                        # Map proximity to approximate depth for the same
+                        # proximity_score formula used by kg_neighborhood results.
+                        if _prox >= 0.80:
+                            _depth_approx = 0
+                        elif _prox >= 0.65:
+                            _depth_approx = 1
+                        else:
+                            _depth_approx = 2
+                        if _linked_tid not in graph_thought_ids or _depth_approx < graph_thought_ids[_linked_tid]:
+                            graph_thought_ids[_linked_tid] = _depth_approx
+            except Exception as _al_exc:
+                logger.warning(
+                    f"graph_search: atom_links 1-hop expansion failed ({_al_exc}); "
+                    "continuing without atom_links augmentation."
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        # If neither kg_neighborhood nor atom_links found anything, fall back.
+        if not graph_thought_ids and not kg_expanded:
+            cur.close()
+            return seeds[:limit]
 
         # Step 3: Identify graph-discovered thoughts NOT already in seed results
         new_thought_ids = [tid for tid in graph_thought_ids if tid not in seed_by_id]
@@ -4421,6 +4591,18 @@ def _format_search_results(results: List[Dict], sort_by: str = "similarity") -> 
         topics = r.get("TOPICS", [])
         if topics:
             lines.append(f"   Topics: {', '.join(str(t) for t in topics)}")
+        # fblai-lk4gt: surface atom_links provenance annotations
+        _annots = []
+        superseded_by = r.get("SUPERSEDED_BY")
+        if superseded_by:
+            ids_str = ", ".join(str(s) for s in superseded_by)
+            _annots.append(f"[SUPERSEDED_BY {ids_str}]")
+        disputed = r.get("DISPUTED")
+        if disputed:
+            by_ids = ", ".join(str(s) for s in (disputed.get("by") or []))
+            _annots.append(f"[DISPUTED by {by_ids}]")
+        if _annots:
+            lines.append(f"   {' '.join(_annots)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -4473,6 +4655,19 @@ def _format_graph_search_results(results: List[Dict], sort_by: str = "similarity
         topics = r.get("TOPICS", [])
         if topics:
             lines.append(f"   Topics: {', '.join(str(t) for t in topics)}")
+        # fblai-lk4gt: surface atom_links provenance annotations (same as
+        # _format_search_results — graph results carry the same annotation keys)
+        _annots = []
+        superseded_by = r.get("SUPERSEDED_BY")
+        if superseded_by:
+            ids_str = ", ".join(str(s) for s in superseded_by)
+            _annots.append(f"[SUPERSEDED_BY {ids_str}]")
+        disputed = r.get("DISPUTED")
+        if disputed:
+            by_ids = ", ".join(str(s) for s in (disputed.get("by") or []))
+            _annots.append(f"[DISPUTED by {by_ids}]")
+        if _annots:
+            lines.append(f"   {' '.join(_annots)}")
         lines.append("")
 
     return "\n".join(lines)
