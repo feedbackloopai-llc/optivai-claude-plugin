@@ -379,7 +379,7 @@ python3 scripts/open_brain.py --stats --json
 
 `decision` | `insight` | `person_note` | `meeting` | `idea` | `task` | `reflection` | `preference` | `impression` | `pattern` | `working_memory`
 
-Metadata (type, topics, people, action_items, summary, confidence, scope) is **auto-extracted** by Cortex LLM on capture — no manual tagging needed.
+Metadata (type, topics, people, action_items, summary, confidence, scope) is **auto-extracted** by Anthropic Claude (Haiku model, with Ollama fallback) on capture — no manual tagging needed.
 
 ### Architecture
 - **Schema**: `brain.thoughts` (Neon PostgreSQL)

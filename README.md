@@ -367,7 +367,7 @@ optivai-claude-plugin/
 │   ├── hooks/session_summary.py  # Stop hook (token/cost tracking)
 │   └── requirements.txt       # Python dependencies
 ├── sql/
-│   ├── BRAIN_SCHEMA.sql       # Memory DDL
+│   ├── BRAIN_SCHEMA_PG.sql    # Memory DDL (PostgreSQL)
 │   └── VW_CLAUDE_CODE_*.sql   # Analytics views
 └── README.md
 ```
