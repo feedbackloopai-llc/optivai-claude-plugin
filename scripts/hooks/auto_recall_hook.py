@@ -163,6 +163,13 @@ _ENVELOPE_CLOSE_TAG = "</recalled-memory-data>"
 _CLOSE_TAG_PLACEHOLDER = "[/recalled-memory-data]"
 _OPEN_TAG_PLACEHOLDER = "[recalled-memory-data]"
 
+# Case-insensitive matchers for the envelope tags so mixed-case variants
+# (e.g. </RECALLED-MEMORY-DATA>) cannot slip through unchanged. Closing tag
+# checked first; the alternation in each pattern is anchored so the closing
+# slash is required for the close pattern and absent for the open pattern.
+_ENVELOPE_CLOSE_TAG_RE = re.compile(r"</recalled-memory-data>", re.IGNORECASE)
+_ENVELOPE_OPEN_TAG_RE = re.compile(r"<recalled-memory-data>", re.IGNORECASE)
+
 
 def sanitize_untrusted_string(value: object) -> str:
     """Defang an untrusted string so it cannot inject markdown or break the envelope.
@@ -171,8 +178,10 @@ def sanitize_untrusted_string(value: object) -> str:
     1. Coerce to str; None → "".
     2. Collapse all newlines (\\n, \\r) to a single space — eliminates multi-line
        structural injection.  A single atom's summary becomes one line.
-    3. Replace the literal envelope closing tag (and opening tag) with safe
+    3. Replace the envelope closing tag (and opening tag) with safe
        bracket-notation placeholders so payload cannot close the envelope early.
+       Matching is CASE-INSENSITIVE so mixed-case variants like
+       ``</RECALLED-MEMORY-DATA>`` are neutralised too.
     4. Prefix any line-start markdown control character (#, -, *, >, `) with a
        zero-width escape (Unicode ZERO WIDTH NON-JOINER U+200C) so the character
        is visible but not parsed as a heading, bullet, blockquote, or code fence.
@@ -190,9 +199,10 @@ def sanitize_untrusted_string(value: object) -> str:
         # 1. Collapse newlines → space.
         text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
 
-        # 2. Neutralise envelope tags.
-        text = text.replace(_ENVELOPE_CLOSE_TAG, _CLOSE_TAG_PLACEHOLDER)
-        text = text.replace(_ENVELOPE_OPEN_TAG, _OPEN_TAG_PLACEHOLDER)
+        # 2. Neutralise envelope tags (case-insensitive). Close first (it is the
+        #    more specific pattern — has the leading slash), then open.
+        text = _ENVELOPE_CLOSE_TAG_RE.sub(_CLOSE_TAG_PLACEHOLDER, text)
+        text = _ENVELOPE_OPEN_TAG_RE.sub(_OPEN_TAG_PLACEHOLDER, text)
 
         # 3. Triple-backtick code-fence neutralisation.
         text = text.replace("```", "[backtick-fence]")
@@ -216,9 +226,11 @@ def sanitize_untrusted_string(value: object) -> str:
 def _format_atom_line(atom: dict) -> Optional[str]:
     """Render one atom as a sanitized markdown bullet line, or None if malformed.
 
-    The summary is passed through sanitize_untrusted_string so heading/list
-    syntax, envelope tags, and embedded newlines in the atom data cannot inject
-    structural markdown into the agent's reasoning frame.
+    EVERY interpolated atom field is passed through sanitize_untrusted_string —
+    not just SUMMARY. THOUGHT_TYPE is VARCHAR(50) with no enum CHECK constraint
+    and CREATED_AT / THOUGHT_ID are likewise free text from an external store, so
+    any of them could carry embedded newlines or markdown control chars that
+    would inject structural markdown into the agent's reasoning frame.
     """
     try:
         thought_id = str(atom.get("THOUGHT_ID") or "")
@@ -237,7 +249,12 @@ def _format_atom_line(atom: dict) -> Optional[str]:
         if len(summary) > SUMMARY_MAX_CHARS:
             summary = summary[:SUMMARY_MAX_CHARS].rstrip() + "..."
 
-        # Sanitize before interpolation — the atom came from an external store.
+        # Sanitize EVERY interpolated field — the atom came from an external store.
+        # Newlines/markdown control chars in any field would break the line out of
+        # the envelope or inject a heading/bullet at a new line start.
+        date = sanitize_untrusted_string(date)
+        thought_type = sanitize_untrusted_string(thought_type)
+        short_id = sanitize_untrusted_string(short_id)
         summary = sanitize_untrusted_string(summary)
 
         return f"- {date} | {thought_type} | {short_id} — {summary}"
