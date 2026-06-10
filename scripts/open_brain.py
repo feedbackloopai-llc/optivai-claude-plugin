@@ -357,24 +357,27 @@ def _extract_metadata_via_claude(text: str) -> dict:
 
 
 def _ensure_ollama_ready() -> bool:
-    """Ensure Ollama is installed, running, and has the required model."""
+    """Ensure Ollama is installed, running, and has the required model.
+
+    This function will NOT auto-install Ollama.  If Ollama is not present on
+    PATH the caller receives ``False`` along with an actionable message on
+    stderr.  Auto-installing via a remote shell script is a silent
+    remote-code-execution vector and has been removed permanently.
+    """
     import subprocess
     import urllib.request
 
-    # Check if Ollama is installed
+    # Check if Ollama is installed — do NOT auto-install
     if not any(
         (Path(p) / "ollama").exists()
         for p in os.environ.get("PATH", "").split(":")
     ):
-        logger.info("Installing Ollama...")
-        try:
-            subprocess.run(
-                ["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"],
-                check=True, capture_output=True, timeout=120,
-            )
-        except Exception as e:
-            logger.warning(f"Ollama install failed: {e}")
-            return False
+        print(
+            "Ollama not available; install manually from https://ollama.com "
+            "or set a different metadata provider",
+            file=sys.stderr,
+        )
+        return False
 
     # Check if Ollama is running
     try:
@@ -3880,7 +3883,15 @@ def _run_from_pi():
         sys.exit(0)
 
     op = args.get("op", "")
-    user_id = args.get("user_id", _get_user_id())
+    # Security: always derive user_id from the OS principal; never honor a
+    # caller-supplied value — accepting it would allow any process writing to
+    # the stdin bridge to impersonate an arbitrary user (principal-scoping bypass).
+    if "user_id" in args:
+        print(
+            "WARNING: ignoring caller-supplied user_id; deriving from OS principal",
+            file=sys.stderr,
+        )
+    user_id = _get_user_id()
 
     conn = _connect()
     try:
@@ -3930,8 +3941,16 @@ def _run_from_pi():
             )
             print(json.dumps(results, default=str))
         elif op == "admin_stats":
-            result = admin_stats(conn)
-            print(json.dumps(result, default=str))
+            # Security: admin_stats returns ALL users' data with no user predicate.
+            # Gate it behind an explicit server-side env flag so a caller cannot
+            # enumerate cross-user statistics through the stdin bridge.
+            if os.environ.get("OPEN_BRAIN_ALLOW_ADMIN", "").lower() != "true":
+                print(json.dumps({
+                    "error": "permission denied: admin_stats requires OPEN_BRAIN_ALLOW_ADMIN=true on the server process"
+                }))
+            else:
+                result = admin_stats(conn)
+                print(json.dumps(result, default=str))
         elif op == "timeline":
             results = timeline(
                 conn,
@@ -4078,14 +4097,36 @@ def run_migration(sql_path: str) -> Dict[str, Any]:
     its own BEGIN/COMMIT it manages its own transaction, otherwise it runs
     inside the implicit transaction opened by psycopg2.
 
+    Security: the resolved canonical path of *sql_path* must be inside the
+    repo's ``sql/`` directory.  ``Path.resolve()`` is called before the check
+    so that symlinks pointing outside ``sql/`` are also rejected (symlink
+    traversal protection).
+
     Returns a status dict suitable for JSON serialization. Raises RuntimeError
     (the local error convention in this module) on failure.
     """
     if not sql_path:
         raise RuntimeError("Migration path required")
-    if not os.path.exists(sql_path):
+
+    # Confinement: resolve both paths to their canonical form (follows symlinks)
+    # so that ../traversal and symlink attacks are neutralised before the check.
+    allowed_dir = (Path(__file__).resolve().parent.parent / "sql").resolve()
+    try:
+        resolved = Path(sql_path).resolve()
+    except Exception as e:
+        raise RuntimeError(f"Cannot resolve migration path: {sql_path!r}: {e}") from e
+
+    try:
+        resolved.relative_to(allowed_dir)
+    except ValueError:
+        raise RuntimeError(
+            f"Migration path not allowed: {sql_path!r} resolves to {resolved!r}, "
+            f"which is outside the confined sql/ directory ({allowed_dir!r})"
+        )
+
+    if not resolved.exists():
         raise RuntimeError(f"Migration file not found: {sql_path}")
-    with open(sql_path, "r", encoding="utf-8") as f:
+    with open(resolved, "r", encoding="utf-8") as f:
         sql = f.read()
     if not sql.strip():
         raise RuntimeError(f"Migration file is empty: {sql_path}")
