@@ -602,13 +602,36 @@ def _get_database_url() -> str:
 
 
 def _connect():
-    """Establish PostgreSQL connection.
+    """Establish PostgreSQL connection with a hard connect_timeout.
 
-    Note: pgvector types are passed as string literals with ::vector casts in SQL,
-    so no special type registration is needed. This works through Neon's connection pooler.
+    Neon (and other cloud Postgres endpoints) can stall a TCP SYN for
+    75-130 seconds before timing out.  Without a timeout the hook process
+    hangs for that entire window, blocking every Pi turn / slash command.
+
+    connect_timeout=10 aborts the TCP handshake after 10 seconds.  The
+    value is injected into the DSN string so it works through both the
+    Neon direct and pooler URLs regardless of whether the caller supplies
+    keyword args or a raw DSN.
+
+    DSN injection rules:
+      - If the DSN already contains 'connect_timeout' we leave it as-is
+        to respect an explicit caller override.
+      - If the DSN has a '?' query section we append with '&'.
+      - Otherwise we append with '?'.
+
+    Note: pgvector types are passed as string literals with ::vector casts
+    in SQL, so no special type registration is needed.  This works through
+    Neon's connection pooler.
     """
     import psycopg2
-    conn = psycopg2.connect(_get_database_url())
+    dsn = _get_database_url()
+    # Inject connect_timeout unless the caller already set one.
+    if "connect_timeout" not in dsn:
+        if "?" in dsn:
+            dsn = dsn + "&connect_timeout=10"
+        else:
+            dsn = dsn + "?connect_timeout=10"
+    conn = psycopg2.connect(dsn)
     conn.autocommit = False
     return conn
 
