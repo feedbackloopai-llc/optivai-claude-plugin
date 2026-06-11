@@ -347,3 +347,146 @@ def test_embed_versioning_migration_backfills_correct_model():
         "Migration must also update brain.thought_versions; "
         f"got:\n{sql[:800]}"
     )
+
+
+# ─── (e) graph_search expansion fetch carries the embed_model filter ─────────
+#
+# Review FIX 2 (fblai-3yd1j): graph_search()'s step-3 batch fetch of
+# graph-expanded atoms must apply the same embed_model filter as search(),
+# else a graph hop can surface a stale-model atom under a model migration.
+
+class _SqlDrivenCursor:
+    """A mock cursor that returns canned results based on SQL content.
+
+    Drives graph_search() far enough to reach the step-3 fetch.  Records
+    every (sql, params) pair so the test can inspect the fetch.
+    """
+
+    def __init__(self, neighbor_thought_id: str, user_id: str):
+        self.neighbor_thought_id = neighbor_thought_id
+        self.user_id = user_id
+        self.calls = []  # list of (sql, params)
+        self._last_rows = []
+        self._last_one = None
+        self.description = [
+            ("thought_id",), ("raw_text",), ("summary",), ("thought_type",),
+            ("topics",), ("people",), ("action_items",), ("source",),
+            ("project",), ("created_at",), ("stv_frequency",), ("stv_confidence",),
+        ]
+
+    def execute(self, sql, params=None):
+        self.calls.append((str(sql), params))
+        s = str(sql)
+        # node_count probe
+        if "COUNT(*)" in s and "knowledge_graph_nodes" in s:
+            self._last_one = (1,)  # node_count > 0
+            self._last_rows = []
+        # seed node lookup
+        elif "node_id, node_nk" in s and "knowledge_graph_nodes" in s and "node_nk IN" in s:
+            self._last_rows = [(101, "thought:seed-1")]
+            self._last_one = None
+        # kg_neighborhood expansion → returns the new neighbor thought
+        elif "kg_neighborhood" in s:
+            # (node_id, node_nk, node_type, name, min_depth)
+            self._last_rows = [
+                (202, f"thought:{self.neighbor_thought_id}", "thought", "neighbor", 1),
+            ]
+            self._last_one = None
+        # atom_links 1-hop expansion → nothing
+        elif "atom_links" in s:
+            self._last_rows = []
+            self._last_one = None
+        # step-3 fetch — return one row for the neighbor (12 columns)
+        elif "FROM brain.thoughts" in s and "thought_id IN" in s:
+            self._last_rows = [(
+                self.neighbor_thought_id, "raw", "summary", "insight",
+                "[]", "[]", "[]", "test", "", "2026-06-01 00:00:00", 1.0, 0.7,
+            )]
+            self._last_one = None
+        else:
+            self._last_rows = []
+            self._last_one = None
+
+    def fetchone(self):
+        return self._last_one
+
+    def fetchall(self):
+        return self._last_rows
+
+    def close(self):
+        pass
+
+
+def test_graph_search_fetch_includes_embed_model_filter():
+    """graph_search step-3 fetch SQL must carry the embed_model filter + EMBED_MODEL param."""
+    neighbor_id = "graph-neighbor-1"
+    user_id = "testuser"
+
+    sql_cursor = _SqlDrivenCursor(neighbor_id, user_id)
+    mock_conn = mock.MagicMock()
+    mock_conn.cursor.return_value = sql_cursor
+
+    # Seed result from search() — a single seed atom.
+    seed_result = {
+        "THOUGHT_ID": "seed-1",
+        "HYBRID_SCORE": 0.9,
+        "SIMILARITY": 0.9,
+        "THOUGHT_TYPE": "insight",
+        "SUMMARY": "seed",
+        "RAW_TEXT": "seed text",
+        "CREATED_AT": "2026-06-01 00:00:00",
+        "TOPICS": [],
+        "PEOPLE": [],
+        "ACTION_ITEMS": [],
+        "KEYWORD_BOOST": 0.0,
+        "TIME_DECAY": 0.0,
+        "STV": {"f": 1.0, "c": 0.7},
+    }
+
+    with mock.patch("open_brain.search", return_value=[seed_result]), \
+         mock.patch("open_brain.emit_replay_log"):
+        open_brain.graph_search(
+            conn=mock_conn,
+            query="test query",
+            user_id=user_id,
+        )
+
+    # Locate the step-3 fetch call.
+    fetch_calls = [
+        (sql, params)
+        for sql, params in sql_cursor.calls
+        if "FROM brain.thoughts" in sql and "thought_id IN" in sql
+    ]
+
+    assert len(fetch_calls) >= 1, (
+        "graph_search did not reach the step-3 fetch; "
+        f"recorded SQL calls: {[c[0][:80] for c in sql_cursor.calls]!r}"
+    )
+
+    fetch_sql, fetch_params = fetch_calls[0]
+
+    assert "embed_model" in fetch_sql.lower(), (
+        "graph_search step-3 fetch must include the embed_model filter; "
+        f"fetch SQL:\n{fetch_sql}"
+    )
+
+    assert "embed_model is null" in fetch_sql.lower(), (
+        "graph_search step-3 fetch must include the 'embed_model IS NULL' "
+        f"defensive tolerance (mirroring search()); fetch SQL:\n{fetch_sql}"
+    )
+
+    # EMBED_MODEL must be present in the params tuple.
+    params_flat = list(fetch_params) if fetch_params else []
+    assert open_brain.EMBED_MODEL in params_flat, (
+        f"Expected EMBED_MODEL='{open_brain.EMBED_MODEL}' in graph_search fetch params; "
+        f"got: {params_flat!r}"
+    )
+
+    # The user_id must immediately precede EMBED_MODEL in the params (clause order),
+    # confirming the param alignment matches the SQL (... user_id = %s AND
+    # (embed_model = %s OR ...)).
+    uid_idx = params_flat.index(user_id)
+    assert params_flat[uid_idx + 1] == open_brain.EMBED_MODEL, (
+        "EMBED_MODEL param must immediately follow user_id to match the WHERE "
+        f"clause order; got params: {params_flat!r}"
+    )

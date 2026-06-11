@@ -346,6 +346,15 @@ def _try_warm_embed_server(text: str) -> Optional[list]:
             health_data = json.loads(resp.read().decode("utf-8"))
         if health_data.get("status") != "ok":
             return None
+        # Model-identity guard (review fix, fblai-3yd1j): a leftover/idle
+        # embed_server (idle timeout is 1800s) may be running a DIFFERENT
+        # model — possibly a same-dim model (e.g. paraphrase-multilingual-
+        # mpnet-base-v2 is also 768d).  Its vectors live in an incompatible
+        # embedding space; the len==768 check below CANNOT catch that.  If the
+        # server's model differs from EMBED_MODEL, fall back to local load so
+        # the stored vector matches the embed_model='all-mpnet-base-v2' stamp.
+        if health_data.get("model") != EMBED_MODEL:
+            return None  # server running a different model — fall back to local load
 
         # 2. Embed request.
         body = json.dumps({"text": text[:8000]}).encode("utf-8")
@@ -3775,6 +3784,11 @@ def graph_search(
                 extra_where += " AND created_at <= (%s::date + INTERVAL '1 day')"
                 extra_params.append(date_to)
 
+            # embed_model filter (review fix, fblai-3yd1j): mirror search()'s
+            # WHERE so a graph hop cannot surface a stale-model atom under a
+            # model migration.  OR IS NULL tolerates pre-migration rows.  The
+            # EMBED_MODEL param is inserted right after user_id to match the
+            # SQL clause order; extra_params still trails.
             fetch_sql = f"""
                 SELECT
                     thought_id, raw_text, summary, thought_type,
@@ -3783,9 +3797,10 @@ def graph_search(
                 FROM {TABLE}
                 WHERE thought_id IN ({id_placeholders})
                   AND user_id = %s
+                  AND (embed_model = %s OR embed_model IS NULL)
                   {extra_where}
             """
-            fetch_params: list = list(new_thought_ids) + [user_id] + extra_params
+            fetch_params: list = list(new_thought_ids) + [user_id, EMBED_MODEL] + extra_params
             cur.execute(fetch_sql, fetch_params)
             columns = [desc[0] for desc in cur.description]
             for row in cur.fetchall():

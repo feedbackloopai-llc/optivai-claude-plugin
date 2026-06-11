@@ -284,3 +284,110 @@ def test_unhealthy_server_status_falls_back_to_local():
     assert result == local_embedding, (
         f"Expected local fallback when server status != 'ok'; got {result[:3]}..."
     )
+
+
+# ─── (f) Server running a DIFFERENT model → fallback to local (review FIX 1) ──
+#
+# Break-input: a leftover/idle embed_server (idle timeout 1800s) running a
+# DIFFERENT 768-dim model.  status=="ok", dim==768 — both checks pass — but the
+# vector lives in an incompatible embedding space and would silently poison
+# cosine recall when stored with embed_model='all-mpnet-base-v2'.  The
+# model-identity guard must reject it.
+
+def _make_mock_urlopen_with_model(server_model: str, embedding: list):
+    """urlopen side_effect: healthy server reporting `server_model`, returns `embedding`."""
+    def urlopen_side_effect(request, timeout=None):
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        if "/health" in url:
+            body = json.dumps({"status": "ok", "model": server_model, "uptime_s": 99.0})
+        elif "/embed" in url:
+            body = json.dumps({"embedding": embedding, "dim": len(embedding)})
+        else:
+            raise urllib.error.URLError("unexpected path")
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = body.encode("utf-8")
+        mock_resp.__enter__ = mock.MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = mock.MagicMock(return_value=False)
+        return mock_resp
+    return urlopen_side_effect
+
+
+def test_try_warm_embed_server_returns_none_on_model_mismatch():
+    """_try_warm_embed_server must return None when server's model != EMBED_MODEL.
+
+    Even with status=='ok' AND a 768-dim embedding (same dim, different model).
+    This is the direct unit test of the model-identity guard.
+    """
+    # A different but same-dim model (paraphrase-multilingual-mpnet-base-v2 is 768d).
+    different_model = "paraphrase-multilingual-mpnet-base-v2"
+    assert different_model != open_brain.EMBED_MODEL, (
+        "Test precondition: the mismatch model must differ from EMBED_MODEL"
+    )
+    incompatible_but_768d = [0.123] * 768
+
+    with mock.patch("urllib.request.urlopen",
+                    side_effect=_make_mock_urlopen_with_model(different_model, incompatible_but_768d)):
+        result = open_brain._try_warm_embed_server("model mismatch unit test")
+
+    assert result is None, (
+        "_try_warm_embed_server must return None when the server reports a model "
+        f"!= EMBED_MODEL ('{open_brain.EMBED_MODEL}'); the dim==768 check cannot "
+        f"catch a same-dim-different-model server.  Got: {result!r}"
+    )
+
+
+def test_model_mismatch_falls_back_to_local_model():
+    """_generate_embedding falls back to local load when server runs a different model.
+
+    Full-path test: status==ok, dim==768, model != EMBED_MODEL → local model
+    is used and a detached spawn is NOT relied upon for correctness (the local
+    result is what gets returned).
+    """
+    different_model = "paraphrase-multilingual-mpnet-base-v2"
+    incompatible_but_768d = [0.456] * 768
+    local_embedding = [0.789] * 768
+
+    mock_model = mock.MagicMock()
+    mock_model.encode.return_value = mock.MagicMock(tolist=lambda: local_embedding)
+
+    with mock.patch("urllib.request.urlopen",
+                    side_effect=_make_mock_urlopen_with_model(different_model, incompatible_but_768d)), \
+         mock.patch("open_brain._get_embedding_model", return_value=mock_model), \
+         mock.patch("open_brain._spawn_embed_server_detached"):
+
+        result = open_brain._generate_embedding("model mismatch full-path test")
+
+    assert result == local_embedding, (
+        "Expected local fallback when server runs a different model; "
+        f"got the (incompatible) server vector instead: {result[:3]}..."
+    )
+    # Critically, the incompatible server vector must NOT be returned.
+    assert result != incompatible_but_768d, (
+        "The incompatible same-dim server vector leaked through the model guard"
+    )
+
+
+def test_matching_model_still_uses_server():
+    """Sanity: when the server's model MATCHES EMBED_MODEL, the server is used (no regression)."""
+    server_embedding = [0.321] * 768
+
+    local_loaded = []
+
+    def mock_get_model():
+        local_loaded.append(True)
+        m = mock.MagicMock()
+        m.encode.return_value = mock.MagicMock(tolist=lambda: [0.0] * 768)
+        return m
+
+    with mock.patch("urllib.request.urlopen",
+                    side_effect=_make_mock_urlopen_with_model(open_brain.EMBED_MODEL, server_embedding)), \
+         mock.patch("open_brain._get_embedding_model", side_effect=mock_get_model):
+
+        result = open_brain._generate_embedding("matching model test")
+
+    assert result == server_embedding, (
+        f"Server with matching model must be used; got {result[:3]}..."
+    )
+    assert len(local_loaded) == 0, (
+        "Local model must NOT load when the server's model matches EMBED_MODEL"
+    )
