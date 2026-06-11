@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: unit — pure-logic tests, no DB required, fast.
+  #
+  # Runs only the test files (and within those files, only the classes/functions)
+  # that are explicitly documented as requiring no DATABASE_URL. The list is
+  # derived from the file-level docstrings and the fixture pattern in each test
+  # module (modules with a DB fixture call pytest.skip when DATABASE_URL is
+  # absent; we exclude those modules here so a missing DATABASE_URL is a hard
+  # failure rather than a silent skip-to-green).
+  #
+  # No-skip gate: after pytest we assert that zero tests were skipped among the
+  # explicitly listed files. Any skip in this job is a CI configuration error —
+  # it means a test that SHOULD run without a DB was somehow skipped, hiding a
+  # regression.
+  #
+  # sentence-transformers concern: open_brain.py imports sentence-transformers at
+  # module load time. The pure-logic tests monkeypatch _generate_embedding, but
+  # the import itself still downloads the model on first run. To avoid a 420 MB
+  # download on every unit run we cache ~/.cache/huggingface. On the FIRST run
+  # the model downloads and the cache is warmed; subsequent runs hit the cache
+  # (typically a few seconds). The unit job does NOT skip the import — doing so
+  # would be an artificial environment difference from production.
+  # ─────────────────────────────────────────────────────────────────────────────
+  unit:
+    name: unit (no DB)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache HuggingFace model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          # Key on the model name embedded in requirements.txt so a model
+          # version bump invalidates the cache.
+          key: hf-mpnet-base-v2-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: |
+            hf-mpnet-base-v2-
+
+      - name: Install Python dependencies
+        working-directory: scripts
+        run: pip install -r requirements.txt
+
+      - name: Run pure-logic unit tests (explicit file list, 0-skip gate)
+        working-directory: scripts
+        run: |
+          # Run only test files that are documented as running without a DB.
+          # Each of these files either (a) never touches DB at all, or (b) has
+          # a module-scoped fixture that calls pytest.skip — but here we only
+          # target the classes/functions that are explicitly DB-free.
+          #
+          # We pass -x (stop on first failure) and -v for readability in CI.
+          pytest \
+            tests/test_nal_stv.py::TestNalRevise \
+            tests/test_capture_redaction.py \
+            tests/test_redact_ipv6.py \
+            tests/test_db_url_resolution.py \
+            tests/test_migration_safety.py \
+            tests/test_pi_bridge_t31.py \
+            tests/test_embed_server.py \
+            tests/test_bridge_auth.py \
+            tests/test_log_writer_email.py \
+            tests/test_session_summary_email.py \
+            "tests/test_vfe_residue.py::TestParaphraseDegradedHonesty" \
+            tests/test_install_check.py \
+            tests/test_links_retrieval.py::TestPenaltyMath \
+            tests/test_links_retrieval.py::TestDisputedAnnotation \
+            tests/test_links_retrieval.py::TestFormatAnnotations \
+            hooks/tests/ \
+            -v \
+            --tb=short \
+            2>&1 | tee /tmp/pytest-unit-output.txt
+          exit_code=${PIPESTATUS[0]}
+          # ── No-skip gate ────────────────────────────────────────────────────
+          # The summary line from pytest looks like:
+          #   "N passed, M skipped, ..." or "N passed in Xs"
+          # We parse the skip count from the summary. If ANY test in this
+          # explicitly-enumerated set was skipped, it means either:
+          #   (a) the test file was accidentally given a DB-dependent fixture, or
+          #   (b) a new skip guard was added without removing the file from here.
+          # Either way it is a CI configuration error that must be fixed.
+          skip_count=$(grep -oP '\d+(?= skipped)' /tmp/pytest-unit-output.txt || echo "0")
+          echo "Skip count in unit job: ${skip_count}"
+          if [ "${skip_count}" -gt "0" ]; then
+            echo "ERROR: ${skip_count} test(s) skipped in the no-DB unit job."
+            echo "These tests MUST run without a DATABASE_URL. Either remove the"
+            echo "file from the unit job's list, or fix the skip guard."
+            exit 1
+          fi
+          exit ${exit_code}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: integration — full pytest suite with a live pgvector DB.
+  #
+  # Spins up a pgvector/pgvector:pg17 service container, bootstraps the schema
+  # (BRAIN_SCHEMA_PG.sql + KNOWLEDGE_GRAPH_PG.sql + all migrations via
+  # migrate-all.sh), then runs the complete test suite. This is the job that
+  # makes the DB-backed tests actually execute in CI rather than skip silently.
+  #
+  # sentence-transformers model cache: the model weights (~420 MB) are cached
+  # in ~/.cache/huggingface between runs. On the first run after a cache miss
+  # the model downloads during the "warmup" step; the download is ~30-45 s on
+  # a GitHub Actions runner. Subsequent runs are a few seconds.
+  #
+  # NEVER point this job at the production Neon DB. DATABASE_URL is constructed
+  # entirely from the ephemeral service container credentials; no secret is used.
+  #
+  # pgvector tag: pg17 confirmed to exist (pulled 2026-06-10). If pg17 is ever
+  # retired, change the tag to pg16 — both support the pgvector extension version
+  # used by this codebase.
+  # ─────────────────────────────────────────────────────────────────────────────
+  integration:
+    name: integration (pgvector DB)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: brain_test
+          POSTGRES_USER: brain
+          POSTGRES_PASSWORD: brainpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: "postgresql://brain:brainpass@localhost:5432/brain_test"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache HuggingFace model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-mpnet-base-v2-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: |
+            hf-mpnet-base-v2-
+
+      - name: Install Python dependencies
+        working-directory: scripts
+        run: pip install -r requirements.txt
+
+      - name: Bootstrap brain schema (BRAIN_SCHEMA_PG.sql)
+        working-directory: scripts
+        run: |
+          python3 open_brain.py --init
+
+      - name: Bootstrap knowledge graph schema (KNOWLEDGE_GRAPH_PG.sql)
+        working-directory: scripts
+        run: |
+          # KNOWLEDGE_GRAPH_PG.sql must be applied via the --migrate path which
+          # validates the path is inside the sql/ directory.
+          python3 open_brain.py --migrate ../sql/KNOWLEDGE_GRAPH_PG.sql
+
+      - name: Run migrations (migrate-all.sh)
+        run: |
+          bash scripts/migrate-all.sh
+
+      - name: Run full pytest suite
+        working-directory: scripts
+        run: |
+          pytest tests/ hooks/tests/ -v --tb=short
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 3: drift — report mode (informational, always exits 0).
+  #
+  # Runs scripts/install-check.sh in report-only mode (no --strict flag) so
+  # drift between the repo and the live ~/.claude install is visible in CI logs
+  # without blocking merges. The HARD drift gate lives in the pi-plugin
+  # sync-check job (which compares bridge files against canonical sources).
+  #
+  # The live ~/.claude directory does not exist on GitHub Actions runners, so
+  # install-check.sh will exit 2 (root-not-found). We handle exit 2 as neutral
+  # (informational skip) — the script prints a clear message and we log it.
+  # Exit 1 (--strict mode drift) is not used in this job.
+  # ─────────────────────────────────────────────────────────────────────────────
+  drift:
+    name: drift (report)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run install-check.sh (report-only)
+        run: |
+          bash scripts/install-check.sh || rc=$?
+          rc=${rc:-0}
+          if [ "${rc}" -eq 2 ]; then
+            echo "install-check: live ~/.claude not present on runner (expected)."
+            echo "Drift check is informational only. Exit 2 treated as neutral skip."
+            exit 0
+          fi
+          # rc=0: all in sync. rc=1 would be --strict drift (not used here).
+          exit "${rc}"
