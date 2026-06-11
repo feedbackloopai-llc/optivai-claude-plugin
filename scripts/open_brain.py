@@ -2798,14 +2798,15 @@ def capture(
                 thought_id, user_id, raw_text, summary, thought_type,
                 topics, people, action_items, source, session_id, project,
                 prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri,
-                embedding, metadata, stv_frequency, stv_confidence, created_at, updated_at
+                embedding, metadata, stv_frequency, stv_confidence, stv_seeded,
+                created_at, updated_at
             )
             VALUES (
                 %s, %s, %s, %s, %s,
                 %s::jsonb, %s::jsonb, %s::jsonb,
                 %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s::vector, %s::jsonb, %s, %s,
+                %s::vector, %s::jsonb, %s, %s, TRUE,
                 NOW(), NOW()
             )
         """
@@ -2832,6 +2833,10 @@ def capture(
                 json.dumps(metadata),
                 final_stv_f,
                 final_stv_c,
+                # stv_seeded=TRUE: stv is intentionally set at capture time
+                # (either from --stv-c/--stv-f or the confidence-label default).
+                # Marks the row so future idempotent migration re-runs never
+                # re-backfill this atom's stv (fblai-3zk83).
             ),
         )
         conn.commit()
@@ -4212,13 +4217,23 @@ def add_link(
 
                 # RB: snapshot target BEFORE modifying so belief change is
                 # rollback-able and visible in --trace.
-                snapshot_thought(
+                #
+                # Atomicity note (fblai-fzwlw): snapshot_thought commits
+                # internally (it uses SELECT FOR UPDATE + conn.commit()).
+                # Making it defer its commit would require restructuring both
+                # its own conn.commit() AND the emit_replay_log conn.commit()
+                # that follows it — too invasive given ~15 other callers.
+                # Instead we use orphan-cleanup: capture the version_id, and
+                # if the UPDATE below fails, DELETE that version row so the
+                # audit trail never claims a revision that did not happen.
+                _snap_result = snapshot_thought(
                     conn,
                     thought_id=target_id,
                     user_id=user_id,
                     prov_agent=prov_agent,
                     prov_activity="nal_evidence",
                 )
+                _snap_version_id = _snap_result["version_id"]
 
                 # Revise target stv with the attenuated evidence.
                 new_f, new_c = nal_revise(_tgt_f, _tgt_c, _ev_f, _ev_c)
@@ -4233,10 +4248,35 @@ def add_link(
                     )
                     conn.commit()
                 except Exception:
+                    # UPDATE failed after snapshot already committed.
+                    # Best-effort DELETE the orphan version row so the audit
+                    # trail does not claim an nal_evidence revision that never
+                    # applied to the live row.
                     try:
                         conn.rollback()
                     except Exception:
                         pass
+                    try:
+                        _cleanup_cur = conn.cursor()
+                        try:
+                            _cleanup_cur.execute(
+                                "DELETE FROM brain.thought_versions "
+                                "WHERE version_id = %s",
+                                (_snap_version_id,),
+                            )
+                            conn.commit()
+                        finally:
+                            _cleanup_cur.close()
+                    except Exception as _del_exc:
+                        # Cleanup itself failed — log and leave the orphan.
+                        # The orphan version row is misleading but not
+                        # data-loss; it can be identified via /brain-trace
+                        # (prov_activity='nal_evidence' with no live stv match).
+                        logger.warning(
+                            f"NAL evidence propagation: UPDATE failed and "
+                            f"orphan-cleanup of version_id={_snap_version_id} "
+                            f"also failed: {_del_exc}"
+                        )
                     raise
                 finally:
                     _upd_cur.close()

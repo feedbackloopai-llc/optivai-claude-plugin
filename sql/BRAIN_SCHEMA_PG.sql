@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS thoughts (
     -- scripts/open_brain.py::nal_revise().
     stv_frequency   REAL              NOT NULL DEFAULT 1.0,
     stv_confidence  REAL              NOT NULL DEFAULT 0.5,
+    -- Sentinel: TRUE once stv has been intentionally set (at capture or post-T2.6
+    -- backfill). Future idempotent migrations guard on stv_seeded=FALSE instead of
+    -- stv_confidence=0.5, preventing clobber of deliberate --stv-c 0.5 overrides.
+    stv_seeded      BOOLEAN           NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ       DEFAULT NOW(),
     updated_at      TIMESTAMPTZ       DEFAULT NOW(),
     CONSTRAINT fk_thoughts_derived_from
@@ -91,6 +95,9 @@ CREATE TABLE IF NOT EXISTS thought_versions (
     -- by add_link (verifies/refutes) via snapshot_thought(prov_activity='nal_evidence').
     stv_frequency   REAL              NOT NULL DEFAULT 1.0,
     stv_confidence  REAL              NOT NULL DEFAULT 0.5,
+    -- Sentinel: mirrors brain.thoughts.stv_seeded; version rows from capture()
+    -- are inserted with TRUE (stv was intentionally set at creation time).
+    stv_seeded      BOOLEAN           NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
     UNIQUE (thought_id, revision)
 );
