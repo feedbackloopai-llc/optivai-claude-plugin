@@ -551,14 +551,27 @@ def _get_database_url() -> str:
                 # fblai-lm327: validate the value looks like a postgres URL.
                 # A corrupted or multiline keychain entry must not be forwarded
                 # to _connect() where it would surface in an exception with the
-                # raw value.  Treat non-postgres values as a keychain miss and
-                # fall through to the config-file fallback.
-                if keychain_url.startswith("postgres"):
+                # raw value.  Treat invalid values as a keychain miss and fall
+                # through to the config-file fallback.
+                #
+                # Defense-in-depth (review fix): reject embedded control chars
+                # BEFORE the prefix check.  .strip() only trims the ends, so a
+                # value like "postgresql://legithost/db\nhostaddr=evil.com"
+                # passes startswith("postgres") yet smuggles an extra libpq
+                # keyword into the connection string via the newline.  Reject
+                # any \n / \r / \x00 outright.
+                if any(c in keychain_url for c in ("\n", "\r", "\x00")):
+                    print(
+                        "WARNING: keychain value contains control characters; ignoring",
+                        file=sys.stderr,
+                    )
+                elif keychain_url.startswith("postgres"):
                     return keychain_url
-                print(
-                    "WARNING: keychain value is not a postgres URL; ignoring",
-                    file=sys.stderr,
-                )
+                else:
+                    print(
+                        "WARNING: keychain value is not a postgres URL; ignoring",
+                        file=sys.stderr,
+                    )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         # security binary absent (non-macOS) or timed out — fall through.
         pass

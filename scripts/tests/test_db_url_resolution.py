@@ -379,3 +379,97 @@ def test_valid_postgres_url_in_keychain_is_returned(monkeypatch):
     assert result == valid_postgres, (
         f"Valid 'postgres://' URL must be returned; got {result!r}"
     )
+
+
+def test_keychain_embedded_newline_dsn_injection_is_rejected(monkeypatch, capsys):
+    """A 'postgres'-prefixed value with an embedded newline must be rejected (review fix).
+
+    fblai-lm327 review fix: a value like
+    'postgresql://legithost/db\\nhostaddr=evil.com' passes
+    startswith("postgres") yet smuggles an extra libpq keyword into the
+    connection string via the newline (.strip() only trims the ends).  Such
+    control-char-bearing values must be rejected BEFORE the prefix check,
+    emit a WARNING, and fall through to config — NOT be returned to
+    psycopg2.connect().
+    """
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.delenv("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", raising=False)
+
+    # Passes startswith("postgres") but carries an embedded newline that would
+    # inject a hostaddr override into the libpq DSN.
+    injection_value = "postgresql://legithost/db\nhostaddr=evil.com"
+
+    def fake_run_injection(cmd, **kwargs):
+        result = mock.MagicMock(spec=subprocess.CompletedProcess)
+        result.returncode = 0
+        # No trailing newline to strip — the newline is in the MIDDLE.
+        result.stdout = injection_value
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run_injection)
+
+    fake_config = _make_fake_config(_CONFIG_CONN)
+    with mock.patch("open_brain.Path") as mock_path_cls:
+        home_mock = mock.MagicMock()
+        mock_path_cls.home.return_value = home_mock
+        home_mock.__truediv__ = lambda self, other: home_mock
+        home_mock.exists.return_value = True
+
+        with mock.patch("builtins.open", fake_config):
+            result = open_brain._get_database_url()
+
+    # Must NOT return the injection value (the whole point of the fix).
+    assert result != injection_value, (
+        f"Control-char-bearing keychain value must NOT be returned; got {result!r}"
+    )
+    # And the dangerous 'hostaddr=evil.com' fragment must not leak into the URL.
+    assert "hostaddr=evil.com" not in result, (
+        f"Injected libpq keyword must not appear in returned URL; got {result!r}"
+    )
+    # Must fall through to config.
+    assert result == _CONFIG_CONN, (
+        f"After control-char rejection, config fallback must be used; got {result!r}"
+    )
+
+    captured = capsys.readouterr()
+    assert "control character" in captured.err.lower() or "WARNING" in captured.err, (
+        f"Expected control-character WARNING on stderr; got: {captured.err!r}"
+    )
+
+
+def test_keychain_embedded_carriage_return_and_null_rejected(monkeypatch):
+    """Embedded \\r and \\x00 (not just \\n) must also be rejected and fall through."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.delenv("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", raising=False)
+
+    fake_config = _make_fake_config(_CONFIG_CONN)
+
+    for bad in (
+        "postgresql://legithost/db\rhostaddr=evil.com",
+        "postgresql://legithost/db\x00hostaddr=evil.com",
+    ):
+        def fake_run_bad(cmd, _val=bad, **kwargs):
+            result = mock.MagicMock(spec=subprocess.CompletedProcess)
+            result.returncode = 0
+            result.stdout = _val
+            return result
+
+        monkeypatch.setattr("subprocess.run", fake_run_bad)
+
+        with mock.patch("open_brain.Path") as mock_path_cls:
+            home_mock = mock.MagicMock()
+            mock_path_cls.home.return_value = home_mock
+            home_mock.__truediv__ = lambda self, other: home_mock
+            home_mock.exists.return_value = True
+
+            with mock.patch("builtins.open", fake_config):
+                result = open_brain._get_database_url()
+
+        assert result == _CONFIG_CONN, (
+            f"Control-char value {bad!r} must fall through to config; got {result!r}"
+        )
+        assert "evil.com" not in result, (
+            f"Injected fragment must not leak; got {result!r}"
+        )
