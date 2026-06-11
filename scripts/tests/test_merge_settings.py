@@ -33,7 +33,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from merge_settings import (  # noqa: E402
+    LEGACY_HOOK_VARIANTS,
     PLUGIN_HOOKS,
+    _migrate_legacy_commands,
     load_settings,
     main,
     merge_settings,
@@ -590,5 +592,301 @@ class TestRealisticFixturePreservation:
     def test_second_install_with_prefs_is_idempotent(self):
         """Simulates running install.sh twice on a configured machine."""
         first, _ = merge_settings(REALISTIC_EXISTING)
+        second, _ = merge_settings(first)
+        assert first == second
+
+
+# ---------------------------------------------------------------------------
+# 10. FIX 1 — null env/hooks must not crash the merge
+# ---------------------------------------------------------------------------
+
+class TestNullValueCoercion:
+    def test_null_env_merges_cleanly(self):
+        """settings.json with `"env": null` must not throw TypeError."""
+        merged, _ = merge_settings({"env": None})
+        assert isinstance(merged["env"], dict)
+        assert merged["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
+
+    def test_null_hooks_merges_cleanly(self):
+        """settings.json with `"hooks": null` must not throw TypeError."""
+        merged, _ = merge_settings({"hooks": None})
+        assert isinstance(merged["hooks"], dict)
+        for event in PLUGIN_HOOKS:
+            assert event in merged["hooks"]
+
+    def test_null_hooks_produces_all_commands(self):
+        merged, _ = merge_settings({"hooks": None})
+        found = _all_hook_commands(merged)
+        for cmd in ALL_PLUGIN_COMMANDS:
+            assert cmd in found
+
+    def test_null_env_produces_all_commands_and_hooks(self):
+        merged, _ = merge_settings({"env": None})
+        found = _all_hook_commands(merged)
+        for cmd in ALL_PLUGIN_COMMANDS:
+            assert cmd in found
+
+    def test_both_null_merges_cleanly(self):
+        merged, _ = merge_settings({"env": None, "hooks": None})
+        assert isinstance(merged["env"], dict)
+        assert isinstance(merged["hooks"], dict)
+        found = _all_hook_commands(merged)
+        for cmd in ALL_PLUGIN_COMMANDS:
+            assert cmd in found
+
+    def test_null_env_preserves_other_top_level_keys(self):
+        merged, _ = merge_settings({"env": None, "model": "opus"})
+        assert merged["model"] == "opus"
+
+    def test_non_dict_env_resets_with_warning(self):
+        """A non-None, non-dict env (e.g. a string) is treated as corrupt: reset."""
+        merged, log = merge_settings({"env": "oops"})
+        assert isinstance(merged["env"], dict)
+        assert merged["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
+        assert any("WARNING" in l and "env" in l for l in log)
+
+    def test_non_dict_hooks_resets_with_warning(self):
+        merged, log = merge_settings({"hooks": [1, 2, 3]})
+        assert isinstance(merged["hooks"], dict)
+        for event in PLUGIN_HOOKS:
+            assert event in merged["hooks"]
+        assert any("WARNING" in l and "hooks" in l for l in log)
+
+    def test_null_via_full_cli_pipeline(self, tmp_path):
+        """End-to-end: a file with null env+hooks → main() produces valid settings."""
+        settings_path = str(tmp_path / "settings.json")
+        with open(settings_path, "w") as f:
+            json.dump({"env": None, "hooks": None, "model": "opus"}, f)
+        rc = main([settings_path])
+        assert rc == 0
+        with open(settings_path) as f:
+            data = json.load(f)
+        assert data["model"] == "opus"
+        assert isinstance(data["env"], dict)
+        for cmd in ALL_PLUGIN_COMMANDS:
+            assert cmd in _all_hook_commands(data)
+
+    def test_unmerge_tolerates_null_hooks(self):
+        """unmerge on `"hooks": null` must not crash."""
+        cleaned, _ = unmerge_settings({"hooks": None, "model": "opus"})
+        assert cleaned["model"] == "opus"
+
+
+# ---------------------------------------------------------------------------
+# 11. FIX 2 — legacy-variant migration prevents upgrade duplicates
+# ---------------------------------------------------------------------------
+
+HOME = os.path.expanduser("~")
+
+
+class TestLegacyVariantMigration:
+    def test_absolute_path_variant_converges_to_single_canonical(self):
+        """A legacy absolute-path SessionStart hook → exactly one canonical entry."""
+        legacy_cmd = f"python3 {HOME}/.claude/hooks/context_primer.py"
+        existing = {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": legacy_cmd}]}
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        ss_cmds = [
+            h["command"]
+            for g in merged["hooks"]["SessionStart"]
+            for h in g["hooks"]
+        ]
+        canonical = "python3 ~/.claude/hooks/context_primer.py"
+        # The legacy form is gone
+        assert legacy_cmd not in ss_cmds
+        # The canonical form is present exactly once (no duplicate)
+        assert ss_cmds.count(canonical) == 1
+        assert len(ss_cmds) == 1
+
+    def test_home_expanded_python_variant_removed(self):
+        """A `$HOME`-spelled python hook (wrong form) is migrated away."""
+        legacy_cmd = "python3 $HOME/.claude/hooks/pre-tool-use.py"
+        existing = {
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "*", "hooks": [{"type": "command", "command": legacy_cmd}]}
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        pt_cmds = [
+            h["command"] for g in merged["hooks"]["PreToolUse"] for h in g["hooks"]
+        ]
+        canonical = "python3 ~/.claude/hooks/pre-tool-use.py"
+        assert legacy_cmd not in pt_cmds
+        assert pt_cmds.count(canonical) == 1
+
+    def test_tilde_form_stop_hook_removed(self):
+        """The ~-form of the bash stop-hook (broken: ~ doesn't expand in quotes)."""
+        legacy_cmd = 'bash "~/.claude/hooks/stop-hook.sh"'
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": legacy_cmd}]}
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        stop_cmds = [
+            h["command"] for g in merged["hooks"]["Stop"] for h in g["hooks"]
+        ]
+        canonical = 'bash "$HOME/.claude/hooks/stop-hook.sh"'
+        assert legacy_cmd not in stop_cmds
+        assert stop_cmds.count(canonical) == 1
+
+    def test_absolute_stop_hook_removed(self):
+        legacy_cmd = f'bash "{HOME}/.claude/hooks/stop-hook.sh"'
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": legacy_cmd}]}
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        stop_cmds = [
+            h["command"] for g in merged["hooks"]["Stop"] for h in g["hooks"]
+        ]
+        canonical = 'bash "$HOME/.claude/hooks/stop-hook.sh"'
+        assert legacy_cmd not in stop_cmds
+        assert stop_cmds.count(canonical) == 1
+
+    def test_canonical_forms_are_not_treated_as_legacy(self):
+        """The canonical $HOME stop-hook must NOT be in the legacy variant list."""
+        canonical = 'bash "$HOME/.claude/hooks/stop-hook.sh"'
+        for variants in LEGACY_HOOK_VARIANTS.values():
+            assert canonical not in variants
+        canonical_py = "python3 ~/.claude/hooks/context_primer.py"
+        for variants in LEGACY_HOOK_VARIANTS.values():
+            assert canonical_py not in variants
+
+    def test_migration_preserves_unrelated_hooks_in_same_event(self):
+        """A user's own Stop hook survives alongside the migration."""
+        legacy_cmd = f"python3 {HOME}/.claude/hooks/session_summary.py"
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": legacy_cmd},
+                            {"type": "command", "command": "python3 ~/my-own-stop.py"},
+                        ]
+                    }
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        stop_cmds = [
+            h["command"] for g in merged["hooks"]["Stop"] for h in g["hooks"]
+        ]
+        assert legacy_cmd not in stop_cmds
+        assert "python3 ~/my-own-stop.py" in stop_cmds  # user hook preserved
+        assert stop_cmds.count("python3 ~/.claude/hooks/session_summary.py") == 1
+
+    def test_migration_function_directly(self):
+        """_migrate_legacy_commands strips variants and drops emptied groups."""
+        legacy_cmd = f"python3 {HOME}/.claude/hooks/context_primer.py"
+        hooks = {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": legacy_cmd}]}
+            ]
+        }
+        log = _migrate_legacy_commands(hooks)
+        # Group emptied → event removed
+        assert "SessionStart" not in hooks
+        assert any("migrated away" in l for l in log)
+
+    def test_idempotency_holds_after_legacy_migration(self):
+        """FIX 3(b): merge twice == equal even when input had legacy variants."""
+        legacy_cmd = f"python3 {HOME}/.claude/hooks/context_primer.py"
+        existing = {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": legacy_cmd}]}
+                ]
+            },
+            "model": "opus",
+        }
+        first, _ = merge_settings(existing)
+        second, _ = merge_settings(first)
+        assert first == second
+        # And no duplicates after the round-trip
+        ss_cmds = [
+            h["command"] for g in second["hooks"]["SessionStart"] for h in g["hooks"]
+        ]
+        assert ss_cmds.count("python3 ~/.claude/hooks/context_primer.py") == 1
+
+
+# ---------------------------------------------------------------------------
+# 12. FIX 3(a) — non-"*" matcher group is untouched; commands land in new "*"
+# ---------------------------------------------------------------------------
+
+class TestMatcherGroupIsolation:
+    def test_plugin_commands_land_in_new_star_group(self):
+        """User has a UserPromptSubmit group with matcher 'Edit' (not '*')."""
+        existing = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "Edit",
+                        "hooks": [
+                            {"type": "command", "command": "python3 ~/edit-only.py"}
+                        ],
+                    }
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        groups = merged["hooks"]["UserPromptSubmit"]
+
+        # The "Edit" group must be untouched
+        edit_groups = [g for g in groups if g.get("matcher") == "Edit"]
+        assert len(edit_groups) == 1
+        edit_cmds = [h["command"] for h in edit_groups[0]["hooks"]]
+        assert edit_cmds == ["python3 ~/edit-only.py"]
+
+        # The plugin commands must have landed in a NEW "*" group
+        star_groups = [g for g in groups if g.get("matcher") == "*"]
+        assert len(star_groups) == 1
+        star_cmds = [h["command"] for h in star_groups[0]["hooks"]]
+        assert "python3 ~/.claude/hooks/user-prompt-submit.py" in star_cmds
+        assert "python3 ~/.claude/hooks/auto_recall_hook.py" in star_cmds
+
+    def test_edit_group_command_not_duplicated_into_star(self):
+        existing = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "Edit",
+                        "hooks": [
+                            {"type": "command", "command": "python3 ~/edit-only.py"}
+                        ],
+                    }
+                ]
+            }
+        }
+        merged, _ = merge_settings(existing)
+        all_cmds = _all_hook_commands(merged)
+        assert all_cmds.count("python3 ~/edit-only.py") == 1
+
+    def test_matcher_isolation_is_idempotent(self):
+        existing = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "Edit",
+                        "hooks": [
+                            {"type": "command", "command": "python3 ~/edit-only.py"}
+                        ],
+                    }
+                ]
+            }
+        }
+        first, _ = merge_settings(existing)
         second, _ = merge_settings(first)
         assert first == second

@@ -66,6 +66,113 @@ PLUGIN_HOOKS: Dict[str, Tuple[Optional[str], List[str]]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Legacy / variant hook-command forms (upgrade convergence)
+# ---------------------------------------------------------------------------
+#
+# INVARIANT:
+#   PLUGIN_HOOKS strings above are the CANONICAL forms. Command-string matching
+#   is exact (by design — see _command_present), so when a canonical string
+#   changes across plugin versions, the old form is left orphaned in the user's
+#   settings.json AND the new form is added — yielding a DUPLICATE hook that
+#   fires the same logic twice.
+#
+#   LEGACY_HOOK_VARIANTS lists historical / alternate spellings for each logical
+#   hook. _migrate_legacy_commands() strips any of these variant strings from the
+#   hooks groups BEFORE the present-check runs, so the normal add-step then
+#   leaves exactly ONE canonical entry per logical hook on upgrade.
+#
+# FORM RATIONALE (do NOT "normalize ~ and $HOME to one form"):
+#   - Python hooks use `~/.claude/hooks/...` because the Claude Code harness
+#     expands `~` when it runs the command.
+#   - The bash stop-hook uses `bash "$HOME/.claude/hooks/stop-hook.sh"` because
+#     `~` does NOT expand inside bash double-quotes — `$HOME` is REQUIRED there.
+#   That ~/$HOME asymmetry is semantically necessary and is preserved. The
+#   variants below are STALE forms to remove, not a normalization target.
+#
+# Each entry maps an event -> list of stale command strings to remove.
+# (These are historical absolute-path / wrong-expansion forms that earlier
+#  installs may have written.)
+_HOME = os.path.expanduser("~")
+LEGACY_HOOK_VARIANTS: Dict[str, List[str]] = {
+    "SessionStart": [
+        # absolute-path form
+        f"python3 {_HOME}/.claude/hooks/context_primer.py",
+        # $HOME-expanded form of a python hook (wrong: harness expands ~)
+        "python3 $HOME/.claude/hooks/context_primer.py",
+    ],
+    "PreToolUse": [
+        f"python3 {_HOME}/.claude/hooks/pre-tool-use.py",
+        "python3 $HOME/.claude/hooks/pre-tool-use.py",
+    ],
+    "UserPromptSubmit": [
+        f"python3 {_HOME}/.claude/hooks/user-prompt-submit.py",
+        "python3 $HOME/.claude/hooks/user-prompt-submit.py",
+        f"python3 {_HOME}/.claude/hooks/auto_recall_hook.py",
+        "python3 $HOME/.claude/hooks/auto_recall_hook.py",
+    ],
+    "Stop": [
+        f"python3 {_HOME}/.claude/hooks/session_summary.py",
+        "python3 $HOME/.claude/hooks/session_summary.py",
+        # ~-form of the stop-hook: WRONG because ~ does not expand in bash
+        # double-quotes, so this would have been a broken path. Strip it.
+        'bash "~/.claude/hooks/stop-hook.sh"',
+        # absolute-path form of the stop-hook
+        f'bash "{_HOME}/.claude/hooks/stop-hook.sh"',
+    ],
+}
+
+
+def _migrate_legacy_commands(hooks: Dict[str, Any]) -> List[str]:
+    """
+    Strip known stale/variant command strings from *hooks* (mutated in place)
+    so that the subsequent canonical add yields exactly one entry per logical
+    hook on upgrade.
+
+    Returns a list of human-readable log lines for what was migrated away.
+    Groups that become empty after stripping are removed; events that become
+    empty are removed.
+    """
+    log: List[str] = []
+
+    for event, variants in LEGACY_HOOK_VARIANTS.items():
+        if event not in hooks:
+            continue
+        variant_set = set(variants)
+        event_groups = hooks.get(event)
+        if not isinstance(event_groups, list):
+            continue
+
+        new_groups: List[Dict[str, Any]] = []
+        for group in event_groups:
+            if not isinstance(group, dict):
+                new_groups.append(group)
+                continue
+            group_hooks = group.get("hooks", [])
+            kept = [
+                h
+                for h in group_hooks
+                if not (isinstance(h, dict) and h.get("command") in variant_set)
+            ]
+            removed = len(group_hooks) - len(kept)
+            if removed:
+                log.append(
+                    f"hooks.{event}: migrated away {removed} legacy/variant command(s)"
+                )
+            if kept:
+                new_group = dict(group)
+                new_group["hooks"] = kept
+                new_groups.append(new_group)
+            # else: group emptied by migration — drop it
+
+        if new_groups:
+            hooks[event] = new_groups
+        else:
+            del hooks[event]
+
+    return log
+
+
+# ---------------------------------------------------------------------------
 # Pure merge function (no file I/O — unit-testable)
 # ---------------------------------------------------------------------------
 
@@ -84,6 +191,25 @@ def merge_settings(
     """
     result = copy.deepcopy(existing)
     log: List[str] = []
+
+    # ── Type coercion (FIX 1) ────────────────────────────────────────────────
+    # A user's settings.json may have `"env": null` or `"hooks": null` (valid
+    # JSON, but not a dict). setdefault() would then return the existing None and
+    # the subsequent `env[key]=...` / `hooks.setdefault(...)` would raise
+    # TypeError mid-merge, aborting the install and leaving an orphaned .tmp.
+    # Coerce: None → {}; a non-None, non-dict value is a real type error (rare) —
+    # treat it as corrupt, warn, and reset to {} so the merge can proceed.
+    for key in ("env", "hooks"):
+        if key in result:
+            val = result[key]
+            if val is None:
+                result[key] = {}
+            elif not isinstance(val, dict):
+                log.append(
+                    f"WARNING: '{key}' was not an object ({type(val).__name__}); "
+                    f"resetting to {{}} (preserving nothing under '{key}')"
+                )
+                result[key] = {}
 
     # ── ENV ─────────────────────────────────────────────────────────────────
     env = result.setdefault("env", {})
@@ -104,6 +230,10 @@ def merge_settings(
 
     # ── HOOKS ────────────────────────────────────────────────────────────────
     hooks = result.setdefault("hooks", {})
+
+    # Strip stale/variant command forms BEFORE the present-check so that an
+    # upgrade converges on exactly one canonical entry per logical hook (FIX 2).
+    log.extend(_migrate_legacy_commands(hooks))
 
     for event, (matcher, commands) in PLUGIN_HOOKS.items():
         event_groups: List[Dict[str, Any]] = hooks.setdefault(event, [])
@@ -135,6 +265,10 @@ def unmerge_settings(
         return result, log
 
     hooks = result["hooks"]
+    # Tolerate a `null` or non-dict hooks value: nothing to remove.
+    if not isinstance(hooks, dict):
+        return result, log
+
     all_plugin_commands: set = set()
     for _matcher, cmds in PLUGIN_HOOKS.values():
         all_plugin_commands.update(cmds)
