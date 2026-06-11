@@ -252,12 +252,22 @@ def test_store_raw_escape_hatch(monkeypatch):
     )
 
     # 2. metadata jsonb param must include stored_raw=True.
-    # Find the metadata param in the INSERT call (index 17 — the last %s::jsonb).
+    # Locate the metadata param by searching for the JSON dict that contains
+    # 'stored_raw' rather than relying on a hardcoded index — the index shifts
+    # when columns are added to the INSERT (e.g. embed_model/embed_dim in fblai-3yd1j).
     metadata_param = None
     for call in cur.execute.call_args_list:
         args = call[0]
         if len(args) >= 2 and "INSERT INTO brain.thoughts" in args[0]:
-            metadata_param = args[1][17]  # metadata is the 18th bind param (0-indexed)
+            for p in args[1]:
+                if isinstance(p, str) and p.strip().startswith("{"):
+                    try:
+                        candidate = json.loads(p)
+                        if "stored_raw" in candidate:
+                            metadata_param = p
+                            break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
     assert metadata_param is not None, "Could not locate metadata bind param"
     meta_dict = json.loads(metadata_param)
     assert meta_dict.get("stored_raw") is True, (
