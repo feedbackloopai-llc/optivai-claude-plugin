@@ -49,6 +49,10 @@ PLUGIN_HOOKS: Dict[str, Tuple[Optional[str], List[str]]] = {
         "*",
         ["python3 ~/.claude/hooks/pre-tool-use.py"],
     ),
+    "PostToolUse": (
+        "*",
+        ["python3 ~/.claude/hooks/post_tool_use.py"],
+    ),
     "UserPromptSubmit": (
         "*",
         [
@@ -103,6 +107,10 @@ LEGACY_HOOK_VARIANTS: Dict[str, List[str]] = {
     "PreToolUse": [
         f"python3 {_HOME}/.claude/hooks/pre-tool-use.py",
         "python3 $HOME/.claude/hooks/pre-tool-use.py",
+    ],
+    "PostToolUse": [
+        f"python3 {_HOME}/.claude/hooks/post_tool_use.py",
+        "python3 $HOME/.claude/hooks/post_tool_use.py",
     ],
     "UserPromptSubmit": [
         f"python3 {_HOME}/.claude/hooks/user-prompt-submit.py",
