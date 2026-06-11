@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fblai-4ml0h — Migration confinement + curl|sh removal tests.
+"""fblai-4ml0h / fblai-717kv / fblai-c7hec — Migration confinement + hardlink/size hardening tests.
 
 Verifies:
   (a) run_migration("/tmp/evil.sql") (path outside sql/) → rejected with
@@ -152,6 +152,171 @@ def test_run_migration_accepts_legitimate_sql_path():
     assert result.get("status") == "ok", (
         f"Expected status='ok' for a legitimate migration, got: {result!r}"
     )
+
+
+# ─── Test (e): hardlinked file inside sql/ is rejected (fblai-717kv) ─────────
+
+
+def test_run_migration_rejects_hardlinked_file(tmp_path):
+    """A hardlinked file inside sql/ must be rejected (st_nlink > 1 guard).
+
+    Path.resolve() follows symlinks but NOT hardlinks — a hardlink inside sql/
+    to an external inode passes the containment check without the st_nlink fix.
+    """
+    sql_dir = _sql_dir()
+    if not sql_dir.exists():
+        pytest.skip(f"sql/ dir not found at {sql_dir}")
+
+    # Create a legitimate-looking SQL file inside sql/
+    inner_file = sql_dir / "_hardlink_test_target.sql"
+    inner_file.write_text("-- hardlink test target\nSELECT 1;\n")
+
+    # Create a hardlink to it (also inside sql/ — the inode now has nlink=2)
+    hardlink_path = sql_dir / "_hardlink_test_link.sql"
+    try:
+        os.link(inner_file, hardlink_path)
+    except OSError:
+        try:
+            inner_file.unlink()
+        except OSError:
+            pass
+        pytest.skip("Cannot create hardlinks on this filesystem")
+
+    fake_cur = mock.MagicMock()
+    fake_conn = mock.MagicMock()
+    fake_conn.cursor.return_value.__enter__ = mock.MagicMock(return_value=fake_cur)
+    fake_conn.cursor.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+    try:
+        with mock.patch("open_brain._connect", return_value=fake_conn):
+            with pytest.raises(RuntimeError) as exc_info:
+                open_brain.run_migration(str(hardlink_path))
+    finally:
+        for p in (hardlink_path, inner_file):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    # DB must NOT have been touched
+    fake_cur.execute.assert_not_called()
+
+    error_msg = str(exc_info.value).lower()
+    assert any(word in error_msg for word in ("hardlink", "hard link", "nlink", "refusing")), (
+        f"Error should describe the hardlink rejection, got: {exc_info.value!r}"
+    )
+
+
+def test_run_migration_rejects_hardlinked_file_via_stat_mock():
+    """Unit test: mock os.stat to return st_nlink=2 → rejection, no DB execute.
+
+    Creates a real small file inside sql/ so the containment check passes, then
+    patches os.stat to simulate st_nlink=2 (hardlinked inode).  The file is
+    cleaned up regardless of outcome.
+    """
+    sql_dir = _sql_dir()
+    if not sql_dir.exists():
+        pytest.skip(f"sql/ dir not found at {sql_dir}")
+
+    # Use a real file inside sql/ so containment check passes without mocking Path.
+    candidate = sql_dir / "_hardlink_stat_mock_test.sql"
+    candidate.write_text("SELECT 1;")
+
+    fake_conn = mock.MagicMock()
+
+    fake_stat = mock.MagicMock()
+    fake_stat.st_nlink = 2
+    fake_stat.st_size = 100
+
+    try:
+        with mock.patch("open_brain._connect", return_value=fake_conn), \
+             mock.patch("os.stat", return_value=fake_stat):
+            with pytest.raises(RuntimeError) as exc_info:
+                open_brain.run_migration(str(candidate))
+    finally:
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+
+    error_msg = str(exc_info.value).lower()
+    assert any(word in error_msg for word in ("hardlink", "hard link", "nlink", "refusing")), (
+        f"Error should describe the hardlink rejection, got: {exc_info.value!r}"
+    )
+    # DB must NOT have been touched
+    fake_conn.cursor.return_value.execute.assert_not_called()
+
+
+def test_run_migration_rejects_oversized_file(tmp_path):
+    """A file reported as > MAX_MIGRATION_BYTES must be rejected before read (fblai-c7hec).
+
+    We mock os.stat so the file appears oversized without creating a 10MB file.
+    A real small file inside sql/ is used so the containment check passes.
+    """
+    sql_dir = _sql_dir()
+    if not sql_dir.exists():
+        pytest.skip(f"sql/ dir not found at {sql_dir}")
+
+    # Create a small (real) file inside sql/ so containment check passes.
+    oversized_candidate = sql_dir / "_oversized_test.sql"
+    oversized_candidate.write_text("SELECT 1;")
+
+    fake_conn = mock.MagicMock()
+
+    # Patch os.stat to return st_size > MAX_MIGRATION_BYTES and st_nlink=1
+    fake_stat = mock.MagicMock()
+    fake_stat.st_nlink = 1
+    fake_stat.st_size = open_brain.MAX_MIGRATION_BYTES + 1
+
+    try:
+        with mock.patch("open_brain._connect", return_value=fake_conn), \
+             mock.patch("os.stat", return_value=fake_stat):
+            with pytest.raises(RuntimeError) as exc_info:
+                open_brain.run_migration(str(oversized_candidate))
+    finally:
+        try:
+            oversized_candidate.unlink()
+        except OSError:
+            pass
+
+    error_msg = str(exc_info.value).lower()
+    assert any(word in error_msg for word in ("too large", "oversized", "limit", "bytes", "mib")), (
+        f"Error should describe the size rejection, got: {exc_info.value!r}"
+    )
+
+    # Verify the file was NOT opened / read (no DB execute either)
+    fake_conn.cursor.return_value.execute.assert_not_called()
+
+
+def test_run_migration_normal_small_file_proceeds(tmp_path):
+    """A normal small file (st_nlink=1, size<limit) inside sql/ proceeds normally (regression)."""
+    sql_dir = _sql_dir()
+    if not sql_dir.exists():
+        pytest.skip(f"sql/ dir not found at {sql_dir}")
+
+    normal_file = sql_dir / "_normal_test_proceed.sql"
+    normal_file.write_text("-- normal test\nSELECT 1;\n")
+
+    # run_migration uses `with conn.cursor() as cur:` — set up context manager.
+    fake_cur = mock.MagicMock()
+    fake_cur_ctx = mock.MagicMock()
+    fake_cur_ctx.__enter__ = mock.MagicMock(return_value=fake_cur)
+    fake_cur_ctx.__exit__ = mock.MagicMock(return_value=False)
+    fake_conn = mock.MagicMock()
+    fake_conn.cursor.return_value = fake_cur_ctx
+
+    # Real stat: st_nlink=1, small size (let os.stat run on the real file)
+    try:
+        with mock.patch("open_brain._connect", return_value=fake_conn):
+            result = open_brain.run_migration(str(normal_file))
+    finally:
+        try:
+            normal_file.unlink()
+        except OSError:
+            pass
+
+    assert result.get("status") == "ok", f"Expected status=ok, got: {result!r}"
+    fake_cur.execute.assert_called_once()
 
 
 # ─── Test (d): _ensure_ollama_ready has no curl|sh auto-install ──────────────

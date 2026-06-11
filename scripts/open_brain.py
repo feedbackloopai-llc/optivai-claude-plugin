@@ -548,7 +548,17 @@ def _get_database_url() -> str:
         if result.returncode == 0:
             keychain_url = result.stdout.strip()
             if keychain_url:
-                return keychain_url
+                # fblai-lm327: validate the value looks like a postgres URL.
+                # A corrupted or multiline keychain entry must not be forwarded
+                # to _connect() where it would surface in an exception with the
+                # raw value.  Treat non-postgres values as a keychain miss and
+                # fall through to the config-file fallback.
+                if keychain_url.startswith("postgres"):
+                    return keychain_url
+                print(
+                    "WARNING: keychain value is not a postgres URL; ignoring",
+                    file=sys.stderr,
+                )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         # security binary absent (non-macOS) or timed out — fall through.
         pass
@@ -4083,6 +4093,26 @@ def add_link(
                     f"in user scope (user={user_id})"
                 )
 
+        # fblai-hlvnk: target ownership check.  atom_links has NO FK on
+        # target_id by design (targets may be bead IDs or external refs that
+        # legitimately don't live in brain.thoughts).  We only enforce
+        # ownership when the target IS a brain atom that EXISTS:
+        #   - target starts with "brain-" AND a row exists → require same user_id.
+        #   - bead ID (gz-/fblai-/optivai- prefix) → always permit (external).
+        #   - target is a brain-id that does NOT exist (orphan) → permit (no-FK design).
+        #   - anything else → permit (unknown external ref).
+        if target_id.startswith("brain-"):
+            cur.execute(
+                "SELECT user_id FROM brain.thoughts WHERE thought_id = %s",
+                (target_id,),
+            )
+            _tgt_row = cur.fetchone()
+            if _tgt_row is not None and _tgt_row[0] != user_id:
+                raise RuntimeError(
+                    f"add_link: target atom {target_id!r} belongs to a different "
+                    f"user; cross-user links are not permitted (caller={user_id!r})"
+                )
+
         prov = _build_link_prov(
             prov_agent=prov_agent,
             via=via,
@@ -5182,15 +5212,30 @@ def _run_from_pi():
     # Security: always derive user_id from the OS principal; never honor a
     # caller-supplied value — accepting it would allow any process writing to
     # the stdin bridge to impersonate an arbitrary user (principal-scoping bypass).
-    if "user_id" in args:
+    attempted_user_id = args.get("user_id") if "user_id" in args else None
+    user_id = _get_user_id()
+    if attempted_user_id is not None:
         print(
             "WARNING: ignoring caller-supplied user_id; deriving from OS principal",
             file=sys.stderr,
         )
-    user_id = _get_user_id()
 
     conn = _connect()
     try:
+        # fblai-ft6ek: emit audit row for security-relevant events — not just
+        # stderr.  Best-effort (emit_replay_log never raises); done after
+        # _connect() so the conn is available.
+        if attempted_user_id is not None:
+            try:
+                emit_replay_log(
+                    conn,
+                    user_id=user_id,
+                    event_type="user_id_override_rejected",
+                    metadata={"attempted_user_id": attempted_user_id},
+                )
+            except Exception:
+                pass
+
         if op == "capture":
             # NAL stv validation: reject out-of-range values.
             _pi_stv_f = args.get("stv", {}).get("f") if isinstance(args.get("stv"), dict) else None
@@ -5336,6 +5381,15 @@ def _run_from_pi():
                     "error": "permission denied: admin_stats requires OPEN_BRAIN_ALLOW_ADMIN=true on the server process"
                 }))
             else:
+                # fblai-ft6ek: audit-row for admin access (best-effort).
+                try:
+                    emit_replay_log(
+                        conn,
+                        user_id=user_id,
+                        event_type="admin_stats_access",
+                    )
+                except Exception:
+                    pass
                 result = admin_stats(conn)
                 print(json.dumps(result, default=str))
         elif op == "timeline":
@@ -5544,6 +5598,9 @@ def _run_from_pi():
 
 # ─── Migration runner ────────────────────────────────────────────────────────
 
+MAX_MIGRATION_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+
 def run_migration(sql_path: str) -> Dict[str, Any]:
     """Execute a one-shot SQL migration file. Idempotent migrations only.
 
@@ -5556,7 +5613,9 @@ def run_migration(sql_path: str) -> Dict[str, Any]:
     Security: the resolved canonical path of *sql_path* must be inside the
     repo's ``sql/`` directory.  ``Path.resolve()`` is called before the check
     so that symlinks pointing outside ``sql/`` are also rejected (symlink
-    traversal protection).
+    traversal protection).  Hardlinked files (st_nlink > 1) are rejected to
+    prevent an inode outside sql/ from being accessed via a hardlink inside it.
+    Files over MAX_MIGRATION_BYTES are rejected before any read.
 
     Returns a status dict suitable for JSON serialization. Raises RuntimeError
     (the local error convention in this module) on failure.
@@ -5582,6 +5641,29 @@ def run_migration(sql_path: str) -> Dict[str, Any]:
 
     if not resolved.exists():
         raise RuntimeError(f"Migration file not found: {sql_path}")
+
+    # fblai-717kv: Reject hardlinked files. Path.resolve() follows symlinks but
+    # not hardlinks — a hardlink inside sql/ to an external inode passes the
+    # containment check. st_nlink > 1 means the inode has multiple directory
+    # entries; sql/ migration files are never legitimately hardlinked.
+    try:
+        st = os.stat(resolved)
+    except OSError as e:
+        raise RuntimeError(f"Cannot stat migration file: {resolved!r}: {e}") from e
+    if st.st_nlink > 1:
+        raise RuntimeError(
+            f"Refusing to run migration from a hardlinked file: {resolved!r} "
+            f"(st_nlink={st.st_nlink}). Migration files must not have multiple "
+            "hard links."
+        )
+
+    # fblai-c7hec: Reject oversized files before reading into memory.
+    if st.st_size > MAX_MIGRATION_BYTES:
+        raise RuntimeError(
+            f"Migration file too large: {resolved!r} is {st.st_size} bytes "
+            f"(limit {MAX_MIGRATION_BYTES} bytes = 10 MiB)"
+        )
+
     with open(resolved, "r", encoding="utf-8") as f:
         sql = f.read()
     if not sql.strip():
