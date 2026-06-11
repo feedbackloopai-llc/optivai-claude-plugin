@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fblai-g76hd — Pi bridge auth hardening tests.
+"""fblai-g76hd / fblai-ft6ek — Pi bridge auth hardening + audit-row tests.
 
 Verifies:
   (a) envelope with user_id="victim" on a search op → search is invoked with
@@ -168,4 +168,132 @@ def test_admin_stats_allowed_with_env_flag(monkeypatch):
     result = json.loads(output)
     assert "error" not in result, (
         f"Expected no error in response when admin flag is set, got: {result!r}"
+    )
+
+
+# ─── fblai-ft6ek: audit-row for user_id-override and admin_stats access ──────
+
+
+def test_user_id_override_emits_audit_row(monkeypatch):
+    """fblai-ft6ek: envelope with user_id='victim' triggers emit_replay_log
+    with event_type='user_id_override_rejected'.
+
+    Does NOT require a live DB — emit_replay_log is mocked/spied.
+    """
+    emit_calls = []
+
+    def spy_emit_replay_log(conn, user_id, event_type, **kwargs):
+        emit_calls.append({
+            "user_id": user_id,
+            "event_type": event_type,
+            "metadata": kwargs.get("metadata"),
+        })
+        return -1  # best-effort; -1 = write skipped
+
+    envelope = {
+        "op": "search",
+        "query": "test query",
+        "user_id": "victim",  # attacker-supplied — must be dropped + audited
+    }
+
+    def fake_search(conn, query, user_id, **kwargs):
+        return []
+
+    captured_output = io.StringIO()
+
+    with mock.patch("open_brain.emit_replay_log", side_effect=spy_emit_replay_log), \
+         mock.patch("open_brain.search", side_effect=fake_search), \
+         mock.patch("open_brain._connect", return_value=mock.MagicMock()), \
+         mock.patch("sys.stdin", io.StringIO(json.dumps(envelope))), \
+         mock.patch("sys.stdout", captured_output):
+        open_brain._run_from_pi()
+
+    # At least one emit_replay_log call must have event_type='user_id_override_rejected'
+    override_events = [
+        c for c in emit_calls
+        if c["event_type"] == "user_id_override_rejected"
+    ]
+    assert len(override_events) >= 1, (
+        f"Expected at least one emit_replay_log call with "
+        f"event_type='user_id_override_rejected'; got calls: {emit_calls}"
+    )
+    # The metadata must record the attempted user_id
+    meta = override_events[0].get("metadata") or {}
+    assert meta.get("attempted_user_id") == "victim", (
+        f"metadata.attempted_user_id must be 'victim'; got: {meta!r}"
+    )
+
+
+def test_admin_stats_access_emits_audit_row(monkeypatch):
+    """fblai-ft6ek: admin_stats with OPEN_BRAIN_ALLOW_ADMIN=true triggers
+    emit_replay_log with event_type='admin_stats_access'.
+    """
+    emit_calls = []
+
+    def spy_emit_replay_log(conn, user_id, event_type, **kwargs):
+        emit_calls.append({
+            "user_id": user_id,
+            "event_type": event_type,
+        })
+        return -1
+
+    def fake_admin_stats(conn):
+        return {"status": "ok", "total_thoughts": 0}
+
+    envelope = {"op": "admin_stats"}
+    captured_output = io.StringIO()
+
+    with mock.patch("open_brain.emit_replay_log", side_effect=spy_emit_replay_log), \
+         mock.patch("open_brain.admin_stats", side_effect=fake_admin_stats), \
+         mock.patch("open_brain._connect", return_value=mock.MagicMock()), \
+         mock.patch("sys.stdin", io.StringIO(json.dumps(envelope))), \
+         mock.patch("sys.stdout", captured_output):
+        env = dict(os.environ)
+        env["OPEN_BRAIN_ALLOW_ADMIN"] = "true"
+        with mock.patch.dict(os.environ, env, clear=True):
+            open_brain._run_from_pi()
+
+    admin_access_events = [
+        c for c in emit_calls
+        if c["event_type"] == "admin_stats_access"
+    ]
+    assert len(admin_access_events) >= 1, (
+        f"Expected at least one emit_replay_log call with "
+        f"event_type='admin_stats_access'; got calls: {emit_calls}"
+    )
+
+
+def test_no_audit_row_when_no_user_id_override(monkeypatch):
+    """Without a caller-supplied user_id, no user_id_override_rejected event is emitted."""
+    emit_calls = []
+
+    def spy_emit_replay_log(conn, user_id, event_type, **kwargs):
+        emit_calls.append({"event_type": event_type})
+        return -1
+
+    envelope = {
+        "op": "search",
+        "query": "legitimate query",
+        # No user_id supplied — no override attempt
+    }
+
+    def fake_search(conn, query, user_id, **kwargs):
+        return []
+
+    captured_output = io.StringIO()
+
+    with mock.patch("open_brain.emit_replay_log", side_effect=spy_emit_replay_log), \
+         mock.patch("open_brain.search", side_effect=fake_search), \
+         mock.patch("open_brain._connect", return_value=mock.MagicMock()), \
+         mock.patch("sys.stdin", io.StringIO(json.dumps(envelope))), \
+         mock.patch("sys.stdout", captured_output):
+        open_brain._run_from_pi()
+
+    override_events = [
+        c for c in emit_calls
+        if c["event_type"] == "user_id_override_rejected"
+    ]
+    assert len(override_events) == 0, (
+        f"No override event should be emitted without a caller user_id; "
+        f"got: {emit_calls}"
     )
