@@ -17,3 +17,9 @@ PyYAML>=6.0
 
 # RFC 6902 JSON Patch for RB primitive (brain-W1-S5: snapshot diffs, rollback)
 jsonpatch>=1.32
+
+# Beads CLI dependencies (scripts/beads/cli.py, storage.py)
+# These are declared in setup.py but must also appear here so that
+# `pip install -r requirements.txt` (the Windows and standalone path) covers them.
+click>=8.0
+filelock>=3.0

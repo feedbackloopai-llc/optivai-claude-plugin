@@ -235,8 +235,17 @@ install_ollama() {
 }
 
 # Detect operating system
+# Returns one of: windows | macos | linux | wsl | unknown
+#
+# WSL detection: uname -s returns "Linux" inside WSL, which would otherwise
+# take the generic linux path. We detect WSL by checking /proc/version (WSL1)
+# and /proc/sys/kernel/osrelease (WSL2) for the "microsoft" or "WSL" string
+# (case-insensitive). WSL is treated like linux for file-copy/pip/merge steps,
+# but the daemon and keychain notes differ.
 detect_os() {
-    case "$(uname -s)" in
+    local kernel
+    kernel="$(uname -s)"
+    case "$kernel" in
         MINGW*|MSYS*|CYGWIN*)
             echo "windows"
             ;;
@@ -244,7 +253,13 @@ detect_os() {
             echo "macos"
             ;;
         Linux*)
-            echo "linux"
+            # Check for WSL before returning generic "linux"
+            if grep -qiE "microsoft|wsl" /proc/version 2>/dev/null \
+               || grep -qiE "microsoft|wsl" /proc/sys/kernel/osrelease 2>/dev/null; then
+                echo "wsl"
+            else
+                echo "linux"
+            fi
             ;;
         *)
             echo "unknown"
@@ -315,6 +330,19 @@ uninstall_unix() {
             print_status "Removed launchd daemon: $LAUNCHD_LABEL"
         else
             print_warning "Launchd daemon not found (already removed)"
+        fi
+    elif [ "$OS_TYPE" = "wsl" ]; then
+        # WSL: daemon was installed via cron (no systemd assumed)
+        if crontab -l 2>/dev/null | grep -q "pg_sync.py"; then
+            crontab -l 2>/dev/null | grep -v "pg_sync.py" | crontab - 2>/dev/null || true
+            print_status "Removed cron job (WSL)"
+        else
+            print_warning "No cron entry for pg_sync found (already removed)"
+        fi
+        # Best-effort removal of Windows Task Scheduler entry if schtasks available
+        if command -v schtasks.exe &> /dev/null; then
+            schtasks.exe /delete /tn "OptivAI-PgSync" /f 2>/dev/null && \
+                print_status "Removed Windows Task Scheduler entry OptivAI-PgSync" || true
         fi
     else
         # Linux: Remove systemd service
@@ -441,6 +469,29 @@ install_unix() {
     echo "║   Platform: $OS_TYPE                                            ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
+
+    # WSL-specific information block
+    if [ "$OS_TYPE" = "wsl" ]; then
+        echo -e "${CYAN}========================================${NC}"
+        echo -e "${CYAN}  WSL (Windows Subsystem for Linux) Detected${NC}"
+        echo -e "${CYAN}========================================${NC}"
+        echo ""
+        print_info "WSL uses the Linux install path for all file-copy and pip steps."
+        print_info "A few WSL-specific notes:"
+        echo "  • macOS Keychain is NOT available in WSL."
+        echo "    Database credentials must be provided via environment variables:"
+        echo "      export DATABASE_URL=\"postgresql://user:pass@host/db?sslmode=require\""
+        echo "      export ANTHROPIC_API_KEY=\"sk-ant-....\""
+        echo "    Add these to ~/.bashrc or ~/.zshrc to persist across sessions."
+        echo "  • launchd (macOS daemon) is NOT available in WSL."
+        echo "    Daemon options for WSL:"
+        echo "    1. Use a cron job (see daemon section below for --skip-daemon guidance)"
+        echo "    2. Run pg_sync.py manually when needed:"
+        echo "         python3 ~/.claude/hooks/pg_sync.py --once"
+        echo "    3. Set up a Windows Task Scheduler task that calls:"
+        echo "         wsl python3 ~/.claude/hooks/pg_sync.py --once"
+        echo ""
+    fi
 
     # Check prerequisites
     print_header "Checking Prerequisites"
@@ -711,12 +762,21 @@ except Exception:
             else
                 print_warning "install-launchd.sh not found, skipping daemon setup"
             fi
+        elif [ "$OS_TYPE" = "wsl" ]; then
+            # WSL: launchd is unavailable; systemd is rarely enabled in WSL2 by
+            # default; use cron or print guidance to run manually / via Windows
+            # Task Scheduler.
+            install_wsl_daemon
         else
             # Linux: Use systemd or cron
             install_linux_daemon
         fi
     else
         print_info "Skipping daemon installation (--skip-daemon specified)"
+        if [ "$OS_TYPE" = "wsl" ]; then
+            print_info "To run the sync manually in WSL:"
+            echo "  python3 ~/.claude/hooks/pg_sync.py --once"
+        fi
     fi
 
     # Installation complete
@@ -729,6 +789,9 @@ except Exception:
     echo "Verify installation:"
     if [ "$OS_TYPE" = "macos" ]; then
         echo "  • Check daemon: launchctl list | grep claude-pg"
+    elif [ "$OS_TYPE" = "wsl" ]; then
+        echo "  • Check cron: crontab -l | grep pg_sync"
+        echo "  • Run sync manually: python3 ~/.claude/hooks/pg_sync.py --once"
     else
         echo "  • Check daemon: systemctl --user status $SYSTEMD_SERVICE"
     fi
@@ -736,6 +799,47 @@ except Exception:
     echo "  • Test sync: python3 ~/.claude/hooks/pg_sync.py --status"
     echo ""
     print_status "Installation complete!"
+}
+
+install_wsl_daemon() {
+    # WSL daemon setup: systemd is typically NOT available in WSL1 and may
+    # require explicit opt-in in WSL2 (requires /etc/wsl.conf + Windows 11).
+    # Rather than silently fail or require systemd, we prefer cron which works
+    # in all WSL configurations, and print clear guidance for Windows Task
+    # Scheduler as an alternative.
+    local SYNC_SCRIPT="$HOOKS_DIR/pg_sync.py"
+    local LOG_FILE="$LOGS_DIR/sync_daemon.log"
+
+    print_info "WSL detected — using cron for pg_sync daemon (systemd not assumed)"
+
+    # Check if cron is available
+    if command -v crontab &> /dev/null; then
+        local CRON_CMD="* * * * * /usr/bin/python3 $SYNC_SCRIPT --once >> $LOG_FILE 2>&1"
+        # Add to crontab idempotently
+        if crontab -l 2>/dev/null | grep -q "pg_sync.py"; then
+            print_status "cron entry for pg_sync already present"
+        else
+            (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+            print_status "Added cron job for pg_sync (runs every minute)"
+            echo "  Verify: crontab -l | grep pg_sync"
+        fi
+        echo ""
+        print_info "Note: cron in WSL only runs while the WSL session is active."
+        print_info "Alternative — Windows Task Scheduler (runs even when WSL is idle):"
+        echo "  schtasks /create /tn \"OptivAI-PgSync\" /tr \"wsl python3 ~/.claude/hooks/pg_sync.py --once\" \\"
+        echo "    /sc MINUTE /mo 5 /ru \"%USERNAME%\" /f"
+        echo ""
+        print_info "Or run manually whenever needed:"
+        echo "  python3 ~/.claude/hooks/pg_sync.py --once"
+    else
+        print_warning "crontab not found in WSL environment"
+        print_info "Run the sync daemon manually:"
+        echo "  python3 $SYNC_SCRIPT --once"
+        echo ""
+        print_info "Or set up Windows Task Scheduler from a PowerShell window:"
+        echo "  schtasks /create /tn \"OptivAI-PgSync\" /tr \"wsl python3 ~/.claude/hooks/pg_sync.py --once\" \\"
+        echo "    /sc MINUTE /mo 5 /ru \"%USERNAME%\" /f"
+    fi
 }
 
 install_linux_daemon() {
@@ -788,7 +892,9 @@ case "$OS" in
     windows)
         install_windows
         ;;
-    macos|linux)
+    macos|linux|wsl)
+        # wsl takes the same file-copy/pip/merge path as linux; daemon and
+        # keychain handling differ (see install_wsl_daemon + WSL info block).
         install_unix "$OS"
         ;;
     *)
