@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS thoughts (
     session_id      VARCHAR(200),
     project         VARCHAR(200),
     embedding       vector(768),
+    -- embed_model/embed_dim versioning (fblai-3yd1j): records which embedding
+    -- model and dimension produced the vector so cross-model comparisons can be
+    -- detected and filtered.  NULL = rows captured before this column existed;
+    -- treated defensively as compatible with the current model in search().
+    embed_model     VARCHAR(100),
+    embed_dim       SMALLINT,
     metadata        JSONB,
     -- NAL-lite truth values (T2.6 / fblai-eovhe): Non-Axiomatic Logic stv pair.
     -- stv_frequency: degree of positive evidence [0,1] (1.0 = fully positive).
@@ -86,6 +92,10 @@ CREATE TABLE IF NOT EXISTS thought_versions (
     people          JSONB,
     action_items    JSONB,
     embedding       vector(768),
+    -- embed_model/embed_dim: mirrored from brain.thoughts at snapshot time
+    -- so --trace shows which model produced each version's vector.
+    embed_model     VARCHAR(100),
+    embed_dim       SMALLINT,
     metadata        JSONB,
     prov_agent      VARCHAR(100)      NOT NULL,
     prov_activity   VARCHAR(50)       NOT NULL,

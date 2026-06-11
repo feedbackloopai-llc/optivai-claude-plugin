@@ -2776,6 +2776,18 @@ def capture(
         # representation is consistent with what is stored in raw_text.
         embedding = _generate_embedding(text_for_storage)
 
+        # Dim-mismatch guard (fblai-3yd1j): the schema declares vector(768).
+        # If the configured EMBED_MODEL returns a different dimension, the
+        # INSERT will fail with a cryptic pgvector error.  Fail loudly here
+        # before touching the DB.
+        _expected_dim = 768
+        if len(embedding) != _expected_dim:
+            raise ValueError(
+                f"Embedding dimension mismatch: model '{EMBED_MODEL}' produced "
+                f"{len(embedding)} dims but schema expects {_expected_dim}. "
+                "A schema migration is required before switching embedding models."
+            )
+
         # Step 3a: Resolve NAL stv values.
         # Priority: explicit stv_f/stv_c overrides > confidence label from metadata.
         # Caller-supplied values must be validated in [0,1] before this point
@@ -2798,7 +2810,8 @@ def capture(
                 thought_id, user_id, raw_text, summary, thought_type,
                 topics, people, action_items, source, session_id, project,
                 prov_agent, prov_activity, was_generated_by, was_derived_from, source_uri,
-                embedding, metadata, stv_frequency, stv_confidence, stv_seeded,
+                embedding, embed_model, embed_dim,
+                metadata, stv_frequency, stv_confidence, stv_seeded,
                 created_at, updated_at
             )
             VALUES (
@@ -2806,7 +2819,8 @@ def capture(
                 %s::jsonb, %s::jsonb, %s::jsonb,
                 %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s::vector, %s::jsonb, %s, %s, TRUE,
+                %s::vector, %s, %s,
+                %s::jsonb, %s, %s, TRUE,
                 NOW(), NOW()
             )
         """
@@ -2830,6 +2844,8 @@ def capture(
                 was_derived_from,
                 None,  # source_uri — reserved for external-URL captures
                 str(embedding),
+                EMBED_MODEL,           # embed_model — fblai-3yd1j versioning
+                len(embedding),        # embed_dim — fblai-3yd1j versioning
                 json.dumps(metadata),
                 final_stv_f,
                 final_stv_c,
@@ -3196,8 +3212,17 @@ def search(
         keyword_params = []
 
     # Build dynamic WHERE clauses and params
-    where_clauses = ["user_id = %s", "embedding IS NOT NULL"]
-    where_params: List[Any] = [user_id]
+    # embed_model filter (fblai-3yd1j): only compare vectors produced by the
+    # same embedding model as the current query embedding.  The OR IS NULL
+    # is a defensive tolerance for rows captured before embed_model was added
+    # (the migration backfills them, but a partially-applied migration or a
+    # very recent capture before migration won't have the column set).
+    where_clauses = [
+        "user_id = %s",
+        "embedding IS NOT NULL",
+        "(embed_model = %s OR embed_model IS NULL)",
+    ]
+    where_params: List[Any] = [user_id, EMBED_MODEL]
 
     if thought_type is not None:
         where_clauses.append("thought_type = %s")
