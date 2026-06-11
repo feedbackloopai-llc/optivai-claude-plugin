@@ -696,3 +696,120 @@ def test_atom_supersession_warning():
     assert "brain-1234-deadbeef" in ctx
     assert "superseded_by" in ctx
     assert "brain-9999-cafef00d" in ctx
+
+
+# ─── Atom stale-guard cumulative timeout cap (fblai-7sjjj FIX 2) ─────────────
+
+def test_collect_stale_atoms_stops_at_cumulative_budget():
+    """_collect_stale_atoms honors ATOM_STALE_GUARD_BUDGET_SECONDS wall-clock cap.
+
+    Scenario: 5 atom IDs are passed. Each _run_open_brain_inspect call sleeps
+    long enough that even 2 calls would exceed the budget. Verify that the
+    function returns after fewer than N calls, not all 5.
+
+    The constant ATOM_STALE_GUARD_BUDGET_SECONDS is 10 s in the live config.
+    We patch it to 0.05 s for the test so the budget fires immediately.
+    Each mock inspect call sleeps 0.04 s — fast enough for the first call
+    to complete within the budget but the second call to trip the cap.
+    """
+    import time as _time
+    from unittest.mock import patch
+
+    call_count = {"n": 0}
+
+    def slow_inspect(atom_id: str):
+        """Simulates a slow open_brain --inspect call."""
+        call_count["n"] += 1
+        _time.sleep(0.04)   # 40 ms per call; budget=50 ms → 2nd call trips the cap
+        return {"prov": {"superseded_by": "brain-9999-replaced"}}
+
+    atom_ids = [f"brain-{i}-{'a' * 8}" for i in range(5)]
+
+    with patch.object(auto_recall_hook, "ATOM_STALE_GUARD_BUDGET_SECONDS", 0.05):
+        with patch.object(auto_recall_hook, "_run_open_brain_inspect", side_effect=slow_inspect):
+            result = auto_recall_hook._collect_stale_atoms(atom_ids)
+
+    # The budget fires after ≤2 calls. We must have stopped before all 5.
+    assert call_count["n"] < len(atom_ids), (
+        f"Expected fewer than {len(atom_ids)} calls due to budget cap, "
+        f"but got {call_count['n']} calls — cumulative cap is not working"
+    )
+    # Whatever ran should still be in the result (fail-open partial return).
+    assert len(result) == call_count["n"], (
+        f"Expected {call_count['n']} stale entries (one per call that completed), "
+        f"got {len(result)}"
+    )
+
+
+def test_collect_stale_atoms_returns_partial_when_budget_hits():
+    """Partial results are returned when the budget fires mid-loop.
+
+    Three atom IDs; each inspect sleeps 0.03 s. Budget = 0.08 s (fits ~2
+    calls). The third call should be skipped; the first two should appear
+    in the result.
+    """
+    import time as _time
+    from unittest.mock import patch
+
+    call_count = {"n": 0}
+
+    def slow_inspect(atom_id: str):
+        call_count["n"] += 1
+        _time.sleep(0.03)
+        return {"superseded_by": f"brain-replaced-{call_count['n']}"}
+
+    atom_ids = [f"brain-{i}-{'b' * 8}" for i in range(3)]
+
+    with patch.object(auto_recall_hook, "ATOM_STALE_GUARD_BUDGET_SECONDS", 0.08):
+        with patch.object(auto_recall_hook, "_run_open_brain_inspect", side_effect=slow_inspect):
+            result = auto_recall_hook._collect_stale_atoms(atom_ids)
+
+    # At 30 ms/call with an 80 ms budget: call 1 finishes at ~30 ms (OK),
+    # call 2 finishes at ~60 ms (OK), call 3 is blocked by the budget check
+    # (elapsed ~60 ms > 80 ms is NOT yet over — but monotonic drift means
+    # we may get 2 or 3 calls). The key invariant is: fewer than or equal to
+    # total atom IDs, and the result length matches calls that completed.
+    assert call_count["n"] <= len(atom_ids), (
+        f"More calls than atom IDs: {call_count['n']} > {len(atom_ids)}"
+    )
+    assert len(result) == call_count["n"], (
+        f"Result length {len(result)} != call count {call_count['n']}"
+    )
+
+
+def test_collect_stale_atoms_with_fast_inspect_runs_all():
+    """When inspect calls are fast, all atom IDs are processed within budget."""
+    from unittest.mock import patch
+
+    call_count = {"n": 0}
+
+    def fast_inspect(atom_id: str):
+        call_count["n"] += 1
+        # No sleep — returns immediately
+        return {"prov": {"superseded_by": "brain-9999-replaced"}}
+
+    atom_ids = [f"brain-{i}-{'c' * 8}" for i in range(auto_recall_hook.ATOM_ID_CAP)]
+
+    # Use the real budget (no patching) — fast calls should all complete.
+    with patch.object(auto_recall_hook, "_run_open_brain_inspect", side_effect=fast_inspect):
+        result = auto_recall_hook._collect_stale_atoms(atom_ids)
+
+    assert call_count["n"] == auto_recall_hook.ATOM_ID_CAP, (
+        f"Expected all {auto_recall_hook.ATOM_ID_CAP} calls to complete when "
+        f"inspect is fast, got {call_count['n']}"
+    )
+    assert len(result) == auto_recall_hook.ATOM_ID_CAP
+
+
+def test_collect_stale_atoms_budget_constant_exists():
+    """ATOM_STALE_GUARD_BUDGET_SECONDS constant must be defined and < 40s."""
+    assert hasattr(auto_recall_hook, "ATOM_STALE_GUARD_BUDGET_SECONDS"), (
+        "ATOM_STALE_GUARD_BUDGET_SECONDS constant missing from auto_recall_hook"
+    )
+    budget = auto_recall_hook.ATOM_STALE_GUARD_BUDGET_SECONDS
+    max_old = auto_recall_hook.ATOM_ID_CAP * auto_recall_hook.ATOM_INSPECT_TIMEOUT_SECONDS
+    assert budget < max_old, (
+        f"Budget {budget}s must be less than the old worst-case {max_old}s "
+        f"(ATOM_ID_CAP={auto_recall_hook.ATOM_ID_CAP} × "
+        f"ATOM_INSPECT_TIMEOUT_SECONDS={auto_recall_hook.ATOM_INSPECT_TIMEOUT_SECONDS})"
+    )

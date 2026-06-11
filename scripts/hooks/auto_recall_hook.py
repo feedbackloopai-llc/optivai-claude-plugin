@@ -63,6 +63,8 @@ ATOM_ID_CAP = 5                  # max atom IDs per prompt to look up
 BEADS_SHOW_TIMEOUT_SECONDS = 8   # per-call timeout for `beads show`
 ATOM_INSPECT_TIMEOUT_SECONDS = 8  # per-call timeout for open_brain --inspect
 STALE_GUARD_BUDGET_SECONDS = 15  # total wall-clock budget for ALL bead lookups
+ATOM_STALE_GUARD_BUDGET_SECONDS = 10  # total wall-clock budget for ALL atom lookups
+# Without this cap: ATOM_ID_CAP × ATOM_INSPECT_TIMEOUT_SECONDS = 5 × 8 = 40s worst case.
 STALE_BEAD_STATES = {"closed", "done"}  # which states warrant a warning
 BEAD_TITLE_MAX_CHARS = 120       # trim bead title in the output section
 
@@ -504,9 +506,18 @@ def _collect_stale_atoms(atom_ids: List[str]) -> List[Tuple[str, str]]:
 
     Returns ``(atom_id, reason)`` tuples. Atoms without supersession/forget
     metadata (the vast majority) are silently skipped — no warning needed.
+
+    Honors a cumulative wall-clock budget of ATOM_STALE_GUARD_BUDGET_SECONDS.
+    Without this cap the worst case is ATOM_ID_CAP × ATOM_INSPECT_TIMEOUT_SECONDS
+    (5 × 8 = 40 s) blocking every prompt that mentions atom IDs. When the budget
+    is hit mid-loop, we stop and return whatever was already collected — partial
+    stale info is fine (fail-open: missing stale info is safer than a 40s hang).
     """
     stale: List[Tuple[str, str]] = []
+    start = time.monotonic()
     for aid in atom_ids:
+        if time.monotonic() - start > ATOM_STALE_GUARD_BUDGET_SECONDS:
+            break
         data = _run_open_brain_inspect(aid)
         if not data:
             continue
