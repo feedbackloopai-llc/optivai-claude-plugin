@@ -58,10 +58,11 @@ CREATE INDEX IF NOT EXISTS idx_thoughts_derived_from
 CREATE INDEX IF NOT EXISTS idx_thoughts_generated_by
   ON thoughts (was_generated_by);
 
--- IVFFlat index for vector similarity search
--- Note: IVFFlat requires data to exist for training. Create after initial data load if needed.
--- For small datasets (<10k rows), exact search is fine. Add this later:
--- CREATE INDEX IF NOT EXISTS idx_thoughts_embedding ON thoughts USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- HNSW index for vector similarity search
+-- HNSW builds at ANY table size (including zero rows) and supports incremental inserts,
+-- unlike IVFFlat which requires training data.  m=16 ef_construction=64 are production
+-- defaults that give good recall/build-time balance up to 1M+ rows.
+CREATE INDEX IF NOT EXISTS idx_thoughts_embedding_hnsw ON thoughts USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
 -- ============================================================================
 -- RB primitive (brain-W1-S4): versioning substrate for snapshot/rollback/diff
