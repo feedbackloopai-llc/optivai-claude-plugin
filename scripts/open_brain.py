@@ -313,8 +313,110 @@ def _get_embedding_model():
     return _embed_model
 
 
+def _embed_server_path() -> Path:
+    """Return the path to embed_server.py (sibling of this script)."""
+    return Path(__file__).parent / "embed_server.py"
+
+
+def _try_warm_embed_server(text: str) -> Optional[list]:
+    """Attempt to get an embedding from the warm embed_server.
+
+    Returns the embedding list on success, or None on any failure (server
+    down, timeout, wrong dim, bad JSON).  Never raises — the caller falls
+    back to local model.
+
+    Contract (from embed_server.py):
+      GET  /health  → {"status": "ok", "model": ..., "uptime_s": ...}
+      POST /embed   {"text": ...} → {"embedding": [...], "dim": N}
+
+    Port: OPEN_BRAIN_EMBED_PORT env var (default 8474).
+    Health timeout: 0.5s (just a localhost TCP connect).
+    Embed timeout: 10s (inference on a cold CPU model can take 2-4s).
+    """
+    import urllib.request
+    import urllib.error
+
+    port = int(os.environ.get("OPEN_BRAIN_EMBED_PORT", "8474"))
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # 1. Health check — fast localhost connect only.
+        health_req = urllib.request.Request(f"{base_url}/health")
+        with urllib.request.urlopen(health_req, timeout=0.5) as resp:
+            health_data = json.loads(resp.read().decode("utf-8"))
+        if health_data.get("status") != "ok":
+            return None
+
+        # 2. Embed request.
+        body = json.dumps({"text": text[:8000]}).encode("utf-8")
+        embed_req = urllib.request.Request(
+            f"{base_url}/embed",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(embed_req, timeout=10) as resp:
+            embed_data = json.loads(resp.read().decode("utf-8"))
+
+        embedding = embed_data.get("embedding")
+        if not isinstance(embedding, list) or len(embedding) != 768:
+            # Wrong dim or malformed response — fall back to local.
+            return None
+
+        return embedding
+
+    except Exception:
+        # Connection refused, timeout, bad JSON, wrong status code, etc.
+        # Any error means the server is not usable for this call.
+        return None
+
+
+def _spawn_embed_server_detached() -> None:
+    """Fire-and-forget: spawn embed_server.py so the NEXT call can use it.
+
+    Uses start_new_session=True so the child process is detached from this
+    process's session and survives the parent exiting.  We do NOT wait —
+    the spawn cost is negligible; the model load inside embed_server takes
+    several seconds and happens in the background.
+
+    Silently swallows all errors: spawning is an optimistic best-effort act.
+    """
+    import subprocess
+    server_path = _embed_server_path()
+    if not server_path.exists():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(server_path)],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+
+
 def _generate_embedding(text: str) -> list:
-    """Generate 768-dim embedding using local all-mpnet-base-v2."""
+    """Generate 768-dim embedding; prefer warm embed_server, fall back to local load.
+
+    Warm path (fast ~0.1s): tries embed_server on 127.0.0.1:OPEN_BRAIN_EMBED_PORT.
+    If the server is not yet up:
+      - Best-effort spawns it detached so the NEXT call is warm.
+      - Falls through to the local model (cold-load, ~1-4s first call, cached after).
+
+    Any error from the server silently falls back to local — the server is an
+    optimisation, never a hard dependency.
+    """
+    # Fast path: try the warm server first.
+    warm_result = _try_warm_embed_server(text[:8000])
+    if warm_result is not None:
+        return warm_result
+
+    # Server is not up (or unusable for this call).  Spawn it detached so the
+    # next invocation can benefit, then fall back to the local model.
+    _spawn_embed_server_detached()
+
     model = _get_embedding_model()
     return model.encode(text[:8000]).tolist()
 
