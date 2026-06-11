@@ -337,26 +337,34 @@ uninstall_unix() {
     if [ -d "$HOOKS_DIR" ]; then
         print_info "Removing hook scripts..."
         local hook_files=(
-            "log_writer.py"
-            "pre-tool-use.py"
-            "user-prompt-submit.py"
-            "pg_sync.py"
-            "memory_writer.py"
-            "subagent_context.py"
-            "context_primer.py"
+            "auto_recall_hook.py"
             "beads_writer.py"
+            "brain_hook.py"
+            "citation_walker.py"
+            "context_primer.py"
+            "log_writer.py"
+            "memory_writer.py"
+            "open_brain.py"
+            "pg_sync.py"
+            "post_tool_use.py"
+            "pre-tool-use.py"
             "redact_secrets.py"
             "session_summary.py"
-            "stop-hook.sh"
             "stop-hook.py"
-            "brain_hook.py"
+            "stop-hook.sh"
+            "subagent_context.py"
             "till_done.py"
-            "open_brain.py"
+            "time_travel.py"
+            "user-prompt-submit.py"
+            "vf_probe.py"
         )
 
         for file in "${hook_files[@]}"; do
             rm -f "$HOOKS_DIR/$file"
         done
+
+        # Remove redact/ package
+        rm -rf "$HOOKS_DIR/redact"
 
         # Remove __pycache__
         rm -rf "$HOOKS_DIR/__pycache__"
@@ -463,21 +471,24 @@ install_unix() {
     # Install hook scripts
     print_header "Installing Hook Scripts"
 
+    # Files sourced from scripts/hooks/ → ~/.claude/hooks/
+    # Add new hook files here (one entry per line).
     local hook_files=(
-        "log_writer.py"
-        "pre-tool-use.py"
-        "user-prompt-submit.py"
-        "pg_sync.py"
-        "memory_writer.py"
-        "subagent_context.py"
-        "context_primer.py"
+        "auto_recall_hook.py"
         "beads_writer.py"
+        "brain_hook.py"
+        "context_primer.py"
+        "log_writer.py"
+        "memory_writer.py"
+        "post_tool_use.py"
+        "pre-tool-use.py"
         "redact_secrets.py"
         "session_summary.py"
-        "stop-hook.sh"
         "stop-hook.py"
-        "brain_hook.py"
+        "stop-hook.sh"
+        "subagent_context.py"
         "till_done.py"
+        "user-prompt-submit.py"
     )
 
     local REPO_HOOKS_DIR="$REPO_DIR/scripts/hooks"
@@ -490,10 +501,29 @@ install_unix() {
     done
     chmod +x "$HOOKS_DIR/stop-hook.sh" 2>/dev/null || true
 
-    # Deploy open_brain.py from scripts/ (not hooks/)
-    if [ -f "$REPO_DIR/scripts/open_brain.py" ]; then
-        cp "$REPO_DIR/scripts/open_brain.py" "$HOOKS_DIR/"
+    # Files sourced from scripts/ top-level → ~/.claude/hooks/
+    # These live at scripts/ (not scripts/hooks/) for historical or build reasons.
+    local scripts_top_files=(
+        "open_brain.py"        # brain CLI + Pi bridge
+        "citation_walker.py"   # citation graph walker used by time_travel
+        "time_travel.py"       # temporal memory retrieval hook
+        "vf_probe.py"          # VF_ε verified-forget probe runner
+        "pg_sync.py"           # activity-log-to-Postgres sync daemon
+    )
+    for file in "${scripts_top_files[@]}"; do
+        if [ -f "$REPO_DIR/scripts/$file" ]; then
+            cp "$REPO_DIR/scripts/$file" "$HOOKS_DIR/"
+            count=$((count + 1))
+        fi
+    done
+
+    # Deploy redact/ package (scripts/redact/ → ~/.claude/hooks/redact/)
+    # Required by memory_writer.py and open_brain.py for PII/secret redaction.
+    # Without this a fresh install will fail on import at first hook fire.
+    if [ -d "$REPO_DIR/scripts/redact" ]; then
+        cp -R "$REPO_DIR/scripts/redact" "$HOOKS_DIR/"
         count=$((count + 1))
+        print_status "Installed redact/ PII-redaction package"
     fi
 
     # Deploy BRAIN_SCHEMA_PG.sql so --init works post-install
@@ -637,10 +667,26 @@ ENVBLOCK
 )
     fi
 
+    # Note: if settings.json already exists, this writes a fresh baseline.
+    # The live install may have additional fields (model, effortLevel,
+    # skipDangerousModePermissionPrompt, enabledPlugins, agentPushNotifEnabled)
+    # that are not reproduced here intentionally — those are user-preference fields
+    # that a fresh installer should not pre-set. The hook wiring below matches
+    # the full live shape so a fresh install gets all six hooks wired correctly.
     cat > "$SETTINGS_FILE" << SETTINGS
 {
 $ENV_BLOCK
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/context_primer.py"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "*",
@@ -659,6 +705,10 @@ $ENV_BLOCK
           {
             "type": "command",
             "command": "python3 ~/.claude/hooks/user-prompt-submit.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/auto_recall_hook.py"
           }
         ]
       }
