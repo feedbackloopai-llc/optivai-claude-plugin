@@ -327,10 +327,11 @@ Molecules are reusable workflow templates that instantiate as dependency-wired b
 
 ### Storage
 
-- **Project beads:** `.beads/` in project directory
-- **Global beads:** `~/.claude/beads/` (cross-project)
+- **Canonical store:** ONE physical DB at `~/.beads/issues.jsonl`. `beads` resolves its DB by walking up from the cwd; `~/.beads` is the universal ancestor, so every repo resolves to this single store.
+- **NEVER run `beads init` inside a repo** — it creates a local `.beads/` that shadows the canonical store by walk-up, re-splitting the tracker and making cross-repo dependency edges undrawable. If a repo-local `.beads/` ever reappears, merge its beads into `~/.beads` and delete it (drop the tracked `config.yaml` too).
 - **Format:** JSONL (append-only, git-friendly)
 - **Locking:** FileLock for concurrent safety
+- **Repo labels:** carry a `repo:<basename>` label on each bead to sort/filter by repo without polluting the bead ID.
 
 ### Auto-Created Beads (beads_writer.py hook)
 
@@ -483,7 +484,7 @@ When enabled, a PreToolUse hook **blocks** tool execution unless:
 |-------|------|
 | Session Recovery | `CCODE_SESSION_RECOVERY_GUIDE.md` |
 | Memory System Plan | `docs/plans/2026-03-02-open-brain.md` |
-| Memory Schema DDL | `sql/BRAIN_SCHEMA.sql` |
+| Memory Schema DDL | `sql/BRAIN_SCHEMA_PG.sql` |
 
 ---
 

@@ -1,5 +1,7 @@
 # Plugin Harness Hardening Implementation Plan
 
+> **STATUS: COMPLETE (2026-06-10).** Epic `fblai-t8h8t`. All 4 waves landed via subagent-driven development: 49 commits (34 claude + 15 pi), 26 tasks closed, ~290 claude pytest + 134 pi vitest GREEN, both repos pushed. Every wave gated on adversarial review (each caught real RED/HIGH must-fixes — VF_ε probe tautology, _safeEnv credential leak, thought_type injection). The three over-claims are now TRUE: VF_ε scrubs+probes real residue (k=0 is a measurement), NAL-lite revision is live with verified Wang-1995 math, atom_links suppresses superseded memories at recall. Deferred items filed as `epic:harness-hardening` follow-up beads (security-low, cross-user-link, NAL-docs, CRIT-2 RB-txn, pi-test-debt, migration-idempotency). Retro atom `brain-1781140140-1c575a40`.
+>
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task in this session, or superpowers:executing-plans in a dedicated session. Beads are the source of truth: Task 0 creates the full dependency-wired bead graph BEFORE any other task starts, every task records its bead ID in the execution log, and a task is complete ONLY when its bead is closed after verification.
 
 **Goal:** Close the gap between what the optivai-claude-plugin + optivai-pi-plugin neurosymbolic harness claims and what it does — fix the active breakage, close the security blind spots, make the over-claims true or honest, and install the drift-prevention that stops this class of rot from recurring.
