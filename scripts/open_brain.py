@@ -5226,6 +5226,53 @@ def _run_from_pi():
                 stv_f=_pi_stv_f,
                 stv_c=_pi_stv_c,
             )
+            # links passthrough: list of {"target_id": str, "link_type": str}
+            # or "target_id:link_type" strings (mirrors --link CLI flag).
+            # Pre-validate ALL specs before any write — unknown link_type rejects
+            # the whole batch (atom already committed; links are best-effort but
+            # we still validate up-front to surface errors clearly).
+            _pi_links = args.get("links") or []
+            if isinstance(_pi_links, list) and _pi_links:
+                _pi_link_specs: List[tuple] = []
+                _pi_link_errors: List[str] = []
+                for _raw_link in _pi_links:
+                    try:
+                        if isinstance(_raw_link, dict):
+                            _t = str(_raw_link.get("target_id", ""))
+                            _lt = str(_raw_link.get("link_type", ""))
+                            _pi_link_specs.append((_parse_link_spec(f"{_t}:{_lt}")))
+                        elif isinstance(_raw_link, str):
+                            _pi_link_specs.append(_parse_link_spec(_raw_link))
+                        else:
+                            _pi_link_errors.append(f"unsupported link spec type: {type(_raw_link)}")
+                    except ValueError as _e:
+                        _pi_link_errors.append(str(_e))
+                if _pi_link_errors:
+                    print(json.dumps({"error": f"link spec errors: {_pi_link_errors}", "capture": result}))
+                    return
+                _written_links: List[Dict[str, Any]] = []
+                for _target_id, _link_type in _pi_link_specs:
+                    try:
+                        _lr = add_link(
+                            conn,
+                            source_id=result["thought_id"],
+                            target_id=_target_id,
+                            link_type=_link_type,
+                            user_id=user_id,
+                            via="capture-flag",
+                            prov_agent=args.get("prov_agent"),
+                            session_id=args.get("session_id") or None,
+                            verify_source_exists=False,
+                        )
+                        _written_links.append(_lr)
+                    except Exception as _e:
+                        sys.stderr.write(
+                            f"Pi capture link write failed (continuing): "
+                            f"source={result['thought_id']} target={_target_id} "
+                            f"type={_link_type} error={_e}\n"
+                        )
+                if _written_links:
+                    result["links"] = _written_links
             print(json.dumps(result))
         elif op == "revise":
             # NAL revision: create derived atom with fused stv.
@@ -5417,6 +5464,75 @@ def _run_from_pi():
                 from_iso=args.get("from_iso") or args.get("from"),
                 to_iso=args.get("to_iso") or args.get("to"),
                 event_type=args.get("event_type"),
+                limit=args.get("limit", 100),
+            )
+            print(json.dumps(result, default=str))
+        # ─── T3.1 ops: links / skill / queries ───────────────────────────────
+        elif op == "add_link":
+            _src = args.get("source_id", "")
+            _tgt = args.get("target_id", "")
+            _ltype = args.get("link_type", "")
+            if not _src or not _tgt or not _ltype:
+                print(json.dumps({"error": "add_link requires source_id, target_id, link_type"}))
+                return
+            try:
+                result = add_link(
+                    conn,
+                    source_id=_src,
+                    target_id=_tgt,
+                    link_type=_ltype,
+                    user_id=user_id,
+                    via=args.get("via", "post-hoc"),
+                    prov_agent=args.get("prov_agent"),
+                    session_id=args.get("session_id"),
+                )
+                print(json.dumps(result, default=str))
+            except (ValueError, RuntimeError) as e:
+                print(json.dumps({"error": str(e)}))
+        elif op == "show_links":
+            _atom_id = args.get("atom_id", "")
+            if not _atom_id:
+                print(json.dumps({"error": "show_links requires atom_id"}))
+                return
+            try:
+                result = show_links(conn, atom_id=_atom_id, user_id=user_id)
+                print(json.dumps(result, default=str))
+            except (ValueError, RuntimeError) as e:
+                print(json.dumps({"error": str(e)}))
+        elif op == "register_skill":
+            _sk_name = args.get("name", "")
+            _sk_desc = args.get("description", "")
+            if not _sk_name or not _sk_desc:
+                print(json.dumps({"error": "register_skill requires name and description"}))
+                return
+            _from_patterns = args.get("from_patterns") or []
+            if isinstance(_from_patterns, str):
+                _from_patterns = [_from_patterns]
+            try:
+                result = register_skill(
+                    conn,
+                    name=_sk_name,
+                    description=_sk_desc,
+                    user_id=user_id,
+                    from_patterns=_from_patterns,
+                    prov_agent=args.get("prov_agent"),
+                    project=args.get("project", ""),
+                    session_id=args.get("session_id", ""),
+                )
+                print(json.dumps(result, default=str))
+            except (ValueError, RuntimeError) as e:
+                print(json.dumps({"error": str(e)}))
+        elif op == "query_unresolved_findings":
+            result = query_unresolved_findings(
+                conn,
+                user_id=user_id,
+                limit=args.get("limit", 50),
+            )
+            print(json.dumps(result, default=str))
+        elif op == "query_orphan_links":
+            result = query_orphan_links(
+                conn,
+                user_id=user_id,
                 limit=args.get("limit", 100),
             )
             print(json.dumps(result, default=str))
