@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fblai-knutz — Keychain-first credential resolution tests for _get_database_url.
+"""fblai-knutz / fblai-lm327 — Keychain-first credential resolution + URL validation tests.
 
 Verifies the three-tier resolution order without touching the live DB:
   (a) DATABASE_URL env var wins when set.
@@ -238,3 +238,144 @@ def test_keychain_file_not_found_falls_through_to_config(monkeypatch):
             result = open_brain._get_database_url()
 
     assert result == _CONFIG_CONN, "Should fall through to config when security binary is absent"
+
+
+# ─── fblai-lm327: keychain URL validation ────────────────────────────────────
+
+
+def test_keychain_non_postgres_value_is_rejected_and_falls_through(monkeypatch, capsys):
+    """A non-postgres keychain value must be ignored with a WARNING and fall through.
+
+    fblai-lm327: corrupted or multiline keychain values that do not start with
+    'postgres' must not be returned; the function must fall through to the
+    config-file tier and emit a WARNING to stderr.
+    """
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.delenv("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", raising=False)
+
+    # Keychain returns garbage (multiline, non-postgres)
+    garbage_value = "garbage\nmultiline\nnot-a-url"
+
+    def fake_run_garbage(cmd, **kwargs):
+        result = mock.MagicMock(spec=subprocess.CompletedProcess)
+        result.returncode = 0
+        result.stdout = garbage_value
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run_garbage)
+
+    # Config file fallback provides the real URL
+    fake_config = _make_fake_config(_CONFIG_CONN)
+    with mock.patch("open_brain.Path") as mock_path_cls:
+        home_mock = mock.MagicMock()
+        mock_path_cls.home.return_value = home_mock
+        home_mock.__truediv__ = lambda self, other: home_mock
+        home_mock.exists.return_value = True
+
+        with mock.patch("builtins.open", fake_config):
+            result = open_brain._get_database_url()
+
+    # Must NOT return the garbage value
+    assert result != garbage_value, (
+        f"Non-postgres keychain value must NOT be returned; got {result!r}"
+    )
+    assert result == _CONFIG_CONN, (
+        f"After keychain rejection, config fallback must be used; got {result!r}"
+    )
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err or "keychain" in captured.err.lower(), (
+        f"Expected WARNING on stderr about invalid keychain value; got: {captured.err!r}"
+    )
+
+
+def test_keychain_non_postgres_value_does_not_contain_garbage(monkeypatch):
+    """Ensure the returned URL never contains garbage when keychain is bad."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.delenv("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", raising=False)
+
+    bad_values = [
+        "garbage",
+        "mysql://user:pass@host/db",
+        "http://not-a-database",
+        "",
+        "  ",
+        "\nmultiline\nvalue\n",
+        "redis://localhost:6379",
+    ]
+
+    fake_config = _make_fake_config(_CONFIG_CONN)
+
+    for bad_val in bad_values:
+        def fake_run_bad(cmd, _val=bad_val, **kwargs):
+            result = mock.MagicMock(spec=subprocess.CompletedProcess)
+            result.returncode = 0
+            result.stdout = _val
+            return result
+
+        monkeypatch.setattr("subprocess.run", fake_run_bad)
+
+        with mock.patch("open_brain.Path") as mock_path_cls:
+            home_mock = mock.MagicMock()
+            mock_path_cls.home.return_value = home_mock
+            home_mock.__truediv__ = lambda self, other: home_mock
+            home_mock.exists.return_value = True
+
+            with mock.patch("builtins.open", fake_config):
+                result = open_brain._get_database_url()
+
+        # For non-empty bad values, ensure the raw garbage doesn't leak into
+        # the returned URL.  (Empty/whitespace-only values can't be asserted
+        # "not in" since "" is contained in every string — instead assert the
+        # config URL was returned, which we check below.)
+        stripped = bad_val.strip()
+        if stripped:
+            assert stripped not in result, (
+                f"Bad keychain value {bad_val!r} must not appear in returned URL; got {result!r}"
+            )
+
+
+def test_valid_postgresql_url_in_keychain_is_returned(monkeypatch):
+    """A valid 'postgresql://' keychain URL IS returned directly (regression guard)."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.delenv("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", raising=False)
+
+    valid_postgresql = "postgresql://user:pass@host/db"
+
+    def fake_run_valid(cmd, **kwargs):
+        result = mock.MagicMock(spec=subprocess.CompletedProcess)
+        result.returncode = 0
+        result.stdout = valid_postgresql + "\n"
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run_valid)
+
+    result = open_brain._get_database_url()
+    assert result == valid_postgresql, (
+        f"Valid 'postgresql://' URL must be returned; got {result!r}"
+    )
+
+
+def test_valid_postgres_url_in_keychain_is_returned(monkeypatch):
+    """A valid 'postgres://' keychain URL IS returned directly."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.delenv("OPEN_BRAIN_DB_KEYCHAIN_SERVICE", raising=False)
+
+    valid_postgres = "postgres://user:pass@host/db"
+
+    def fake_run_valid(cmd, **kwargs):
+        result = mock.MagicMock(spec=subprocess.CompletedProcess)
+        result.returncode = 0
+        result.stdout = valid_postgres
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run_valid)
+
+    result = open_brain._get_database_url()
+    assert result == valid_postgres, (
+        f"Valid 'postgres://' URL must be returned; got {result!r}"
+    )
