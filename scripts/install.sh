@@ -399,12 +399,16 @@ uninstall_unix() {
         fi
     fi
 
-    # Remove settings.json (backup first)
+    # Remove ONLY the plugin's hook commands from settings.json.
+    # Every other user preference (model, permissions, enabledPlugins, etc.)
+    # and every non-plugin hook is left untouched. A timestamped backup is
+    # created first so the user can always roll back.
     if [ -f "$SETTINGS_FILE" ]; then
         local backup_file="${SETTINGS_FILE}.uninstall-backup.$(date +%Y%m%d-%H%M%S)"
         cp "$SETTINGS_FILE" "$backup_file"
-        rm -f "$SETTINGS_FILE"
-        print_status "Removed settings.json (backed up to $backup_file)"
+        print_status "Backed up settings.json to: $backup_file"
+        python3 "$SCRIPT_DIR/merge_settings.py" "$SETTINGS_FILE" --uninstall
+        print_status "Removed plugin hooks from settings.json (user preferences preserved)"
     fi
 
     echo ""
@@ -631,15 +635,13 @@ install_unix() {
         configure_postgresql
     fi
 
-    # Generate settings.json
+    # Merge plugin hooks/env into settings.json without clobbering user settings.
+    # merge_settings.py is settings-aware: it PRESERVES every existing top-level key
+    # (model, effortLevel, permissions, enabledPlugins, etc.) and adds/updates only
+    # the plugin's required env keys and hook commands idempotently.
+    # --force no longer destroys user settings; it simply re-runs the merge
+    # (a fresh baseline is the empty-merge case).
     print_header "Configuring Claude Code Settings"
-
-    if [ -f "$SETTINGS_FILE" ] && [ "$FORCE" = false ]; then
-        print_warning "settings.json already exists"
-        BACKUP_FILE="${SETTINGS_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "$SETTINGS_FILE" "$BACKUP_FILE"
-        print_status "Backed up to: $BACKUP_FILE"
-    fi
 
     # Prompt for user email (for token usage attribution)
     print_header "User Identity Configuration"
@@ -647,91 +649,27 @@ install_unix() {
     USER_EMAIL=$(prompt_with_default "Your company email" "")
     ORG_NAME=$(prompt_with_default "Organization name" "FeedbackLoopAI")
 
-    # Build env block
-    local ENV_BLOCK=""
-    if [ -n "$USER_EMAIL" ] || [ -n "$ORG_NAME" ]; then
-        ENV_BLOCK=$(cat << ENVBLOCK
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "CLAUDE_USER_EMAIL": "$USER_EMAIL",
-    "CLAUDE_ORG_NAME": "$ORG_NAME"
-  },
-ENVBLOCK
-)
-    else
-        ENV_BLOCK=$(cat << ENVBLOCK
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
-  },
-ENVBLOCK
-)
+    # Safety backup before any write (keeps a timestamped snapshot regardless
+    # of whether settings.json already exists, so the user can always roll back).
+    if [ -f "$SETTINGS_FILE" ]; then
+        BACKUP_FILE="${SETTINGS_FILE}.pre-merge-backup.$(date +%Y%m%d-%H%M%S)"
+        cp "$SETTINGS_FILE" "$BACKUP_FILE"
+        print_status "Backed up existing settings.json to: $BACKUP_FILE"
     fi
 
-    # Note: if settings.json already exists, this writes a fresh baseline.
-    # The live install may have additional fields (model, effortLevel,
-    # skipDangerousModePermissionPrompt, enabledPlugins, agentPushNotifEnabled)
-    # that are not reproduced here intentionally — those are user-preference fields
-    # that a fresh installer should not pre-set. The hook wiring below matches
-    # the full live shape so a fresh install gets all six hooks wired correctly.
-    cat > "$SETTINGS_FILE" << SETTINGS
-{
-$ENV_BLOCK
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/context_primer.py"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/pre-tool-use.py"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/user-prompt-submit.py"
-          },
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/auto_recall_hook.py"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/session_summary.py"
-          },
-          {
-            "type": "command",
-            "command": "bash \"\$HOME/.claude/hooks/stop-hook.sh\""
-          }
-        ]
-      }
-    ]
-  }
-}
-SETTINGS
+    # Build the merge argument list
+    local MERGE_ARGS=("$SETTINGS_FILE")
+    if [ -n "$USER_EMAIL" ]; then
+        MERGE_ARGS+=("--email" "$USER_EMAIL")
+    fi
+    if [ -n "$ORG_NAME" ]; then
+        MERGE_ARGS+=("--org" "$ORG_NAME")
+    fi
 
-    print_status "Generated settings.json"
+    # Run the merge helper (invoked from $SCRIPT_DIR — no need to copy to ~/.claude).
+    python3 "$SCRIPT_DIR/merge_settings.py" "${MERGE_ARGS[@]}"
+
+    print_status "Merged plugin hooks/env into settings.json (user preferences preserved)"
 
     # ─── brain-v0.2.0 upgrade detection (deploy-S2) ─────────────────────────────
     # If brain.thoughts exists but lacks the PROV-DM columns, this is a pre-v0.2.0
