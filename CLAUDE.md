@@ -65,8 +65,7 @@ Agents run via `Task` tool with `subagent_type` parameter.
 
 | Agent | Model | Use Case |
 |-------|-------|----------|
-| `postgresql-specialist` | opus | Indexes, partitioning, pgvector, optimization |
-| `sql-developer` | opus | Complex SQL, stored procs, cross-DB |
+| `sql-developer` | opus | Complex SQL, stored procs, pgvector, cross-DB |
 | `etl-pipeline-developer` | opus | Data pipelines, transformations |
 | `data-architect` | opus | Schema design, data modeling |
 | `solution-architect-planner` | opus | Technical planning, architecture |
@@ -486,8 +485,10 @@ When enabled, a PreToolUse hook **blocks** tool execution unless:
 
 | Topic | File |
 |-------|------|
-| Session Recovery | `CCODE_SESSION_RECOVERY_GUIDE.md` |
-| Memory System Plan | `docs/plans/2026-03-02-open-brain.md` |
+| Brain partner setup | `docs/OPEN_BRAIN_PARTNER_SETUP.md` |
+| Neon / pgvector setup | `docs/NEON_SETUP_GUIDE.md` |
+| Brain migration guide | `docs/MIGRATION_GUIDE.md` |
+| MS_ε primer (sovereignty primitives) | `docs/MS_EPS_PRIMER.md` |
 | Memory Schema DDL | `sql/BRAIN_SCHEMA_PG.sql` |
 
 ---

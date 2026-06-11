@@ -22,7 +22,7 @@ After capturing, briefly confirm what I remembered and what metadata was extract
 
 ## Seeding NAL truth values (T2.6)
 
-By default, the truth-value `{frequency, confidence}` (stv) is derived from the confidence label Cortex extracts from the capture text (high→`c=0.9`, medium→`c=0.7`, low/absent→`c=0.5`; frequency defaults to `1.0`). You can override this explicitly:
+By default, the truth-value `{frequency, confidence}` (stv) is derived from the confidence label Haiku extracts from the capture text (high→`c=0.9`, medium→`c=0.7`, low/absent→`c=0.5`; frequency defaults to `1.0`). You can override this explicitly:
 
 - `--stv-f FREQ` — set stv frequency (0.0–1.0). Use `0.0` for a fully-refuted belief, `1.0` for strong positive evidence, values between for partial support.
 - `--stv-c CONF` — set stv confidence (0.0–1.0). Represents weight of evidence; higher = more observations backing this belief. Confidence of `0.35` or below causes search results to display a `[LOW-CONFIDENCE]` marker.
@@ -60,7 +60,7 @@ This is the agent's instrument for **Rule 3 — Capture-with-alternatives** and 
 
 ## How to use the result
 
-- Confirm the returned `thought_id` and the metadata Cortex extracted (`type`, `topics`, `people`, `summary`, `confidence`). If extraction got the type wrong, immediately re-capture with the corrected framing rather than letting the wrong kind drift downstream.
+- Confirm the returned `thought_id` and the metadata Haiku extracted (`type`, `topics`, `people`, `summary`, `confidence`). If extraction got the type wrong, immediately re-capture with the corrected framing rather than letting the wrong kind drift downstream.
 - For derived captures, verify the `was_derived_from` field is populated by running `/brain-trace <new_id>` and confirming the chain walks back to the intended parent.
 - If the captured atom matters more than its raw similarity score will likely surface, call `/brain-promote <id>` once after capture to seed Hebbian weight (Rule 4).
 - If the user immediately corrects the capture ("no, the alternative I rejected was different"), do NOT call `/brain-forget`; capture a corrective atom with `--derived-from` pointing at the wrong one and `/brain-demote` the wrong one. Forgetting is reserved for the user.
@@ -93,4 +93,4 @@ You commit to using `pgvector` for the embedding store after evaluating Pinecone
 python3 ~/.claude/hooks/open_brain.py --capture "Decision: use pgvector for the embedding store. Alternatives rejected: Pinecone (vendor lock-in, no on-prem option), Qdrant (operational overhead at 1-user scale not justified). Reasoning: shared infra with existing Postgres; HNSW recall ≥ 0.95 measured on prior benchmark; reversible if scale exceeds 10M vectors." --source "claude-code" --session-id "$CLAUDE_CODE_SESSION_ID" --project "optivai-builder"
 ```
 
-Cortex extracts `type=decision`, `topics=[pgvector, embedding-store, vector-db]`, `confidence=0.92`. Six weeks later another agent runs `/brain-search "vector database choice"` and surfaces this atom with its alternatives and reasoning intact — no re-derivation, and the rejected alternatives are themselves searchable when the question becomes "why didn't we use Pinecone?"
+Haiku extracts `type=decision`, `topics=[pgvector, embedding-store, vector-db]`, `confidence=0.92`. Six weeks later another agent runs `/brain-search "vector database choice"` and surfaces this atom with its alternatives and reasoning intact — no re-derivation, and the rejected alternatives are themselves searchable when the question becomes "why didn't we use Pinecone?"
