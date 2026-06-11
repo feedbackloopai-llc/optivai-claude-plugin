@@ -207,6 +207,8 @@ function Invoke-Uninstall([string]$pythonExe) {
         }
         $redactDir = Join-Path $HooksDir "redact"
         if (Test-Path $redactDir) { Remove-Item $redactDir -Recurse -Force }
+        # Mirror install.sh: clean up the Python bytecode cache too.
+        Remove-Item -Recurse -Force (Join-Path $HooksDir "__pycache__") -ErrorAction SilentlyContinue
         Write-OK "Removed hook scripts"
     }
 
@@ -285,15 +287,21 @@ function Install-Daemon([string]$pythonExe) {
         }
     }
 
-    # Create the task: run every 5 minutes as the current user
-    $createResult = schtasks /create `
-        /tn  $TaskName `
-        /tr  "$taskAction" `
-        /sc  MINUTE `
-        /mo  5 `
-        /ru  "$env:USERNAME" `
-        /rl  LIMITED `
-        /f 2>&1
+    # Create the task: run every 5 minutes as the current user.
+    # Use an argument array + splatting rather than backtick line-continuation.
+    # A trailing space after any backtick silently turns it into a literal and
+    # breaks the parse on some PowerShell versions; splatting avoids that footgun.
+    $schtasksArgs = @(
+        '/create',
+        '/tn', $TaskName,
+        '/tr', $taskAction,
+        '/sc', 'MINUTE',
+        '/mo', '5',
+        '/ru', $env:USERNAME,
+        '/rl', 'LIMITED',
+        '/f'
+    )
+    schtasks @schtasksArgs 2>&1 | Out-Null
 
     if ($LASTEXITCODE -eq 0) {
         Write-OK "Created Task Scheduler entry: $TaskName (runs every 5 minutes)"
@@ -470,12 +478,10 @@ function Invoke-Install() {
         }
     }
 
-    # Ensure beads dir exists
-    $beadsDir = Join-Path $ClaudeDir "beads"
-    if (-not (Test-Path $beadsDir)) {
-        New-Item -ItemType Directory -Path $beadsDir -Force | Out-Null
-    }
-    Write-OK "Created ~/.claude/beads/ (global beads storage)"
+    # NOTE: Do NOT create ~/.claude/beads — the canonical beads store is
+    # ~/.beads/issues.jsonl, which the beads CLI resolves by walk-up and creates
+    # on first use. A ~/.claude/beads directory would be a misleading dead dir
+    # that the CLI never reads.
 
     # ── settings.json merge ─────────────────────────────────────────────────
     Write-Header "Configuring Claude Code Settings"
