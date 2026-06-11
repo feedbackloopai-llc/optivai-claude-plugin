@@ -32,6 +32,7 @@ This is the agent's primary instrument for **Rule 1 — Recall-before-reason**. 
 ## How to use the result
 
 - Each result carries `id`, `type`, `summary`, `similarity`, `created_at`, and any extracted `topics`/`people`. Lead with the highest-similarity atom whose type matches your need (`decision` for prior choices, `pattern` for reusable approaches, `preference` for user-stated rules).
+- Results also carry `stv: {f, c}` — the NAL truth value for each atom. Atoms with `c < 0.35` display a `[LOW-CONFIDENCE]` marker; treat these as weak evidence and seek corroboration or run `/brain-revise` if a stronger complementary atom exists.
 - If two results contradict each other, invoke `/brain-trace` on both before deciding which to trust. This serves Rule 2 — Conflict-fusion via NAL: the trace surfaces premises and PROV-DM lineage so the conflict can be resolved by provenance comparison rather than arbitrary tiebreak.
 - If a recalled atom is older than 90 days, single-sourced, or load-bearing for the decision you're about to make, run `/brain-trace <id>` before acting on it (Rule 6 — Provenance-traversal).
 - If a recalled atom turned out to be load-bearing after the fact — it prevented a regression, surfaced a non-obvious constraint — call `/brain-promote <id>` so the Hebbian signal protects it from time decay (Rule 4).

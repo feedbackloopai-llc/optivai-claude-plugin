@@ -20,6 +20,22 @@ Replace `<current_project_name>` with the actual current project/directory name.
 
 After capturing, briefly confirm what I remembered and what metadata was extracted.
 
+## Seeding NAL truth values (T2.6)
+
+By default, the truth-value `{frequency, confidence}` (stv) is derived from the confidence label Cortex extracts from the capture text (high→`c=0.9`, medium→`c=0.7`, low/absent→`c=0.5`; frequency defaults to `1.0`). You can override this explicitly:
+
+- `--stv-f FREQ` — set stv frequency (0.0–1.0). Use `0.0` for a fully-refuted belief, `1.0` for strong positive evidence, values between for partial support.
+- `--stv-c CONF` — set stv confidence (0.0–1.0). Represents weight of evidence; higher = more observations backing this belief. Confidence of `0.35` or below causes search results to display a `[LOW-CONFIDENCE]` marker.
+
+```bash
+python3 ~/.claude/hooks/open_brain.py \
+  --capture "Postgres HNSW index recall ≥ 0.95 at 1M vectors (measured 2026-05-01)" \
+  --stv-f 1.0 --stv-c 0.85 \
+  --source "claude-code" --session-id "$CLAUDE_CODE_SESSION_ID" --project "optivai-builder"
+```
+
+These flags pair with `/brain-revise`: if you later find a contradicting atom, `--revise` will fuse the two stv values via NAL evidential-horizon revision. Seeding accurate `stv-c` values at capture time makes future revisions more meaningful — the weighted average is only as good as the input confidence values.
+
 ## Optional PROV-DM fields (v0.2.0+)
 
 For explicit W3C PROV-DM provenance, the following flags are supported. The default capture path stamps these automatically from session context, but you can override when the thought derives from a specific upstream source (e.g. summarising a meeting note, transforming a prior decision):

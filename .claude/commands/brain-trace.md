@@ -17,6 +17,7 @@ This invokes the **citation walker** — it walks the `was_derived_from` chain (
 
 - Present the chain bottom-up (root → target) so the reader follows derivation forward in time.
 - For each node, show: short_id, agent, activity, wasGeneratedBy timestamp, one-line summary.
+- Each non-orphan node also carries `stv: {f, c}` — the belief truth value at that point in the derivation. A chain produced by `/brain-revise` will show increasing `c` values toward the leaf, reflecting evidence accumulation. A chain with `c` dropping toward the root may indicate the belief was strengthened by more recent evidence (closer to the leaf).
 - Highlight orphan nodes — they reveal where a parent was forgotten via VF_ε, making the chain auditable in both directions.
 - If `truncated: true` (max-depth hit), suggest re-running with a higher `--max-depth`.
 

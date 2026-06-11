@@ -106,6 +106,10 @@ session restarts, and compaction. It is permanent and perfect.
 **Task memory** (Beads) — Active work items with dependencies and status flow.
 What I'm working on, what's blocked, what's done. My to-do list with a dependency graph.
 
+### NAL-lite truth values (T2.6)
+
+Every atom carries `stv: {f, c}` — NAL frequency (degree of positive evidence, 0–1) and confidence (weight of evidence, 0–1). Atoms with `c < 0.35` are flagged `[LOW-CONFIDENCE]` in search results. At capture time, seed explicit values with `--stv-f FREQ --stv-c CONF`; the default derives `c` from Cortex's confidence label (high=0.9, medium=0.7, low/absent=0.5). Adding a `verifies` link to an atom raises its confidence; a `refutes` link revises it toward `f=0.0`. Use `--revise ID_A ID_B` to fuse two atoms about the same proposition via NAL evidential-horizon revision — the derived atom's `c` is strictly higher than either premise (evidence accumulation), and `derives_from` links to both premises make the resolution auditable by `/brain-trace`. This is NAL-lite: revision + evidence propagation only — not a general inference engine.
+
 ### Memory Commands (USE THESE — don't wait to be asked)
 
 ```bash
