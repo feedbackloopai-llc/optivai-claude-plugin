@@ -1,0 +1,81 @@
+{
+  "_doc": "Shared dispatch-gate test corpus. Both dispatch_gate.py and dispatch-gate.ts load this and must produce identical verdicts (parity test T3). See docs/dispatch-contract.md. expect fields: compliant, block, missing_has (substring that must appear in some missing[] entry), warnings_has (substring in some warnings[] entry), not_missing (substring that must NOT appear in missing[]).",
+  "cases": [
+    {
+      "name": "compliant_full",
+      "mode": "warn",
+      "prompt": "You are implementing bead fblai-x1 in /Users/erato949/dev/optivai-claude-plugin (branch: main). Read scripts/open_brain.py and the spec at docs/dispatch-contract.md. Task: add a helper that counts tokens. Acceptance: the new pytest test passes and tsc is clean. Return a one-paragraph summary of the files changed and the test result.",
+      "expect": {
+        "compliant": true,
+        "block": false
+      }
+    },
+    {
+      "name": "missing_termination",
+      "mode": "warn",
+      "prompt": "You are working in scripts/foo.py. Please add a log parser and report your progress as you go. Read the existing helpers in scripts/ first.",
+      "expect": {
+        "compliant": false,
+        "block": false,
+        "missing_has": "termination"
+      }
+    },
+    {
+      "name": "missing_output_contract",
+      "mode": "warn",
+      "prompt": "You are implementing in src/x.ts (branch: main). Read src/tools.ts for the pattern. Acceptance: the build passes and the new vitest case is green. Stop when the suite is fully green.",
+      "expect": {
+        "compliant": false,
+        "block": false,
+        "warnings_has": "output",
+        "not_missing": "termination"
+      }
+    },
+    {
+      "name": "redundant_paste_with_path",
+      "mode": "warn",
+      "prompt": "Implement the change in scripts/open_brain.py. Acceptance: tests pass. Return a summary. Here is the current file for context:\n```python\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\n```",
+      "expect": {
+        "compliant": false,
+        "block": false,
+        "warnings_has": "content",
+        "not_missing": "termination"
+      }
+    },
+    {
+      "name": "big_paste_no_path_is_fine",
+      "mode": "warn",
+      "prompt": "Here is the target implementation you must produce verbatim. Acceptance: it compiles. Return the result.\n```python\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\ndef handler(x):\n    return x + 1  # filler line to add bulk\n# ---- REPEAT MARKER ----\n```",
+      "expect": {
+        "compliant": true,
+        "block": false
+      }
+    },
+    {
+      "name": "missing_termination_strict_blocks",
+      "mode": "strict",
+      "prompt": "You are working in scripts/foo.py. Please add a log parser and report your progress.",
+      "expect": {
+        "compliant": false,
+        "block": true,
+        "missing_has": "termination"
+      }
+    },
+    {
+      "name": "off_mode_skips",
+      "mode": "off",
+      "prompt": "anything at all, no contract elements",
+      "expect": {
+        "checked": false
+      }
+    },
+    {
+      "name": "empty_prompt_allows",
+      "mode": "warn",
+      "prompt": "",
+      "expect": {
+        "checked": false
+      }
+    }
+  ]
+}

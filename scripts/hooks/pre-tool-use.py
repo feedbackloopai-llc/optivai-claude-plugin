@@ -221,7 +221,7 @@ def determine_operation(tool_info):
         if tool_input.get('glob'):
             details['glob_filter'] = tool_input['glob']
 
-    elif tool_name == "Task":
+    elif tool_name in ("Task", "Agent"):
         operation = "task"
         subagent_type = tool_input.get('subagent_type', '')
         task_description = tool_input.get('description', '')
@@ -338,6 +338,54 @@ def main():
             task_context = handle_task_operation(tool_input, session_id)
             # Merge task context into details
             details.update(task_context)
+
+            # --- Dispatch quality gate (fail-open) ---
+            try:
+                from dispatch_gate import evaluate_dispatch, resolve_env_config
+                _gate_cfg = resolve_env_config()
+                _dispatch_prompt = tool_input.get("prompt", "")
+                if not isinstance(_dispatch_prompt, str):
+                    _dispatch_prompt = ""
+                _verdict = evaluate_dispatch(_dispatch_prompt, **_gate_cfg)
+
+                if _verdict.get("checked") and not _verdict.get("compliant"):
+                    _mode = _gate_cfg.get("mode", "warn")
+                    _missing = _verdict.get("missing", [])
+                    _warnings = _verdict.get("warnings", [])
+
+                    if _mode == "strict" and _verdict.get("block"):
+                        # Deny the dispatch
+                        _reasons = _missing + _warnings
+                        _reason_text = " | ".join(_reasons) if _reasons else "dispatch prompt fails contract"
+                        import json as _json
+                        print(_json.dumps({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": _reason_text,
+                            }
+                        }))
+                        sys.exit(1)
+                    else:
+                        # Warn mode: emit advisory, allow
+                        _items = _missing + _warnings
+                        if _items:
+                            _advisory = (
+                                "[dispatch-gate] Subagent prompt quality advisory:\n"
+                                + "\n".join(f"  - {msg}" for msg in _items)
+                            )
+                            import json as _json
+                            print(_json.dumps({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PreToolUse",
+                                    "additionalContext": _advisory,
+                                }
+                            }))
+            except Exception:
+                # Fail-open: any error in the gate does nothing
+                pass
+            # --- End dispatch quality gate ---
+
         else:
             # For all other operations, include current subagent context
             subagent_ctx = get_subagent_context()
