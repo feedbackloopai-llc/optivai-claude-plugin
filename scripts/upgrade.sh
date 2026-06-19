@@ -91,6 +91,7 @@ REPO_HOOKS_DIR="$REPO_DIR/scripts/hooks"
 if [ -d "$REPO_HOOKS_DIR" ] && [ -d "$HOOKS_DIR" ]; then
     # Core hooks with beads integration
     cp "$REPO_HOOKS_DIR/pre-tool-use.py" "$HOOKS_DIR/"
+    cp "$REPO_HOOKS_DIR/dispatch_gate.py" "$HOOKS_DIR/"   # imported by pre-tool-use.py (subagent dispatch gate)
     cp "$REPO_HOOKS_DIR/user-prompt-submit.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/beads_writer.py" "$HOOKS_DIR/"
 

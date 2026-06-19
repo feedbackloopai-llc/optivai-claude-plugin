@@ -193,7 +193,7 @@ function Invoke-Uninstall([string]$pythonExe) {
     # Remove hook scripts
     $hookFiles = @(
         "auto_recall_hook.py", "beads_writer.py", "brain_hook.py",
-        "citation_walker.py", "context_primer.py", "log_writer.py",
+        "citation_walker.py", "context_primer.py", "dispatch_gate.py", "log_writer.py",
         "memory_writer.py", "open_brain.py", "pg_sync.py",
         "post_tool_use.py", "pre-tool-use.py", "redact_secrets.py",
         "session_summary.py", "stop-hook.py", "stop-hook.sh",
@@ -389,6 +389,7 @@ function Invoke-Install() {
         "beads_writer.py",
         "brain_hook.py",
         "context_primer.py",
+        "dispatch_gate.py",
         "log_writer.py",
         "memory_writer.py",
         "post_tool_use.py",
