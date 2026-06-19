@@ -101,7 +101,7 @@ if [ -d "$REPO_HOOKS_DIR" ] && [ -d "$HOOKS_DIR" ]; then
     cp "$REPO_HOOKS_DIR/redact_secrets.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/subagent_context.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/context_primer.py" "$HOOKS_DIR/"
-    cp "$REPO_HOOKS_DIR/pg_sync.py" "$HOOKS_DIR/"
+    cp "$REPO_DIR/scripts/pg_sync.py" "$HOOKS_DIR/"   # pg_sync.py lives in scripts/, not scripts/hooks/
     cp "$REPO_HOOKS_DIR/stop-hook.sh" "$HOOKS_DIR/"
     chmod +x "$HOOKS_DIR/stop-hook.sh"
 
