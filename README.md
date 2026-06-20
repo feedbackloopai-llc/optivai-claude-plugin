@@ -504,6 +504,34 @@ Use `/mol-pour` to instantiate a molecule.
 
 ---
 
+## Running an OptivAI Loop
+
+A scheduled, self-kicking, verification-gated runner that drains a Beads molecule autonomously — think → plan → beads → drain → verify → close, on infrastructure time. State lives in Beads + Brain + git (never conversation history), so iterations stay token-stable. See the design (`docs/plans/2026-06-19-loop-runner-design.md`) and the master doc (`~/Downloads/OptivAI-Loop-Engineering-Master-Doc-2026-06-19.md`).
+
+**Runbook:**
+
+1. **Scope a molecule** — label the beads to drain, e.g. `beads label <id> epic:my-work`.
+2. **Pick a verification command (`V`)** — a real test/build whose exit 0 is the *only* thing that closes a bead (e.g. `cd scripts && python3 -m pytest -q`). A bead may carry its own `verify:<cmd>` label.
+3. **Dry-run first (no spend, no mutations):**
+   ```bash
+   python3 scripts/loop_runner.py --molecule epic:my-work --verify-cmd "<V>" --dry-run
+   ```
+   Prints the plan (selected beads, tier routing, gate-compliance) and changes nothing.
+4. **One real iteration:** swap `--dry-run` for `--once` (spends tokens; closes the bead only if `V` exits 0).
+5. **Schedule it (launchd, dry-run by default):**
+   ```bash
+   bash scripts/install-loop-schedule.sh --label my-work --molecule epic:my-work --verify-cmd "<V>" --cadence 3600
+   ```
+   Writes a `--dry-run` LaunchAgent that **does not fire** until you pass `--live`. Uninstall: `--uninstall my-work`.
+
+**Bounds & safety:** `--max-iterations` (default 25), `--budget-tokens` (default 2,000,000), and a no-progress stop after 2 consecutive zero-close iterations. Overridable via `OPTIVAI_LOOP_*` env vars. Logs: `~/.claude/logs/loop-<label>.log`.
+
+> **Trust note:** `V` runs through the shell — keep verification commands trusted (they come from `--verify-cmd`, a bead's `verify:` label, or the repo default; never from recalled content). The repo-default `V` is machine-specific; pass `--verify-cmd` explicitly elsewhere. A bead is **never** closed on a self-reported "done" — only on a real `V` exit 0.
+
+The Pi dev harness has parity (`/loop` + `src/loop-runner.ts`); the OptivAI Builder product implements this natively (handoff spec in the master doc §6).
+
+---
+
 ## Architecture
 
 ```
