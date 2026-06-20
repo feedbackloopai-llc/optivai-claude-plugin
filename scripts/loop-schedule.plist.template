@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  loop-schedule.plist.template — LaunchAgent plist template for OptivAI Loop runner (T4)
+
+  Placeholders (filled by install-loop-schedule.sh):
+    {LABEL}            — short identifier, becomes part of the service name
+    {PYTHON}           — absolute path to python3 interpreter
+    {LOOP_RUNNER}      — absolute path to loop_runner.py
+    {MOLECULE}         — molecule label passed to --molecule
+    {VERIFY_CMD}       — verify command passed to --verify-cmd
+    {CADENCE_SECONDS}  — integer; used for StartInterval
+    {EXTRA_FLAGS}      — additional CLI flags; defaults to "--dry-run" until --live is passed
+
+  Safety defaults:
+    RunAtLoad = false  — never fires immediately on bootstrap
+    StartInterval      — fires on the cadence, NOT on a calendar schedule
+    {EXTRA_FLAGS} defaults to "--dry-run" — no live token spend until explicitly enabled
+
+  Logs:
+    stdout → ~/.claude/logs/loop-{LABEL}.log
+    stderr → ~/.claude/logs/loop-{LABEL}.log  (merged for simplicity)
+-->
+<plist version="1.0">
+<dict>
+    <!-- Service identity -->
+    <key>Label</key>
+    <string>com.erato949.optivai-loop-{LABEL}</string>
+
+    <!-- Interpreter + script + fixed flags -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{PYTHON}</string>
+        <string>{LOOP_RUNNER}</string>
+        <string>--molecule</string>
+        <string>{MOLECULE}</string>
+        <string>--verify-cmd</string>
+        <string>{VERIFY_CMD}</string>
+        {EXTRA_FLAGS}
+    </array>
+
+    <!-- Cadence: fire every N seconds (NOT calendar-based) -->
+    <key>StartInterval</key>
+    <integer>{CADENCE_SECONDS}</integer>
+
+    <!-- IMPORTANT: do NOT fire immediately on bootstrap/login -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Restart on crash (applies only in live mode once bootstrapped) -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Log destination — stdout and stderr merged into a single rotating log -->
+    <key>StandardOutPath</key>
+    <string>{HOME}/.claude/logs/loop-{LABEL}.log</string>
+    <key>StandardErrorPath</key>
+    <string>{HOME}/.claude/logs/loop-{LABEL}.log</string>
+
+    <!-- Run in the user's home directory so relative paths resolve cleanly -->
+    <key>WorkingDirectory</key>
+    <string>{HOME}</string>
+
+    <!-- Ensure PATH includes Homebrew so beads/claude CLIs are reachable -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>{HOME}</string>
+    </dict>
+</dict>
+</plist>
