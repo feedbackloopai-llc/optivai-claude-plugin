@@ -1,0 +1,8 @@
+# OptivAI Loop e2e probe (bead fblai-v46li)
+# Committable record of the toy loop end-to-end probe.
+# The runtime deliverable is the ephemeral marker at /tmp/optivai-loop-marker.txt,
+# which lives outside the repo; this file is the in-repo artifact committed to
+# satisfy the loop's "do one bounded unit → commit" contract.
+# Verify: test -f /tmp/optivai-loop-marker.txt
+probe=fblai-v46li
+status=ok
