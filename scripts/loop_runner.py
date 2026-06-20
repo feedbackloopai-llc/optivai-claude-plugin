@@ -132,29 +132,35 @@ class Runners:
 # ---------------------------------------------------------------------------
 
 def _live_beads_ready(molecule: str) -> List[dict]:
-    """Call `beads ready -l <molecule>` and parse JSON output."""
+    """Return ready (unblocked, open) beads scoped to a molecule label.
+
+    `beads ready` takes NO options (no -l/--json); only `beads list` does.
+    So we intersect the global ready frontier (parsed from `beads ready`
+    text) with the molecule's open beads (`beads list -l <label> --json`).
+    ``molecule`` is a full bead label, e.g. "epic:scheduled-loop".
+    """
     try:
-        result = subprocess.run(
-            ["beads", "ready", "-l", f"molecule:{molecule}", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        # 1. global ready frontier (text → set of ids)
+        ready = subprocess.run(
+            ["beads", "ready"], capture_output=True, text=True, timeout=30,
         )
-        if result.returncode != 0:
-            # beads ready may not support --json; fall back to human output parse
-            result2 = subprocess.run(
-                ["beads", "ready", "-l", f"molecule:{molecule}"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            return _parse_beads_ready_text(result2.stdout)
-        text = result.stdout.strip()
-        if not text:
+        ready_ids = {
+            b["id"] for b in _parse_beads_ready_text(ready.stdout) if b.get("id")
+        }
+        if not ready_ids:
             return []
-        return json.loads(text)
+        # 2. molecule's open beads (label filter → JSON)
+        listed = subprocess.run(
+            ["beads", "list", "-l", molecule, "--status", "open", "--json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if listed.returncode != 0 or not listed.stdout.strip():
+            return []
+        molecule_beads = json.loads(listed.stdout)
+        # 3. intersect: ready AND in molecule, preserving list order
+        return [b for b in molecule_beads if b.get("id") in ready_ids]
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as exc:
-        logger.warning("beads ready failed: %s", exc)
+        logger.warning("beads_ready failed: %s", exc)
         return []
 
 
