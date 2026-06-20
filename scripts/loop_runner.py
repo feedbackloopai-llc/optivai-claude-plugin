@@ -27,7 +27,9 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -56,6 +58,10 @@ LOOP_NOPROGRESS_K: int = int(os.environ.get("OPTIVAI_LOOP_NOPROGRESS_K", "2"))
 LOOP_MODEL_MAP: dict = {"design": "opus", "implement": "sonnet", "busywork": "haiku"}
 LOOP_VERIFY_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_VERIFY_TIMEOUT_S", "900"))
 LOOP_ITER_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_ITER_TIMEOUT_S", "1800"))
+
+# Default path for the shared loop state file (OBS2).
+# Override via Runners.loop_state_path for testing.
+LOOP_STATE_PATH: Path = Path.home() / ".claude" / "loop-state.json"
 
 # Default verify command for this repo when none is specified
 _REPO_DEFAULT_VERIFY_CMD = "cd /Users/erato949/dev/optivai-claude-plugin/scripts && python3 -m pytest -q"
@@ -117,6 +123,9 @@ class Runners:
       brain_capture(text, type_)     → None
       dispatch(prompt, model, timeout_s) → dict    ({"tokens": int, "output": str})
       run_verify(cmd, timeout_s)     → int         (exit code)
+
+    loop_state_path: override the default LOOP_STATE_PATH for testing.
+      When None, write_loop_state uses the module-level LOOP_STATE_PATH constant.
     """
 
     beads_ready: Callable[[str], List[dict]]
@@ -125,6 +134,7 @@ class Runners:
     brain_capture: Callable[[str, str], None]
     dispatch: Callable[[str, str, int], dict]
     run_verify: Callable[[str, int], int]
+    loop_state_path: Optional[Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +298,83 @@ def make_live_runners() -> Runners:
         dispatch=_live_dispatch,
         run_verify=_live_run_verify,
     )
+
+
+# ---------------------------------------------------------------------------
+# OBS2 — loop state file helpers
+# ---------------------------------------------------------------------------
+
+def write_loop_state(state: dict, path: Path) -> None:
+    """Write loop state atomically to *path*.
+
+    Uses a temporary file in the same directory as *path* + ``os.replace``
+    so a reader never sees a half-written file.  Fail-open: any error is
+    logged to stderr and silently swallowed — this function MUST NOT raise.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write to a sibling temp file then atomically replace
+        fd, tmp_path_str = tempfile.mkstemp(
+            dir=path.parent, prefix=path.name + ".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp_path_str, path)
+        except Exception:
+            # Clean up orphaned temp file if replace failed
+            try:
+                os.unlink(tmp_path_str)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        print(f"[loop-state] write failed (non-fatal): {exc}", file=sys.stderr)
+
+
+def _build_state(
+    summary: RunSummary,
+    cfg: RunConfig,
+    *,
+    status: str,
+    last_bead: Optional[str],
+    last_outcome: Optional[str],
+    stop_reason: Optional[str],
+    active: bool = True,
+) -> dict:
+    """Build the §1 schema dict for the loop state file.
+
+    Fields:
+      harness       — always "claude" for this runner
+      active        — True while looping; False on termination
+      molecule      — the scoped label from cfg
+      iteration     — current iteration count (from summary)
+      max_iterations— from cfg
+      closed        — cumulative beads closed
+      failed        — cumulative non-closed outcomes (total iterations - closed)
+      tokens        — cumulative output tokens
+      last_bead     — most recent bead id worked (or None)
+      last_outcome  — most recent outcome string (or None)
+      status        — "running"|"dry-run"|"done"|"stopped"
+      stop_reason   — why the run stopped, or None while running
+      updated_at    — float unix epoch (time.time())
+    """
+    failed_count = summary.iterations - summary.beads_closed
+    return {
+        "harness": "claude",
+        "active": active,
+        "molecule": cfg.molecule,
+        "iteration": summary.iterations,
+        "max_iterations": cfg.max_iterations,
+        "closed": summary.beads_closed,
+        "failed": failed_count,
+        "tokens": summary.total_tokens,
+        "last_bead": last_bead,
+        "last_outcome": last_outcome,
+        "status": status,
+        "stop_reason": stop_reason,
+        "updated_at": time.time(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +780,29 @@ def run_loop(cfg: RunConfig, runners: Runners) -> RunSummary:
     """Execute the full loop until a stop condition fires."""
     summary = RunSummary(stop_reason="")
 
+    # Resolve the state file path: runner override wins, else module default.
+    state_path: Path = runners.loop_state_path if runners.loop_state_path is not None else LOOP_STATE_PATH
+
+    # Determine initial status (dry-run writes "dry-run" to allow observation).
+    running_status = "dry-run" if cfg.dry_run else "running"
+
+    # OBS2 — write START state
+    write_loop_state(
+        _build_state(
+            summary,
+            cfg,
+            status=running_status,
+            last_bead=None,
+            last_outcome=None,
+            stop_reason=None,
+            active=True,
+        ),
+        state_path,
+    )
+
+    last_bead: Optional[str] = None
+    last_outcome: Optional[str] = None
+
     while True:
         # Check budget governor BEFORE the iteration
         ok, reason = should_continue(summary, cfg)
@@ -719,14 +829,45 @@ def run_loop(cfg: RunConfig, runners: Runners) -> RunSummary:
         summary.iterations += 1
         summary.total_tokens += result.tokens_spent
 
+        if result.bead_id is not None:
+            last_bead = result.bead_id
+        last_outcome = result.outcome
+
         if result.outcome == "closed":
             summary.beads_closed += 1
             summary.consecutive_zero_close = 0
         elif result.outcome == "empty":
             summary.stop_reason = "queue-empty"
+            # OBS2 — write per-iteration state before breaking
+            write_loop_state(
+                _build_state(
+                    summary,
+                    cfg,
+                    status=running_status,
+                    last_bead=last_bead,
+                    last_outcome=last_outcome,
+                    stop_reason=None,
+                    active=True,
+                ),
+                state_path,
+            )
             break
         else:
             summary.consecutive_zero_close += 1
+
+        # OBS2 — write per-iteration state after accumulating counts
+        write_loop_state(
+            _build_state(
+                summary,
+                cfg,
+                status=running_status,
+                last_bead=last_bead,
+                last_outcome=last_outcome,
+                stop_reason=None,
+                active=True,
+            ),
+            state_path,
+        )
 
         # --once: exactly one real iteration then exit
         if cfg.once:
@@ -735,6 +876,30 @@ def run_loop(cfg: RunConfig, runners: Runners) -> RunSummary:
 
     if not summary.stop_reason:
         summary.stop_reason = "unknown"
+
+    # OBS2 — write TERMINAL state
+    # Dry-run keeps "dry-run" as the status throughout (including termination).
+    # Live runs use "done" for normal exits, "stopped" for unexpected ones.
+    if cfg.dry_run:
+        terminal_status = "dry-run"
+    elif summary.stop_reason in (
+        "queue-empty", "once", "max-iterations", "budget-exhausted", "no-progress"
+    ):
+        terminal_status = "done"
+    else:
+        terminal_status = "stopped"
+    write_loop_state(
+        _build_state(
+            summary,
+            cfg,
+            status=terminal_status,
+            last_bead=last_bead,
+            last_outcome=last_outcome,
+            stop_reason=summary.stop_reason,
+            active=False,
+        ),
+        state_path,
+    )
 
     return summary
 
