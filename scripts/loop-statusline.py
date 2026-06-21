@@ -26,7 +26,16 @@ STALE_S = 120
 
 
 def _loop_segment():
-    """Return the loop indicator string, or None when no fresh active loop."""
+    """Return the loop indicator string, or None when no fresh active loop.
+
+    Multi-worker (Mayor) format — emitted when ``active_workers`` key is present:
+      🔄 <molecule> <closed>/<total> · <active>w <recovery_blocked>⚠ · <closed>✓ <failed>✗
+
+    Single-worker (legacy run_loop) format — emitted when ``active_workers`` is absent:
+      🔄 <molecule> <iter>/<max> · <closed>✓ [<failed>✗]
+
+    Preserves the 120s staleness guard and fail-open: any exception → None (never raises).
+    """
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
             d = json.load(f)
@@ -34,13 +43,35 @@ def _loop_segment():
             return None
         if time.time() - float(d.get("updated_at", 0)) > STALE_S:
             return None
-        seg = (
-            f"🔄 {d.get('molecule', '?')} "
-            f"{d.get('iteration', 0)}/{d.get('max_iterations', 0)} "
-            f"· {d.get('closed', 0)}✓"
-        )
-        if d.get("failed", 0):
-            seg += f" {d['failed']}✗"
+        molecule = d.get("molecule", "?")
+        closed = d.get("closed", 0)
+        failed = d.get("failed", 0)
+        if "active_workers" in d:
+            # Mayor multi-worker render
+            cap = d.get("capacity", {})
+            n_active = cap.get("active", len(d["active_workers"]))
+            n_recovery = cap.get("recovery_blocked", 0)
+            total = closed + failed
+            seg = (
+                f"🔄 {molecule} {closed}/{total} "
+                f"· {n_active}w"
+            )
+            if n_recovery:
+                seg += f" {n_recovery}⚠"
+            seg += f" · {closed}✓"
+            if failed:
+                seg += f" {failed}✗"
+        else:
+            # Legacy single-worker render (backward compat)
+            iteration = d.get("iteration", 0)
+            max_iterations = d.get("max_iterations", 0)
+            seg = (
+                f"🔄 {molecule} "
+                f"{iteration}/{max_iterations} "
+                f"· {closed}✓"
+            )
+            if failed:
+                seg += f" {failed}✗"
         return seg
     except Exception:
         return None

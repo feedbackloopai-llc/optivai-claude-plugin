@@ -531,7 +531,7 @@ def _build_state(
     stop_reason: Optional[str],
     active: bool = True,
 ) -> dict:
-    """Build the §1 schema dict for the loop state file.
+    """Build the §1 schema dict for the loop state file (single-worker / run_loop path).
 
     Fields:
       harness       — always "claude" for this runner
@@ -563,6 +563,64 @@ def _build_state(
         "status": status,
         "stop_reason": stop_reason,
         "updated_at": time.time(),
+    }
+
+
+def _build_mayor_state(
+    summary: MayorSummary,
+    cfg: RunConfig,
+    *,
+    status: str,
+    stop_reason: Optional[str],
+    active_handles: "Dict[str, WorkerHandle]",
+    recovery_blocked: "Set[str]",
+    now_monotonic: float,
+    active: bool = True,
+) -> dict:
+    """Build the loop state dict for the Mayor multi-worker path (P3.1).
+
+    Extends the §1 schema with Mayor-specific fields:
+
+      active_workers — list of {bead_id, model, runtime_s} for in-flight workers
+      capacity       — {max, active, recovery_blocked, free}
+
+    Backward compat: ``active_workers`` is present only in Mayor states. The
+    statusline checks for its presence to select the multi-worker render path.
+    """
+    worker_list = [
+        {
+            "bead_id": h.bead_id,
+            "model": h.model,
+            "runtime_s": round(now_monotonic - h.started_at, 1),
+        }
+        for h in active_handles.values()
+    ]
+    n_active = len(active_handles)
+    n_recovery = len(recovery_blocked)
+    capacity = {
+        "max": cfg.max_workers,
+        "active": n_active,
+        "recovery_blocked": n_recovery,
+        "free": cfg.max_workers - n_active - n_recovery,
+    }
+    total = summary.closed + summary.failed
+    return {
+        "harness": "claude",
+        "active": active,
+        "molecule": cfg.molecule,
+        "iteration": summary.iterations,
+        "max_iterations": cfg.max_iterations,
+        "closed": summary.closed,
+        "failed": summary.failed,
+        "tokens": summary.total_tokens,
+        "last_bead": None,
+        "last_outcome": None,
+        "status": status,
+        "stop_reason": stop_reason,
+        "updated_at": time.time(),
+        # Mayor-specific fields
+        "active_workers": worker_list,
+        "capacity": capacity,
     }
 
 
@@ -1116,6 +1174,52 @@ def _pick(
 
 
 # ---------------------------------------------------------------------------
+# Mayor ledger helper (P3.2) — fail-safe brain_capture wrapper
+# ---------------------------------------------------------------------------
+
+def _mayor_capture(runners: Runners, text: str, type_: str) -> None:
+    """Fail-safe wrapper for runners.brain_capture in the Mayor main loop.
+
+    The Mayor loop MUST NOT crash because the brain subsystem is unavailable.
+    Any exception from brain_capture is logged at WARNING level and swallowed.
+    This wrapper is used for ALL Mayor-side brain_capture calls (both the
+    existing diagnostic captures and the new P3.2 ledger events).
+    """
+    try:
+        runners.brain_capture(text, type_)
+    except Exception as exc:
+        logger.warning("Mayor: brain_capture failed (non-fatal): %s", exc)
+
+
+def _ledger_capture(
+    runners: Runners,
+    *,
+    action: str,
+    bead_id: str,
+    molecule: str,
+    tier: Optional[str],
+    extra: str = "",
+) -> None:
+    """Emit a Mayor-side task-state-transition ledger event via brain_capture.
+
+    Covers three transitions: dispatch, verify-result (pass or fail), close.
+    Fail-safe: if brain_capture raises (unavailable, timeout, etc.) the
+    exception is logged and silently swallowed — the Mayor loop MUST NOT
+    crash because the ledger is unavailable.
+
+    Do NOT call this for worker-side gate-block / dispatch-exception captures —
+    those are emitted by _mayor_worker; this ledger is Mayor-side only.
+    """
+    text = (
+        f"Mayor ledger | action={action} bead={bead_id} "
+        f"molecule={molecule} tier={tier or 'unknown'}"
+    )
+    if extra:
+        text += f" | {extra}"
+    _mayor_capture(runners, text, "decision")
+
+
+# ---------------------------------------------------------------------------
 # Mayor loop — bounded-concurrent drain
 # ---------------------------------------------------------------------------
 
@@ -1157,6 +1261,20 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=cfg.max_workers)
 
+    # OBS2 — write START state before entering the tick loop
+    write_loop_state(
+        _build_mayor_state(
+            summary, cfg,
+            status="running",
+            stop_reason=None,
+            active_handles=active,
+            recovery_blocked=recovery_blocked,
+            now_monotonic=time.monotonic(),
+            active=True,
+        ),
+        state_path,
+    )
+
     try:
         while True:
             # ---- 1. Governor stop-check ----
@@ -1185,6 +1303,14 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     started_at=time.monotonic(),
                 )
                 active[bead_id] = handle
+                # P3.2 — ledger: worker dispatched
+                _ledger_capture(
+                    runners,
+                    action="dispatch",
+                    bead_id=bead_id,
+                    molecule=cfg.molecule,
+                    tier=handle.model,
+                )
 
             # ---- 2b. P2 reconcile — once per tick, Mayor applies actions ----
             # reconcile is pure: detect → guard-ladder → AI-judge → returns actions.
@@ -1210,7 +1336,8 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     recovery_blocked.discard(bid)
                     bead_statuses[bid] = "failed"
                     summary.failed += 1
-                    runners.brain_capture(
+                    _mayor_capture(
+                        runners,
                         f"Mayor reconcile: bead {bid} killed by judge.", "pattern"
                     )
                 elif decision == "respawn":
@@ -1223,7 +1350,8 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     # Reopen the bead for redispatch (Mayor single-writer)
                     if runners.beads_update is not None:
                         runners.beads_update(bid, "open")
-                    runners.brain_capture(
+                    _mayor_capture(
+                        runners,
                         f"Mayor reconcile: bead {bid} respawned "
                         f"(count={respawn_counts[bid]}).",
                         "pattern",
@@ -1231,6 +1359,20 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 else:
                     # "wait" — leave as-is; re-evaluated next tick
                     logger.debug("reconcile: waiting on bead %s", bid)
+
+            # OBS2 P3.1 — write per-tick state after slot-filling + reconcile
+            write_loop_state(
+                _build_mayor_state(
+                    summary, cfg,
+                    status="running",
+                    stop_reason=None,
+                    active_handles=active,
+                    recovery_blocked=recovery_blocked,
+                    now_monotonic=time.monotonic(),
+                    active=True,
+                ),
+                state_path,
+            )
 
             # ---- 3. Check stop: nothing running AND nothing ready AND nothing recovering ----
             if not active:
@@ -1280,7 +1422,8 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     recovery_blocked.add(bead_id)
                     bead_statuses[bead_id] = "in_progress"  # stays in_progress until reconciled
                     summary.failed += 1
-                    runners.brain_capture(
+                    _mayor_capture(
+                        runners,
                         f"Mayor: worker future for {bead_id} raised unexpectedly: {exc}",
                         "pattern",
                     )
@@ -1291,10 +1434,20 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     recovery_blocked.add(bead_id)
                     bead_statuses[bead_id] = "in_progress"  # stays in_progress until reconciled
                     summary.failed += 1
-                    runners.brain_capture(
+                    _mayor_capture(
+                        runners,
                         f"Mayor: bead {bead_id} moved to recovery_blocked. "
                         f"error={res.error} timed_out={res.timed_out}",
                         "pattern",
+                    )
+                    # P3.2 — ledger: verify failed (crash/timeout counts as verify-fail)
+                    _ledger_capture(
+                        runners,
+                        action="verify-fail",
+                        bead_id=bead_id,
+                        molecule=cfg.molecule,
+                        tier=handle.model,
+                        extra=f"timed_out={res.timed_out} error={res.error}",
                     )
                 elif res.verify_exit == 0:
                     # V passed — Mayor closes the bead (single-writer)
@@ -1302,17 +1455,44 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     bead_statuses[bead_id] = "closed"
                     summary.closed += 1
                     any_closed = True
-                    runners.brain_capture(
+                    _mayor_capture(
+                        runners,
                         f"Mayor: bead {bead_id} closed after verify_exit=0.",
                         "decision",
+                    )
+                    # P3.2 — ledger: verify passed then close
+                    _ledger_capture(
+                        runners,
+                        action="verify-pass",
+                        bead_id=bead_id,
+                        molecule=cfg.molecule,
+                        tier=handle.model,
+                        extra="verify_exit=0",
+                    )
+                    _ledger_capture(
+                        runners,
+                        action="close",
+                        bead_id=bead_id,
+                        molecule=cfg.molecule,
+                        tier=handle.model,
                     )
                 else:
                     # V failed or no verify cmd — leave open for reconciler/next round
                     bead_statuses.pop(bead_id, None)
                     summary.failed += 1
-                    runners.brain_capture(
+                    _mayor_capture(
+                        runners,
                         f"Mayor: bead {bead_id} NOT closed — verify_exit={res.verify_exit}.",
                         "pattern",
+                    )
+                    # P3.2 — ledger: verify failed
+                    _ledger_capture(
+                        runners,
+                        action="verify-fail",
+                        bead_id=bead_id,
+                        molecule=cfg.molecule,
+                        tier=handle.model,
+                        extra=f"verify_exit={res.verify_exit}",
                     )
 
             summary.iterations += 1
@@ -1337,6 +1517,24 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
 
     if not summary.stop_reason:
         summary.stop_reason = "unknown"
+
+    # OBS2 P3.1 — write TERMINAL state after the Mayor loop exits
+    terminal_status = "done" if summary.stop_reason in (
+        "queue-empty", "max-iterations", "budget-exhausted",
+        "no-progress", "capacity-exhausted-by-stuck-workers",
+    ) else "stopped"
+    write_loop_state(
+        _build_mayor_state(
+            summary, cfg,
+            status=terminal_status,
+            stop_reason=summary.stop_reason,
+            active_handles=active,
+            recovery_blocked=recovery_blocked,
+            now_monotonic=time.monotonic(),
+            active=False,
+        ),
+        state_path,
+    )
 
     return summary
 
