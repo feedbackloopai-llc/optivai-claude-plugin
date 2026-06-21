@@ -37,12 +37,15 @@ _HOOKS_DIR = _SCRIPTS_DIR / "hooks"
 if str(_HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOKS_DIR))
 
+from unittest.mock import patch
+
 from loop_runner import (
     RunConfig,
     Runners,
     RunSummary,
     run_loop,
     run_mayor_loop,
+    main,
     WorkerHandle,
     WorkerResult,
     should_continue,
@@ -559,3 +562,203 @@ class TestCapacityExhaustedByStuckWorkers:
             f"got '{summary.stop_reason}'"
         )
         assert summary.closed == 0
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER-1: CLI entrypoint wiring — max_workers > 1 → run_mayor_loop
+# ---------------------------------------------------------------------------
+
+class TestCLIWiring:
+    """Integration tests asserting that main() routes to the correct loop function
+    based on --max-workers.  Uses unittest.mock.patch to spy on the loop functions
+    without running real subprocess calls."""
+
+    def test_max_workers_2_routes_to_mayor_loop(self, tmp_path: Path) -> None:
+        """--max-workers 2 must cause main() to invoke run_mayor_loop, not run_loop."""
+        invoked = []
+
+        def _fake_mayor(cfg, runners):
+            invoked.append("run_mayor_loop")
+            from loop_runner import MayorSummary
+            return MayorSummary(stop_reason="queue-empty")
+
+        def _fake_run_loop(cfg, runners):
+            invoked.append("run_loop")
+            return RunSummary(stop_reason="queue-empty")
+
+        with patch("loop_runner.run_mayor_loop", side_effect=_fake_mayor), \
+             patch("loop_runner.run_loop", side_effect=_fake_run_loop), \
+             patch("loop_runner.make_live_runners", return_value=MagicMock()):
+            exit_code = main([
+                "--molecule", "epic:does-not-exist",
+                "--max-workers", "2",
+                "--dry-run",
+            ])
+
+        assert "run_mayor_loop" in invoked, (
+            f"Expected run_mayor_loop to be called with --max-workers 2; got {invoked}"
+        )
+        assert "run_loop" not in invoked, (
+            "run_loop should NOT be called when --max-workers 2"
+        )
+        assert exit_code == 0
+
+    def test_max_workers_1_routes_to_run_loop(self, tmp_path: Path) -> None:
+        """--max-workers 1 (default) must cause main() to invoke run_loop, not run_mayor_loop."""
+        invoked = []
+
+        def _fake_mayor(cfg, runners):
+            invoked.append("run_mayor_loop")
+            from loop_runner import MayorSummary
+            return MayorSummary(stop_reason="queue-empty")
+
+        def _fake_run_loop(cfg, runners):
+            invoked.append("run_loop")
+            return RunSummary(stop_reason="queue-empty")
+
+        with patch("loop_runner.run_mayor_loop", side_effect=_fake_mayor), \
+             patch("loop_runner.run_loop", side_effect=_fake_run_loop), \
+             patch("loop_runner.make_live_runners", return_value=MagicMock()):
+            exit_code = main([
+                "--molecule", "epic:does-not-exist",
+                "--max-workers", "1",
+                "--dry-run",
+            ])
+
+        assert "run_loop" in invoked, (
+            f"Expected run_loop to be called with --max-workers 1; got {invoked}"
+        )
+        assert "run_mayor_loop" not in invoked, (
+            "run_mayor_loop should NOT be called when --max-workers 1"
+        )
+        assert exit_code == 0
+
+    def test_default_max_workers_routes_to_run_loop(self, tmp_path: Path) -> None:
+        """Omitting --max-workers (default=1) must still invoke run_loop."""
+        invoked = []
+
+        def _fake_run_loop(cfg, runners):
+            invoked.append("run_loop")
+            return RunSummary(stop_reason="queue-empty")
+
+        with patch("loop_runner.run_loop", side_effect=_fake_run_loop), \
+             patch("loop_runner.make_live_runners", return_value=MagicMock()):
+            main([
+                "--molecule", "epic:does-not-exist",
+                "--dry-run",
+            ])
+
+        assert "run_loop" in invoked
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER-2: dry_run and once semantics in run_mayor_loop
+# ---------------------------------------------------------------------------
+
+class TestMayorDryRun:
+    """run_mayor_loop with cfg.dry_run=True must NOT call dispatch, beads_update,
+    beads_close, or run_verify — it must only print the plan."""
+
+    def test_dry_run_mutates_nothing(self, tmp_path: Path) -> None:
+        """In dry-run mode, Mayor must produce zero dispatch / close / update calls."""
+        beads = [_make_bead(f"fblai-dry{i}", priority=i + 1) for i in range(3)]
+        tracker = _StatusTracker()
+        for b in beads:
+            tracker.set_open(b["id"])
+
+        dispatch_calls = [0]
+        close_calls = [0]
+        update_calls = [0]
+        verify_calls = [0]
+
+        def _counting_dispatch(prompt: str, model: str, timeout_s: int) -> dict:
+            dispatch_calls[0] += 1
+            return {"tokens": 5, "output": "done"}
+
+        def _counting_update(bead_id: str, status: str) -> None:
+            update_calls[0] += 1
+            tracker.update(bead_id, status)
+
+        def _counting_close(bead_id: str) -> None:
+            close_calls[0] += 1
+            tracker.close(bead_id)
+
+        def _counting_verify(cmd: str, timeout_s: int) -> int:
+            verify_calls[0] += 1
+            return 0
+
+        def _ready_fn(molecule: str) -> List[dict]:
+            return [b for b in beads if tracker.get_status(b["id"]) == "open"]
+
+        runners = Runners(
+            beads_ready=_ready_fn,
+            beads_close=_counting_close,
+            brain_recall=MagicMock(return_value=""),
+            brain_capture=MagicMock(),
+            dispatch=_counting_dispatch,
+            run_verify=_counting_verify,
+            beads_update=_counting_update,
+            loop_state_path=tmp_path / "loop-state.json",
+        )
+        cfg = _make_cfg(max_workers=2, dry_run=True)
+
+        summary = run_mayor_loop(cfg, runners)
+
+        assert dispatch_calls[0] == 0, (
+            f"dispatch called {dispatch_calls[0]} times in dry-run mode; expected 0"
+        )
+        assert close_calls[0] == 0, (
+            f"beads_close called {close_calls[0]} times in dry-run mode; expected 0"
+        )
+        assert update_calls[0] == 0, (
+            f"beads_update called {update_calls[0]} times in dry-run mode; expected 0"
+        )
+        assert verify_calls[0] == 0, (
+            f"run_verify called {verify_calls[0]} times in dry-run mode; expected 0"
+        )
+        # Summary should reflect no real work done
+        assert summary.closed == 0
+        assert summary.failed == 0
+
+
+class TestMayorOnce:
+    """run_mayor_loop with cfg.once=True must stop after one completion round."""
+
+    def test_once_stops_after_one_completion_round(self, tmp_path: Path) -> None:
+        """With once=True, the Mayor must stop after the first tick that reaps workers."""
+        beads = [_make_bead(f"fblai-once{i}", priority=i + 1) for i in range(5)]
+        tracker = _StatusTracker()
+        for b in beads:
+            tracker.set_open(b["id"])
+
+        def _ready_fn(molecule: str) -> List[dict]:
+            return [b for b in beads if tracker.get_status(b["id"]) == "open"]
+
+        runners = _make_mayor_runners(
+            ready_beads_fn=_ready_fn,
+            verify_exit=0,
+            tracker=tracker,
+            loop_state_path=tmp_path / "loop-state.json",
+        )
+        # max_workers=2 so the first tick dispatches 2 beads, then once fires
+        cfg = _make_cfg(max_workers=2, once=True, max_iterations=20)
+
+        summary = run_mayor_loop(cfg, runners)
+
+        assert summary.stop_reason == "once", (
+            f"Expected stop_reason='once', got '{summary.stop_reason}'"
+        )
+        # With once=True, the Mayor stops after the FIRST completion round.
+        # At max_workers=2, the first round closes at most 2 beads.
+        assert summary.closed <= 2, (
+            f"Expected at most 2 beads closed (one round at max_workers=2), "
+            f"got {summary.closed}"
+        )
+        # At least 1 bead should have been processed (queue was not empty)
+        assert summary.closed >= 1, (
+            f"Expected at least 1 bead closed with once=True, got {summary.closed}"
+        )
+        # Iterations should be exactly 1 (one completion round)
+        assert summary.iterations == 1, (
+            f"Expected exactly 1 iteration with once=True, got {summary.iterations}"
+        )

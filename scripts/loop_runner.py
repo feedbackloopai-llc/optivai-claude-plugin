@@ -1289,6 +1289,32 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
             free = cfg.max_workers - len(active) - len(recovery_blocked)
             to_dispatch = _pick(ready, free, occupied)
 
+            if cfg.dry_run:
+                # DRY-RUN: print the plan for each bead we WOULD dispatch — no mutations.
+                if to_dispatch:
+                    for bead in to_dispatch:
+                        bead_id = bead["id"]
+                        tier = route_model(bead)
+                        verify_cmd = resolve_verify_cmd(bead, cfg.verify_cmd)
+                        try:
+                            prompt = compose_dispatch(
+                                bead,
+                                cfg.repo,
+                                cfg.branch,
+                                verify_cmd or cfg.verify_cmd,
+                                recall_context="",
+                            )
+                            _print_dry_run_plan(bead, tier, verify_cmd, prompt)
+                        except ValueError as exc:
+                            print(
+                                f"\n[dry-run] Bead {bead_id} would be GATE-BLOCKED: {exc}"
+                            )
+                    summary.stop_reason = "once" if cfg.once else "queue-empty"
+                    break
+                else:
+                    summary.stop_reason = "queue-empty"
+                    break
+
             for bead in to_dispatch:
                 bead_id = bead["id"]
                 # Mayor marks in_progress BEFORE submitting to pool (single-writer)
@@ -1429,6 +1455,9 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     )
                     continue
 
+                # Accumulate tokens inline — res is available here; no second future.result call needed.
+                summary.total_tokens += res.dispatch_result.get("tokens", 0)
+
                 if res.timed_out or res.error is not None:
                     # Worker crashed or timed out — slot stays occupied
                     recovery_blocked.add(bead_id)
@@ -1501,16 +1530,10 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
             else:
                 summary.consecutive_zero_close = 0
 
-            # Accumulate tokens from done workers
-            for bead_id in completed_bead_ids:
-                # We already popped from active; find result via done_futures
-                pass  # token accounting via WorkerResult was already done above
-            for fut in done_futures:
-                try:
-                    r: WorkerResult = fut.result(timeout=0)
-                    summary.total_tokens += r.dispatch_result.get("tokens", 0)
-                except Exception:
-                    pass
+            # --once: stop after the first completion round (mirrors run_loop semantics)
+            if cfg.once:
+                summary.stop_reason = "once"
+                break
 
     finally:
         pool.shutdown(wait=False)
@@ -1520,7 +1543,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
 
     # OBS2 P3.1 — write TERMINAL state after the Mayor loop exits
     terminal_status = "done" if summary.stop_reason in (
-        "queue-empty", "max-iterations", "budget-exhausted",
+        "queue-empty", "once", "max-iterations", "budget-exhausted",
         "no-progress", "capacity-exhausted-by-stuck-workers",
     ) else "stopped"
     write_loop_state(
@@ -1850,11 +1873,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if cfg.dry_run:
         print(f"[dry-run] OptivAI Loop runner — molecule={cfg.molecule!r}")
-        print(f"[dry-run] max_iterations={cfg.max_iterations}  budget_tokens={cfg.budget_tokens:,}")
+        print(f"[dry-run] max_workers={cfg.max_workers}  "
+              f"max_iterations={cfg.max_iterations}  budget_tokens={cfg.budget_tokens:,}")
         print(f"[dry-run] verify_cmd={cfg.verify_cmd!r}")
         print(f"[dry-run] No mutations will be performed.\n")
 
     runners = make_live_runners()
+
+    # Route to the Mayor concurrent loop when max_workers > 1; otherwise the
+    # existing sequential run_loop (max_workers=1 is the backward-compatible default).
+    if cfg.max_workers > 1:
+        mayor_summary = run_mayor_loop(cfg, runners)
+        print(f"\n[mayor] Run complete — stop_reason={mayor_summary.stop_reason!r}")
+        print(f"[mayor] iterations={mayor_summary.iterations}  "
+              f"beads_closed={mayor_summary.closed}  "
+              f"total_tokens={mayor_summary.total_tokens:,}")
+        _clean_exits = (
+            "queue-empty", "once", "max-iterations",
+            "budget-exhausted", "no-progress",
+            "capacity-exhausted-by-stuck-workers",
+        )
+        return 0 if mayor_summary.stop_reason in _clean_exits else 1
+
     summary = run_loop(cfg, runners)
 
     print(f"\n[loop] Run complete — stop_reason={summary.stop_reason!r}")

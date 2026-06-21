@@ -123,6 +123,7 @@ def survives_guards(
     assigned_worker: Optional[str],  # worker currently assigned (or None)
     now_runtime_s: float,       # re-measured runtime at decision time (TOCTOU check)
     spawning_window_s: float,
+    get_fresh_status: Optional[Callable[[str], str]] = None,
 ) -> bool:
     """Return True iff the candidate survives all guards and should reach the judge.
 
@@ -139,9 +140,13 @@ def survives_guards(
         Crashed candidates bypass this guard (they are already past the window).
     Guard 4 — TOCTOU re-check:
         Re-read worker/bead liveness at the moment of decision.  If the future
-        is now done OR the bead is now closed/done, race condition — drop.
+        is now done OR the bead is now closed/done at the CURRENT moment (fresh
+        re-read via get_fresh_status), race condition — drop.  Per the P2 design,
+        this re-read is the decisive check; without it Guard 4 is redundant with
+        Guard 1 (same stale value).  Falls back to bead_status when get_fresh_status
+        is absent (backward-compat with tests that do not inject a reader).
     """
-    # Guard 1: terminal-state
+    # Guard 1: terminal-state (uses the initially-passed status)
     if bead_status in ("done", "closed"):
         return False
 
@@ -153,13 +158,16 @@ def survives_guards(
     if c.kind == "hung" and now_runtime_s < spawning_window_s:
         return False
 
-    # Guard 4: TOCTOU re-check
+    # Guard 4: TOCTOU re-check — fetch the CURRENT bead status at decision time.
     # For crashed candidates (kind="crashed"), future_done=True is expected — there is no
     # live future; the worker is already gone.  We only use future_done as a drop signal
     # for hung candidates (where the future finishing means the worker resolved the hang).
     if c.kind == "hung" and future_done:
         return False
-    if bead_status in ("done", "closed"):
+    # Re-read bead status now (at decision time) rather than reusing the stale value
+    # captured before the guard ladder started.  This is the TOCTOU guard's purpose.
+    current_status = get_fresh_status(c.bead_id) if get_fresh_status is not None else bead_status
+    if current_status in ("done", "closed"):
         return False
 
     return True
@@ -222,6 +230,9 @@ def reconcile(
             assigned_worker=assigned_worker,
             now_runtime_s=now_runtime_s,
             spawning_window_s=cfg_spawning_window_s,
+            # Re-read the bead status at Guard 4 decision time from the Mayor's
+            # live snapshot (bead_statuses is the Mayor's single-writer view).
+            get_fresh_status=lambda bid: bead_statuses.get(bid, "unknown"),
         ):
             survivors.append(c)
 

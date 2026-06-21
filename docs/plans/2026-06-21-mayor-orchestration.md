@@ -157,6 +157,28 @@ Each bead carries: exact files, acceptance criteria, and a **resolvable V** (a r
 - Parity: identical-verdict corpus across Python/TS (the dispatch-gate parity pattern, reused).
 - Dispatch-gate compliance: every composed worker prompt passes `evaluate_dispatch().compliant`.
 
+## Security Note — verify command shell interpolation
+
+Verify commands sourced from `verify:<cmd>` bead labels are executed via
+`subprocess.run(..., shell=True)` inside `_live_run_verify` (loop_runner.py).
+This is intentional in the **current single-author dev-harness threat model**:
+the only actors who write bead labels are the operator (Chris) and the Mayor
+itself, and the environment is a local developer workstation — the attack surface
+is equivalent to a shell alias.
+
+**Hardening required before any v2 multi-author or colony deployment:**
+
+1. Replace `shell=True` with an explicit argument vector (`shlex.split`) so
+   shell metacharacters in label values cannot inject additional commands.
+2. Introduce a `MAYOR_VERIFY_ALLOWLIST` env var (or config key) listing
+   permitted command prefixes (e.g. `pytest`, `python3 -m pytest`, `true`).
+   Reject any verify command that does not match an allowlist entry.
+3. Document the threat in the bead-label schema so future label authors know
+   that `verify:` values are shell-interpolated.
+
+Until these hardening steps land, **do not grant untrusted parties write access
+to the beads store** or allow automated PR-driven bead-label mutations.
+
 ## Rollback Plan
 
 Pure-additive on both plugins; `git revert` any phase. No production system, no Builder, no data migration. The Mayor reads beads/Brain we already run; reverting leaves the existing single-stream loop runner intact.

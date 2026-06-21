@@ -218,6 +218,42 @@ class TestTOCTOUGuard:
         )
         assert result is False
 
+    def test_fresh_status_closed_at_toctou_drops_candidate(self) -> None:
+        """Guard 4 uses get_fresh_status for a true re-read at decision time.
+
+        Simulates the race where bead_status was 'in_progress' when initially
+        read (Guard 1 passes), but by the time Guard 4 fires the fresh re-read
+        returns 'closed'.  Without get_fresh_status the stale 'in_progress'
+        would let the candidate through; with it the race is caught.
+        """
+        c = _hung_candidate()
+        result = survives_guards(
+            c,
+            bead_status="in_progress",   # stale: Guard 1 passes with this value
+            future_done=False,
+            assigned_worker="fblai-test",
+            now_runtime_s=2000.0,
+            spawning_window_s=300.0,
+            get_fresh_status=lambda _bead_id: "closed",  # fresh re-read at Guard 4
+        )
+        assert result is False, (
+            "Guard 4 should have dropped the candidate after fresh re-read returned 'closed'"
+        )
+
+    def test_fresh_status_in_progress_at_toctou_survives(self) -> None:
+        """Guard 4 fresh re-read returns 'in_progress' → candidate is NOT dropped."""
+        c = _hung_candidate()
+        result = survives_guards(
+            c,
+            bead_status="in_progress",
+            future_done=False,
+            assigned_worker="fblai-test",
+            now_runtime_s=2000.0,
+            spawning_window_s=300.0,
+            get_fresh_status=lambda _bead_id: "in_progress",
+        )
+        assert result is True
+
 
 # ---------------------------------------------------------------------------
 # Genuinely stuck candidate passes all four guards
