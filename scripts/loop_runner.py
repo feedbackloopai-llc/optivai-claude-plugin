@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -30,10 +31,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Resolve the scripts/ directory so we can import dispatch_gate from hooks/
@@ -67,6 +69,14 @@ LOOP_STATE_PATH: Path = Path.home() / ".claude" / "loop-state.json"
 
 # Default verify command for this repo when none is specified
 _REPO_DEFAULT_VERIFY_CMD = "cd /Users/erato949/dev/optivai-claude-plugin/scripts && python3 -m pytest -q"
+
+# ---------------------------------------------------------------------------
+# Worktree serialization lock (P1.2)
+# Concurrent `git worktree add` calls race on the shared .git/config index.
+# Workers may run dispatch in their own isolated worktrees, but worktree
+# creation and teardown are serialized through this process-level lock.
+# ---------------------------------------------------------------------------
+_WORKTREE_LOCK: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # §2 Iteration state object
@@ -168,6 +178,17 @@ class Runners:
 
     loop_state_path: override the default LOOP_STATE_PATH for testing.
       When None, write_loop_state uses the module-level LOOP_STATE_PATH constant.
+
+    P1.2 worktree isolation seam (both optional — absent means no isolation):
+      worktree_manager(bead_id) → ContextManager[Optional[str]]
+        A context manager that yields the path of an isolated git worktree for
+        the given bead. Yields None when isolation is not applicable or available.
+        worktree_manager handles locking (serializes git worktree add/remove) and
+        cleanup on both normal exit and exception.
+      dispatch_with_cwd(prompt, model, timeout_s, cwd) → dict
+        Extended dispatch that accepts an optional working directory.  When
+        present, _mayor_worker calls this instead of dispatch.  When absent
+        (None), the worker falls back to dispatch (backward-compatible path).
     """
 
     beads_ready: Callable[[str], List[dict]]
@@ -179,6 +200,9 @@ class Runners:
     loop_state_path: Optional[Path] = None
     # Mayor single-writer: set in_progress before submitting to pool
     beads_update: Optional[Callable[[str, str], None]] = None
+    # P1.2 worktree isolation seam
+    worktree_manager: Optional[Callable[[str], Any]] = None    # ContextManager[Optional[str]]
+    dispatch_with_cwd: Optional[Callable[[str, str, int, Optional[str]], dict]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +332,20 @@ def _live_brain_capture(text: str, type_: str) -> None:
 
 def _live_dispatch(prompt: str, model: str, timeout_s: int) -> dict:
     """Call `claude -p <prompt> --output-format json` (fresh process per iteration)."""
+    return _live_dispatch_with_cwd(prompt, model, timeout_s, cwd=None)
+
+
+def _live_dispatch_with_cwd(
+    prompt: str,
+    model: str,
+    timeout_s: int,
+    cwd: Optional[str] = None,
+) -> dict:
+    """Call `claude -p <prompt> --output-format json`, optionally in a specific directory.
+
+    ``cwd`` is the working directory for the subprocess (a per-worker git worktree
+    path, or None to inherit the current process directory).
+    """
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "json"],
@@ -315,6 +353,7 @@ def _live_dispatch(prompt: str, model: str, timeout_s: int) -> dict:
             text=True,
             timeout=timeout_s,
             check=False,
+            cwd=cwd,
         )
         try:
             data = json.loads(result.stdout)
@@ -343,6 +382,80 @@ def _live_run_verify(cmd: str, timeout_s: int) -> int:
         return 1
 
 
+@contextlib.contextmanager
+def _live_worktree_manager(bead_id: str) -> Iterator[Optional[str]]:
+    """Create an isolated git worktree for *bead_id*, yield its path, then remove it.
+
+    Serialized through _WORKTREE_LOCK so concurrent workers never race on
+    `git worktree add` (which modifies the shared .git/config and packed-refs).
+    The lock is held only during creation and teardown; the dispatched subagent
+    runs inside the worktree without holding the lock, so workers run truly in
+    parallel while isolation is maintained.
+
+    Yields None if:
+    - not inside a git repository (git rev-parse fails)
+    - git worktree add fails for any reason
+
+    On either normal or exceptional exit, the worktree is removed (serialized).
+    """
+    worktree_path: Optional[str] = None
+    try:
+        # Discover the repo root (needed for `git worktree add`)
+        try:
+            rev_result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if rev_result.returncode != 0:
+                yield None
+                return
+            repo_root = rev_result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            yield None
+            return
+
+        # Sanitize bead_id for use as a directory name component
+        safe_id = bead_id.replace("/", "_").replace("\\", "_")
+        wt_dir = os.path.join(
+            tempfile.gettempdir(),
+            f"mayor-wt-{safe_id}-{threading.get_ident()}",
+        )
+
+        # Serialize worktree creation
+        with _WORKTREE_LOCK:
+            add_result = subprocess.run(
+                ["git", "worktree", "add", "--detach", wt_dir],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=repo_root,
+            )
+            if add_result.returncode != 0:
+                logger.warning(
+                    "git worktree add failed for bead %s: %s",
+                    bead_id,
+                    add_result.stderr.strip(),
+                )
+                yield None
+                return
+            worktree_path = wt_dir
+
+        yield worktree_path
+
+    finally:
+        if worktree_path is not None:
+            # Serialize worktree removal (matches the add serialization)
+            with _WORKTREE_LOCK:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", worktree_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+
 def make_live_runners() -> Runners:
     """Construct the real (live) Runners instance."""
     return Runners(
@@ -353,6 +466,8 @@ def make_live_runners() -> Runners:
         brain_capture=_live_brain_capture,
         dispatch=_live_dispatch,
         run_verify=_live_run_verify,
+        worktree_manager=_live_worktree_manager,
+        dispatch_with_cwd=_live_dispatch_with_cwd,
     )
 
 
@@ -863,6 +978,13 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
     Running verify inside the worker is correct — it is a test command that writes
     only to the worker's isolated environment, not to bead state. This keeps the
     slow path parallel while status writes remain serialized to the main thread.
+
+    P1.2 worktree isolation: when runners.worktree_manager is provided, the dispatch
+    runs inside a dedicated git worktree (via runners.dispatch_with_cwd). The worktree
+    lifecycle is managed entirely here — creation before dispatch, teardown after the
+    worker finishes (including on error). Worktree create/teardown serialize through
+    _WORKTREE_LOCK (inside the worktree_manager); the dispatch itself runs without
+    holding the lock so workers run truly in parallel.
     """
     bead_id = bead.get("id", "unknown")
     tier = route_model(bead)
@@ -890,12 +1012,55 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
             error=exc,
         )
 
-    # EXECUTE — dispatch the subagent (blocking subprocess in this thread)
+    # EXECUTE — dispatch the subagent inside an isolated worktree when available.
+    # If runners.worktree_manager is None, fall back to the plain dispatch path
+    # (backward-compatible for tests and sequential runners that don't need isolation).
+    wt_ctx: Any = (
+        runners.worktree_manager(bead_id)
+        if runners.worktree_manager is not None
+        else contextlib.nullcontext(None)
+    )
+
     try:
-        dispatch_result = runners.dispatch(prompt, tier, LOOP_ITER_TIMEOUT_S)
+        with wt_ctx as worktree_path:
+            # Choose the dispatch callable: cwd-aware when worktree is active
+            if worktree_path is not None and runners.dispatch_with_cwd is not None:
+                dispatch_fn = lambda p, m, t: runners.dispatch_with_cwd(p, m, t, worktree_path)
+            else:
+                dispatch_fn = runners.dispatch
+
+            try:
+                dispatch_result = dispatch_fn(prompt, tier, LOOP_ITER_TIMEOUT_S)
+            except Exception as exc:
+                runners.brain_capture(
+                    f"Mayor dispatch exception for bead {bead_id}: {exc}",
+                    "pattern",
+                )
+                return WorkerResult(
+                    bead_id=bead_id,
+                    dispatch_result={"tokens": 0, "output": ""},
+                    verify_exit=None,
+                    error=exc,
+                )
+
+            # VERIFY — run V in the worker (reads env, does not mutate bead state)
+            if verify_cmd:
+                try:
+                    exit_code = runners.run_verify(verify_cmd, LOOP_VERIFY_TIMEOUT_S)
+                except Exception as exc:
+                    return WorkerResult(
+                        bead_id=bead_id,
+                        dispatch_result=dispatch_result,
+                        verify_exit=None,
+                        error=exc,
+                    )
+            else:
+                exit_code = None  # No verify cmd — Mayor will escalate
+
     except Exception as exc:
+        # Catch any unexpected exception from the worktree lifecycle itself
         runners.brain_capture(
-            f"Mayor dispatch exception for bead {bead_id}: {exc}",
+            f"Mayor worktree lifecycle exception for bead {bead_id}: {exc}",
             "pattern",
         )
         return WorkerResult(
@@ -904,20 +1069,6 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
             verify_exit=None,
             error=exc,
         )
-
-    # VERIFY — run V in the worker (reads env, does not mutate bead state)
-    if verify_cmd:
-        try:
-            exit_code = runners.run_verify(verify_cmd, LOOP_VERIFY_TIMEOUT_S)
-        except Exception as exc:
-            return WorkerResult(
-                bead_id=bead_id,
-                dispatch_result=dispatch_result,
-                verify_exit=None,
-                error=exc,
-            )
-    else:
-        exit_code = None  # No verify cmd — Mayor will escalate
 
     return WorkerResult(
         bead_id=bead_id,
