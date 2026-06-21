@@ -48,6 +48,7 @@ if str(_HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOKS_DIR))
 
 from dispatch_gate import evaluate_dispatch  # noqa: E402
+from reconciler import reconcile as _reconcile, ReconcileAction  # noqa: E402
 
 logger = logging.getLogger("loop_runner")
 
@@ -62,6 +63,15 @@ LOOP_MODEL_MAP: dict = {"design": "opus", "implement": "sonnet", "busywork": "ha
 LOOP_VERIFY_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_VERIFY_TIMEOUT_S", "900"))
 LOOP_ITER_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_ITER_TIMEOUT_S", "1800"))
 LOOP_MAX_WORKERS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_WORKERS", "4"))
+
+# P2 reconciler constants — mirror reconciler.py so callers need not import both
+LOOP_STUCK_THRESHOLD_S: float = float(
+    os.environ.get("OPTIVAI_LOOP_STUCK_THRESHOLD_S", "1800")
+)
+LOOP_SPAWNING_WINDOW_S: float = float(
+    os.environ.get("OPTIVAI_LOOP_SPAWNING_WINDOW_S", "300")
+)
+LOOP_MAX_RESPAWNS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_RESPAWNS", "1"))
 
 # Default path for the shared loop state file (OBS2).
 # Override via Runners.loop_state_path for testing.
@@ -157,6 +167,10 @@ class RunConfig:
     dry_run: bool = False
     once: bool = False
     max_workers: int = 1           # default=1 preserves today's sequential behavior
+    # P2 reconciler config
+    stuck_threshold_s: float = LOOP_STUCK_THRESHOLD_S   # hung-detection threshold (seconds)
+    spawning_window_s: float = LOOP_SPAWNING_WINDOW_S   # grace period for new workers (seconds)
+    max_respawns: int = LOOP_MAX_RESPAWNS               # per-bead respawn cap (stops respawn loops)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +217,10 @@ class Runners:
     # P1.2 worktree isolation seam
     worktree_manager: Optional[Callable[[str], Any]] = None    # ContextManager[Optional[str]]
     dispatch_with_cwd: Optional[Callable[[str, str, int, Optional[str]], dict]] = None
+    # P2 reconciler seam: judge(candidate, context) → "kill" | "respawn" | "wait"
+    # Injected so tests use a fake; live path is a cheap-tier dispatch.
+    # Fail-safe: reconcile treats None/raises as "wait" — never auto-kill on judge failure.
+    judge: Optional[Callable[..., str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1111,7 +1129,16 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
 
     Crash-aware: a crashed/timed-out worker moves its bead_id to recovery_blocked.
     Its bead stays in_progress and the slot remains occupied — capacity is never
-    silently reclaimed. P2's reconciler is what later clears recovery_blocked.
+    silently reclaimed.
+
+    P2 reconciler: once per tick (after slot-filling, before/with the completion
+    wait) the Mayor runs detect → guard-ladder → AI-judge and applies the resulting
+    ReconcileActions.  Only the Mayor applies mutations — the reconcile function
+    is pure-ish and returns actions for the Mayor to execute.
+      - kill   → free slot, bead left failed/open (no close)
+      - respawn → clear slot, bead returns to ready set for redispatch; capped by
+                  cfg.max_respawns to stop respawn loops
+      - wait   → leave as-is; re-evaluated next tick
 
     Backward compat: cfg.max_workers=1 produces sequential behavior compatible
     with the existing run_loop (same beads closed, same order).
@@ -1119,6 +1146,10 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
     summary = MayorSummary()
     active: Dict[str, WorkerHandle] = {}          # in-flight futures keyed by bead_id
     recovery_blocked: Set[str] = set()             # crashed; slot occupied; bead in_progress
+    # P2: per-bead respawn counter (prevents respawn loops)
+    respawn_counts: Dict[str, int] = {}
+    # P2: Mayor-maintained bead status snapshot (injected into reconcile)
+    bead_statuses: Dict[str, str] = {}
 
     state_path: Path = (
         runners.loop_state_path if runners.loop_state_path is not None else LOOP_STATE_PATH
@@ -1145,6 +1176,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 # Mayor marks in_progress BEFORE submitting to pool (single-writer)
                 if runners.beads_update is not None:
                     runners.beads_update(bead_id, "in_progress")
+                bead_statuses[bead_id] = "in_progress"
                 future = pool.submit(_mayor_worker, bead, cfg, runners)
                 handle = WorkerHandle(
                     bead_id=bead_id,
@@ -1153,6 +1185,52 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     started_at=time.monotonic(),
                 )
                 active[bead_id] = handle
+
+            # ---- 2b. P2 reconcile — once per tick, Mayor applies actions ----
+            # reconcile is pure: detect → guard-ladder → AI-judge → returns actions.
+            # The Mayor (this thread) is the sole executor of mutations.
+            recon_actions = _reconcile(
+                active=active,
+                recovery_blocked=recovery_blocked,
+                bead_statuses=bead_statuses,
+                respawn_counts=respawn_counts,
+                cfg_stuck_threshold_s=cfg.stuck_threshold_s,
+                cfg_spawning_window_s=cfg.spawning_window_s,
+                cfg_max_respawns=cfg.max_respawns,
+                now=time.monotonic(),
+                judge=runners.judge,
+            )
+            for action in recon_actions:
+                bid = action.bead_id
+                decision = action.decision
+                if decision == "kill":
+                    # Mayor frees the slot; bead left in_progress/failed (not closed)
+                    logger.info("reconcile: killing bead %s", bid)
+                    active.pop(bid, None)
+                    recovery_blocked.discard(bid)
+                    bead_statuses[bid] = "failed"
+                    summary.failed += 1
+                    runners.brain_capture(
+                        f"Mayor reconcile: bead {bid} killed by judge.", "pattern"
+                    )
+                elif decision == "respawn":
+                    # Mayor clears the slot; bead returns to ready set for redispatch
+                    logger.info("reconcile: respawning bead %s", bid)
+                    active.pop(bid, None)
+                    recovery_blocked.discard(bid)
+                    bead_statuses.pop(bid, None)
+                    respawn_counts[bid] = respawn_counts.get(bid, 0) + 1
+                    # Reopen the bead for redispatch (Mayor single-writer)
+                    if runners.beads_update is not None:
+                        runners.beads_update(bid, "open")
+                    runners.brain_capture(
+                        f"Mayor reconcile: bead {bid} respawned "
+                        f"(count={respawn_counts[bid]}).",
+                        "pattern",
+                    )
+                else:
+                    # "wait" — leave as-is; re-evaluated next tick
+                    logger.debug("reconcile: waiting on bead %s", bid)
 
             # ---- 3. Check stop: nothing running AND nothing ready AND nothing recovering ----
             if not active:
@@ -1200,6 +1278,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     # Future raised an unexpected exception
                     logger.warning("Worker future for %s raised: %s", bead_id, exc)
                     recovery_blocked.add(bead_id)
+                    bead_statuses[bead_id] = "in_progress"  # stays in_progress until reconciled
                     summary.failed += 1
                     runners.brain_capture(
                         f"Mayor: worker future for {bead_id} raised unexpectedly: {exc}",
@@ -1210,6 +1289,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 if res.timed_out or res.error is not None:
                     # Worker crashed or timed out — slot stays occupied
                     recovery_blocked.add(bead_id)
+                    bead_statuses[bead_id] = "in_progress"  # stays in_progress until reconciled
                     summary.failed += 1
                     runners.brain_capture(
                         f"Mayor: bead {bead_id} moved to recovery_blocked. "
@@ -1219,6 +1299,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 elif res.verify_exit == 0:
                     # V passed — Mayor closes the bead (single-writer)
                     runners.beads_close(bead_id)
+                    bead_statuses[bead_id] = "closed"
                     summary.closed += 1
                     any_closed = True
                     runners.brain_capture(
@@ -1227,6 +1308,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                     )
                 else:
                     # V failed or no verify cmd — leave open for reconciler/next round
+                    bead_statuses.pop(bead_id, None)
                     summary.failed += 1
                     runners.brain_capture(
                         f"Mayor: bead {bead_id} NOT closed — verify_exit={res.verify_exit}.",
@@ -1513,6 +1595,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable debug logging.",
     )
+    # P2 reconciler config
+    parser.add_argument(
+        "--stuck-threshold",
+        type=float,
+        default=LOOP_STUCK_THRESHOLD_S,
+        help=(
+            f"Seconds before a hung worker is considered stuck (default: {LOOP_STUCK_THRESHOLD_S})."
+        ),
+    )
+    parser.add_argument(
+        "--spawning-window",
+        type=float,
+        default=LOOP_SPAWNING_WINDOW_S,
+        help=(
+            f"Seconds of grace period before a new worker can be stuck-detected "
+            f"(default: {LOOP_SPAWNING_WINDOW_S})."
+        ),
+    )
+    parser.add_argument(
+        "--max-respawns",
+        type=int,
+        default=LOOP_MAX_RESPAWNS,
+        help=(
+            f"Maximum times a bead may be respawned by the reconciler "
+            f"(default: {LOOP_MAX_RESPAWNS}). Set to 0 to disable respawning."
+        ),
+    )
     return parser
 
 
@@ -1536,6 +1645,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         dry_run=args.dry_run,
         once=args.once,
         max_workers=args.max_workers,
+        stuck_threshold_s=args.stuck_threshold,
+        spawning_window_s=args.spawning_window,
+        max_respawns=args.max_respawns,
     )
 
     if cfg.dry_run:
