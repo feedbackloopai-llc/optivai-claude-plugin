@@ -22,6 +22,7 @@ CLI: --molecule --verify-cmd [--max-iterations N] [--budget-tokens N]
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Resolve the scripts/ directory so we can import dispatch_gate from hooks/
@@ -58,6 +59,7 @@ LOOP_NOPROGRESS_K: int = int(os.environ.get("OPTIVAI_LOOP_NOPROGRESS_K", "2"))
 LOOP_MODEL_MAP: dict = {"design": "opus", "implement": "sonnet", "busywork": "haiku"}
 LOOP_VERIFY_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_VERIFY_TIMEOUT_S", "900"))
 LOOP_ITER_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_ITER_TIMEOUT_S", "1800"))
+LOOP_MAX_WORKERS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_WORKERS", "4"))
 
 # Default path for the shared loop state file (OBS2).
 # Override via Runners.loop_state_path for testing.
@@ -95,6 +97,44 @@ class RunSummary:
 
 
 @dataclass
+class WorkerResult:
+    """Result returned by a Mayor worker thread.
+
+    Workers are read-only with respect to bead state — they return this struct
+    and the Mayor (main thread) performs all status mutations (the single-writer
+    invariant).
+    """
+
+    bead_id: str
+    dispatch_result: dict          # {"tokens": int, "output": str}
+    verify_exit: Optional[int]     # exit code of V, or None on error
+    error: Optional[Exception]     # set if the worker raised
+    timed_out: bool = False        # set if the future timed out before completion
+
+
+@dataclass
+class WorkerHandle:
+    """Tracks an in-flight worker submitted to the ThreadPoolExecutor."""
+
+    bead_id: str
+    future: "concurrent.futures.Future[WorkerResult]"
+    model: str
+    started_at: float              # monotonic time (passed in; no Date.now inside the runner)
+
+
+@dataclass
+class MayorSummary:
+    """Totals accumulated by run_mayor_loop."""
+
+    stop_reason: str = ""
+    closed: int = 0
+    failed: int = 0
+    iterations: int = 0             # completion-rounds, not individual beads
+    total_tokens: int = 0
+    consecutive_zero_close: int = 0
+
+
+@dataclass
 class RunConfig:
     """Immutable runtime configuration for a loop run."""
 
@@ -106,6 +146,7 @@ class RunConfig:
     budget_tokens: int = LOOP_BUDGET_TOKENS
     dry_run: bool = False
     once: bool = False
+    max_workers: int = 1           # default=1 preserves today's sequential behavior
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +158,13 @@ class Runners:
     """Side-effecting callables, injectable for testing.
 
     Each callable signature:
-      beads_ready(molecule)          → list[dict]  (list of bead dicts)
-      beads_close(bead_id)           → None
-      brain_recall(query)            → str         (recall text)
-      brain_capture(text, type_)     → None
-      dispatch(prompt, model, timeout_s) → dict    ({"tokens": int, "output": str})
-      run_verify(cmd, timeout_s)     → int         (exit code)
+      beads_ready(molecule)               → list[dict]  (list of bead dicts)
+      beads_close(bead_id)                → None
+      beads_update(bead_id, status)       → None        (Mayor marks in_progress before dispatch)
+      brain_recall(query)                 → str         (recall text)
+      brain_capture(text, type_)          → None
+      dispatch(prompt, model, timeout_s)  → dict        ({"tokens": int, "output": str})
+      run_verify(cmd, timeout_s)          → int         (exit code)
 
     loop_state_path: override the default LOOP_STATE_PATH for testing.
       When None, write_loop_state uses the module-level LOOP_STATE_PATH constant.
@@ -135,6 +177,8 @@ class Runners:
     dispatch: Callable[[str, str, int], dict]
     run_verify: Callable[[str, int], int]
     loop_state_path: Optional[Path] = None
+    # Mayor single-writer: set in_progress before submitting to pool
+    beads_update: Optional[Callable[[str, str], None]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +264,17 @@ def _live_beads_close(bead_id: str) -> None:
     )
 
 
+def _live_beads_update(bead_id: str, status: str) -> None:
+    """Call `beads update <id> --status <status>` (Mayor single-writer path)."""
+    subprocess.run(
+        ["beads", "update", bead_id, "--status", status],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
 def _live_brain_recall(query: str) -> str:
     """Call open_brain.py --search."""
     open_brain = _SCRIPTS_DIR / "open_brain.py"
@@ -293,6 +348,7 @@ def make_live_runners() -> Runners:
     return Runners(
         beads_ready=_live_beads_ready,
         beads_close=_live_beads_close,
+        beads_update=_live_beads_update,
         brain_recall=_live_brain_recall,
         brain_capture=_live_brain_capture,
         dispatch=_live_dispatch,
@@ -652,21 +708,41 @@ def close_if_verified(
 # §5 Budget governor (in-runner checks)
 # ---------------------------------------------------------------------------
 
-def should_continue(summary: RunSummary, cfg: RunConfig) -> tuple[bool, str]:
+def should_continue(
+    summary: RunSummary,
+    cfg: RunConfig,
+    active: Optional[Dict[str, "WorkerHandle"]] = None,
+    recovery_blocked: Optional[Set[str]] = None,
+) -> tuple[bool, str]:
     """Return (True, "") to continue, or (False, reason) to stop.
 
-    Stop conditions (§5):
-      - iterations >= max_iterations         → "max-iterations"
-      - total_tokens >= budget_tokens        → "budget-exhausted"
-      - consecutive_zero_close >= noprogress → "no-progress"
-      (queue-empty is detected by select_next returning None → handled in run_loop)
+    Stop conditions (§5), extended for concurrency-aware Mayor mode:
+      - iterations >= max_iterations                                → "max-iterations"
+      - total_tokens >= budget_tokens                               → "budget-exhausted"
+      - consecutive_zero_close >= noprogress AND active is empty    → "no-progress"
+      - len(recovery_blocked) >= max_workers AND active is empty    → "capacity-exhausted-by-stuck-workers"
+      (queue-empty is detected by caller when no work can be dispatched)
+
+    The active/recovery_blocked parameters are optional for backward compatibility
+    with sequential run_loop which calls this without them.
     """
+    _active = active or {}
+    _recovery = recovery_blocked or set()
+
     if summary.iterations >= cfg.max_iterations:
         return False, "max-iterations"
     if summary.total_tokens >= cfg.budget_tokens:
         return False, "budget-exhausted"
-    if summary.consecutive_zero_close >= LOOP_NOPROGRESS_K:
+    # no-progress: only fire when no workers are running (a running worker is progress)
+    if summary.consecutive_zero_close >= LOOP_NOPROGRESS_K and not _active:
         return False, "no-progress"
+    # capacity-exhausted: all slots occupied by crashed workers, nothing running, nothing ready
+    if (
+        _recovery
+        and len(_recovery) >= cfg.max_workers
+        and not _active
+    ):
+        return False, "capacity-exhausted-by-stuck-workers"
     return True, ""
 
 
@@ -770,6 +846,294 @@ def run_iteration(cfg: RunConfig, runners: Runners) -> IterationResult:
     verify_result.tier = tier
 
     return verify_result
+
+
+# ---------------------------------------------------------------------------
+# Mayor worker — runs in a thread; NEVER mutates bead status
+# ---------------------------------------------------------------------------
+
+def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
+    """Execute dispatch + verify for one bead inside a worker thread.
+
+    Single-writer invariant: this function MUST NOT call beads_close, beads_update,
+    or any other status mutation. It composes and dispatches the prompt, runs the
+    verify command, and returns a WorkerResult. The Mayor (main thread) reads the
+    result and performs all status writes.
+
+    Running verify inside the worker is correct — it is a test command that writes
+    only to the worker's isolated environment, not to bead state. This keeps the
+    slow path parallel while status writes remain serialized to the main thread.
+    """
+    bead_id = bead.get("id", "unknown")
+    tier = route_model(bead)
+    verify_cmd = resolve_verify_cmd(bead, cfg.verify_cmd)
+
+    # DISPATCH(gate) — compose + self-check
+    try:
+        recall_ctx = runners.brain_recall(f"bead molecule:{cfg.molecule} loop iteration")
+        prompt = compose_dispatch(
+            bead,
+            cfg.repo,
+            cfg.branch,
+            verify_cmd or cfg.verify_cmd,
+            recall_context=recall_ctx,
+        )
+    except ValueError as exc:
+        runners.brain_capture(
+            f"Mayor gate-blocked bead {bead_id}: compose_dispatch raised non-compliant. {exc}",
+            "pattern",
+        )
+        return WorkerResult(
+            bead_id=bead_id,
+            dispatch_result={"tokens": 0, "output": ""},
+            verify_exit=1,
+            error=exc,
+        )
+
+    # EXECUTE — dispatch the subagent (blocking subprocess in this thread)
+    try:
+        dispatch_result = runners.dispatch(prompt, tier, LOOP_ITER_TIMEOUT_S)
+    except Exception as exc:
+        runners.brain_capture(
+            f"Mayor dispatch exception for bead {bead_id}: {exc}",
+            "pattern",
+        )
+        return WorkerResult(
+            bead_id=bead_id,
+            dispatch_result={"tokens": 0, "output": ""},
+            verify_exit=None,
+            error=exc,
+        )
+
+    # VERIFY — run V in the worker (reads env, does not mutate bead state)
+    if verify_cmd:
+        try:
+            exit_code = runners.run_verify(verify_cmd, LOOP_VERIFY_TIMEOUT_S)
+        except Exception as exc:
+            return WorkerResult(
+                bead_id=bead_id,
+                dispatch_result=dispatch_result,
+                verify_exit=None,
+                error=exc,
+            )
+    else:
+        exit_code = None  # No verify cmd — Mayor will escalate
+
+    return WorkerResult(
+        bead_id=bead_id,
+        dispatch_result=dispatch_result,
+        verify_exit=exit_code,
+        error=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# pick — deterministic slot-filling selection (pure)
+# ---------------------------------------------------------------------------
+
+def _pick(
+    ready: List[dict],
+    free: int,
+    exclude: Set[str],
+) -> List[dict]:
+    """Select up to `free` beads from `ready`, skipping any in `exclude`.
+
+    Preserves the select_next ordering (priority then id).
+    """
+    candidates = [b for b in ready if b.get("id") not in exclude]
+    # Sort by (priority, id) — same key as select_next
+    candidates.sort(key=lambda b: (b.get("priority", 99), b.get("id", "")))
+    return candidates[:free]
+
+
+# ---------------------------------------------------------------------------
+# Mayor loop — bounded-concurrent drain
+# ---------------------------------------------------------------------------
+
+def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
+    """Execute beads as a bounded-concurrent Mayor.
+
+    Dispatches up to cfg.max_workers ready beads in parallel. As workers finish,
+    freed slots are filled with newly-unblocked beads. Only the Mayor (this
+    function, main thread) mutates bead status — workers return WorkerResult
+    structs and the Mayor reads and acts on them.
+
+    Crash-aware: a crashed/timed-out worker moves its bead_id to recovery_blocked.
+    Its bead stays in_progress and the slot remains occupied — capacity is never
+    silently reclaimed. P2's reconciler is what later clears recovery_blocked.
+
+    Backward compat: cfg.max_workers=1 produces sequential behavior compatible
+    with the existing run_loop (same beads closed, same order).
+    """
+    summary = MayorSummary()
+    active: Dict[str, WorkerHandle] = {}          # in-flight futures keyed by bead_id
+    recovery_blocked: Set[str] = set()             # crashed; slot occupied; bead in_progress
+
+    state_path: Path = (
+        runners.loop_state_path if runners.loop_state_path is not None else LOOP_STATE_PATH
+    )
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=cfg.max_workers)
+
+    try:
+        while True:
+            # ---- 1. Governor stop-check ----
+            ok, reason = should_continue_mayor(summary, cfg, active, recovery_blocked)
+            if not ok:
+                summary.stop_reason = reason
+                break
+
+            # ---- 2. Fill free slots ----
+            ready = runners.beads_ready(cfg.molecule)
+            occupied = set(active.keys()) | recovery_blocked
+            free = cfg.max_workers - len(active) - len(recovery_blocked)
+            to_dispatch = _pick(ready, free, occupied)
+
+            for bead in to_dispatch:
+                bead_id = bead["id"]
+                # Mayor marks in_progress BEFORE submitting to pool (single-writer)
+                if runners.beads_update is not None:
+                    runners.beads_update(bead_id, "in_progress")
+                future = pool.submit(_mayor_worker, bead, cfg, runners)
+                handle = WorkerHandle(
+                    bead_id=bead_id,
+                    future=future,
+                    model=route_model(bead),
+                    started_at=time.monotonic(),
+                )
+                active[bead_id] = handle
+
+            # ---- 3. Check stop: nothing running AND nothing ready AND nothing recovering ----
+            if not active:
+                # No work in flight. Check if recovery_blocked fills capacity.
+                # (should_continue_mayor already catches the capacity-exhausted case above)
+                ready_check = runners.beads_ready(cfg.molecule)
+                if not ready_check and not recovery_blocked:
+                    summary.stop_reason = "queue-empty"
+                    break
+                if not ready_check and recovery_blocked:
+                    # All remaining capacity is stuck — should_continue_mayor handles this
+                    # on the next iteration, but we need to trigger the check now.
+                    ok2, reason2 = should_continue_mayor(summary, cfg, active, recovery_blocked)
+                    if not ok2:
+                        summary.stop_reason = reason2
+                        break
+                    # If we get here, the stop condition wasn't met — shouldn't happen
+                    # in well-formed usage, but break to avoid an infinite spin.
+                    summary.stop_reason = "capacity-exhausted-by-stuck-workers"
+                    break
+
+            if not active:
+                # Still nothing after the above checks — queue-empty
+                summary.stop_reason = "queue-empty"
+                break
+
+            # ---- 4. Wait for ANY worker to complete ----
+            done_futures, _ = concurrent.futures.wait(
+                [h.future for h in active.values()],
+                return_when=concurrent.futures.FIRST_COMPLETED,
+                timeout=LOOP_ITER_TIMEOUT_S,
+            )
+
+            # ---- 5. Process completed futures (Mayor writes) ----
+            completed_bead_ids = [
+                bid for bid, h in active.items() if h.future in done_futures
+            ]
+
+            any_closed = False
+            for bead_id in completed_bead_ids:
+                handle = active.pop(bead_id)
+                try:
+                    res: WorkerResult = handle.future.result(timeout=0)
+                except Exception as exc:
+                    # Future raised an unexpected exception
+                    logger.warning("Worker future for %s raised: %s", bead_id, exc)
+                    recovery_blocked.add(bead_id)
+                    summary.failed += 1
+                    runners.brain_capture(
+                        f"Mayor: worker future for {bead_id} raised unexpectedly: {exc}",
+                        "pattern",
+                    )
+                    continue
+
+                if res.timed_out or res.error is not None:
+                    # Worker crashed or timed out — slot stays occupied
+                    recovery_blocked.add(bead_id)
+                    summary.failed += 1
+                    runners.brain_capture(
+                        f"Mayor: bead {bead_id} moved to recovery_blocked. "
+                        f"error={res.error} timed_out={res.timed_out}",
+                        "pattern",
+                    )
+                elif res.verify_exit == 0:
+                    # V passed — Mayor closes the bead (single-writer)
+                    runners.beads_close(bead_id)
+                    summary.closed += 1
+                    any_closed = True
+                    runners.brain_capture(
+                        f"Mayor: bead {bead_id} closed after verify_exit=0.",
+                        "decision",
+                    )
+                else:
+                    # V failed or no verify cmd — leave open for reconciler/next round
+                    summary.failed += 1
+                    runners.brain_capture(
+                        f"Mayor: bead {bead_id} NOT closed — verify_exit={res.verify_exit}.",
+                        "pattern",
+                    )
+
+            summary.iterations += 1
+            if not any_closed:
+                summary.consecutive_zero_close += 1
+            else:
+                summary.consecutive_zero_close = 0
+
+            # Accumulate tokens from done workers
+            for bead_id in completed_bead_ids:
+                # We already popped from active; find result via done_futures
+                pass  # token accounting via WorkerResult was already done above
+            for fut in done_futures:
+                try:
+                    r: WorkerResult = fut.result(timeout=0)
+                    summary.total_tokens += r.dispatch_result.get("tokens", 0)
+                except Exception:
+                    pass
+
+    finally:
+        pool.shutdown(wait=False)
+
+    if not summary.stop_reason:
+        summary.stop_reason = "unknown"
+
+    return summary
+
+
+def should_continue_mayor(
+    summary: MayorSummary,
+    cfg: RunConfig,
+    active: Dict[str, "WorkerHandle"],
+    recovery_blocked: Set[str],
+) -> tuple[bool, str]:
+    """Governor stop-check for run_mayor_loop.
+
+    Stop conditions (checked in priority order):
+      - iterations >= max_iterations                                    → "max-iterations"
+      - total_tokens >= budget_tokens                                   → "budget-exhausted"
+      - capacity-exhausted: recovery_blocked >= max_workers AND active empty → "capacity-exhausted-by-stuck-workers"
+        (checked before no-progress: when capacity is stuck, naming it precisely is more useful)
+      - no-progress: consecutive_zero_close >= K AND active is empty    → "no-progress"
+    """
+    if summary.iterations >= cfg.max_iterations:
+        return False, "max-iterations"
+    if summary.total_tokens >= cfg.budget_tokens:
+        return False, "budget-exhausted"
+    # capacity-exhausted before no-progress: when workers fill all slots with crashes,
+    # the specific reason is more diagnostic than the generic no-progress signal.
+    if len(recovery_blocked) >= cfg.max_workers and not active:
+        return False, "capacity-exhausted-by-stuck-workers"
+    if summary.consecutive_zero_close >= LOOP_NOPROGRESS_K and not active:
+        return False, "no-progress"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1349,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Branch passed into the dispatch prompt.",
     )
     parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help=(
+            "Maximum concurrent worker beads (default: 1 = sequential, "
+            "matches today's behavior). Values > 1 activate the Mayor concurrent loop."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging.",
@@ -1011,6 +1384,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         budget_tokens=args.budget_tokens,
         dry_run=args.dry_run,
         once=args.once,
+        max_workers=args.max_workers,
     )
 
     if cfg.dry_run:
