@@ -73,6 +73,25 @@ LOOP_SPAWNING_WINDOW_S: float = float(
 )
 LOOP_MAX_RESPAWNS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_RESPAWNS", "1"))
 
+# VB2 Refinery constants — batch-then-bisect + anti-starvation scoring.
+# batch_max=1 (default at the RunConfig level) reproduces the VA0b serial path.
+LOOP_BATCH_MAX: int = int(os.environ.get("OPTIVAI_LOOP_BATCH_MAX", "8"))
+LOOP_REFINERY_ATTEMPTS_MAX: int = int(
+    os.environ.get("OPTIVAI_LOOP_REFINERY_ATTEMPTS_MAX", "2")
+)
+# Anti-starvation scoring weights (pure orderer — see order_by_score).
+#   W_AGE   : per-second wait weight (older verified candidates merge first)
+#   W_RETRY : per-attempt weight (already-bounced branches are prioritized)
+#   W_PRIO  : per-priority-rank weight (lower bead priority number = higher precedence)
+# Tuned so a single retry or a few minutes of waiting outranks a fresh arrival.
+LOOP_REFINERY_W_AGE: float = float(os.environ.get("OPTIVAI_LOOP_REFINERY_W_AGE", "1.0"))
+LOOP_REFINERY_W_RETRY: float = float(
+    os.environ.get("OPTIVAI_LOOP_REFINERY_W_RETRY", "120.0")
+)
+LOOP_REFINERY_W_PRIO: float = float(
+    os.environ.get("OPTIVAI_LOOP_REFINERY_W_PRIO", "30.0")
+)
+
 # Default path for the shared loop state file (OBS2).
 # Override via Runners.loop_state_path for testing.
 LOOP_STATE_PATH: Path = Path.home() / ".claude" / "loop-state.json"
@@ -89,10 +108,13 @@ _REPO_DEFAULT_VERIFY_CMD = "cd /Users/erato949/dev/optivai-claude-plugin/scripts
 _WORKTREE_LOCK: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Merge serialization lock (VA0b)
+# Merge slot (VA0b serial merge → VB2 Refinery)
 # Merges from mayor/<bead_id> branches into the working branch must be
 # serialized so concurrent workers never race on the same git index.
-# Held only during merge (Mayor main thread), not during worker dispatch.
+# VA0b held this only during one `git merge`.  VB2 promotes it to the merge
+# slot: held around the whole batch-then-bisect cycle (refine()).  Only one
+# batch cycle runs at a time; workers keep dispatching concurrently and only
+# enqueue MergeCandidates — the Mayor main thread is the sole merger.
 # ---------------------------------------------------------------------------
 _MERGE_LOCK: threading.Lock = threading.Lock()
 
@@ -180,6 +202,39 @@ class MayorSummary:
 
 
 @dataclass
+class MergeCandidate:
+    """A V-passed worker branch awaiting integration by the Refinery (VB2).
+
+    Workers never merge — on V-pass the Mayor enqueues one of these and the
+    Refinery (refine(), Mayor main thread, single-writer) drains the queue.
+    All fields the orderer needs (verified_at, attempts, priority) are carried
+    on the candidate so order_by_score stays a pure function (no lookups).
+    """
+
+    bead_id: str
+    branch_name: str               # "mayor/<bead_id>"
+    worktree_path: Optional[str]   # Mayor tears down after the merge decision
+    model: str                     # tier (for ledger)
+    verified_at: float             # monotonic; passed in (no Date.now in the orderer)
+    priority: int = 99             # bead priority (lower number = higher precedence)
+    attempts: int = 0              # refinery re-implement count (anti-loop)
+
+
+@dataclass
+class RefineOutcome:
+    """Result of refining one MergeCandidate (VB2).
+
+    kind:
+      "merged"      — branch landed on the working branch; close the bead.
+      "reimplement" — conflict (textual or semantic); relabel + return to ready.
+      "exhausted"   — re-implement cap reached; escalate (leave open, do not respawn).
+    """
+
+    candidate: MergeCandidate
+    kind: str
+
+
+@dataclass
 class RunConfig:
     """Immutable runtime configuration for a loop run."""
 
@@ -196,6 +251,11 @@ class RunConfig:
     stuck_threshold_s: float = LOOP_STUCK_THRESHOLD_S   # hung-detection threshold (seconds)
     spawning_window_s: float = LOOP_SPAWNING_WINDOW_S   # grace period for new workers (seconds)
     max_respawns: int = LOOP_MAX_RESPAWNS               # per-bead respawn cap (stops respawn loops)
+    # VB2 Refinery config.  batch_max=1 reproduces the VA0b serial merge path
+    # exactly (run_mayor_loop routes batch_max<=1 through the inline merge), so
+    # every existing worktree/governor/rate-limit test stays green.
+    batch_max: int = 1
+    refinery_attempts_max: int = LOOP_REFINERY_ATTEMPTS_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +323,24 @@ class Runners:
     worktree_create: Optional[Callable[[str], Optional[tuple]]] = None
     worktree_teardown: Optional[Callable[[str, str], None]] = None
     merge_branch: Optional[Callable[[str], int]] = None
+    # VB2 Refinery seams (batch-then-bisect).  All three drive the merge slot
+    # from the Mayor main thread only — refine() is the sole caller.
+    #   merge_batch(list[MergeCandidate]) → bool
+    #     Sequentially `git merge --no-ff` each branch.  True iff ALL applied
+    #     cleanly; False on the first textual conflict (working tree may be left
+    #     mid-merge — git_reset cleans it up).
+    #   git_snapshot(branch) → str
+    #     Rollback point for the batch (rev-parse HEAD of the working branch).
+    #   git_reset(snapshot) → None
+    #     Atomic rollback: abort any in-progress merge + hard-reset to snapshot.
+    # When absent, run_mayor_loop falls back to the VA0b inline merge_branch path.
+    merge_batch: Optional[Callable[[List["MergeCandidate"]], bool]] = None
+    git_snapshot: Optional[Callable[[str], str]] = None
+    git_reset: Optional[Callable[[str], None]] = None
+    # VB2: relabel a bead (conflict typing + refinery-attempts bookkeeping).
+    #   beads_relabel(bead_id, label) → None
+    # Mayor-only; fail-safe.  Absent → relabel is skipped (best-effort signal).
+    beads_relabel: Optional[Callable[[str, str], None]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +814,78 @@ def _live_merge_worktree_branch(branch_name: str) -> int:
         return 1
 
 
+def _live_git_snapshot(branch: str) -> str:
+    """VB2: Return the current HEAD sha of the working branch (rollback point).
+
+    Returns "" if git is unavailable — refine() treats an empty snapshot as
+    "no rollback possible" and falls back conservatively.
+    """
+    repo_root = _discover_repo_root()
+    if repo_root is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=repo_root,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("git_snapshot raised: %s", exc)
+        return ""
+
+
+def _live_git_reset(snapshot: str) -> None:
+    """VB2: Atomic rollback of a failed batch to *snapshot*.
+
+    Aborts any in-progress merge, then hard-resets to the snapshot sha so the
+    working branch is byte-identical to its pre-batch state.  Fail-safe.
+    """
+    repo_root = _discover_repo_root()
+    if repo_root is None or not snapshot:
+        return
+    # Abort any in-progress merge first (ignore errors — there may be none).
+    try:
+        subprocess.run(
+            ["git", "merge", "--abort"],
+            capture_output=True, text=True, timeout=30, cwd=repo_root,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("git_reset: merge --abort raised: %s", exc)
+    try:
+        subprocess.run(
+            ["git", "reset", "--hard", snapshot],
+            capture_output=True, text=True, timeout=30, cwd=repo_root,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("git_reset: reset --hard raised: %s", exc)
+
+
+def _live_merge_batch(batch: List["MergeCandidate"]) -> bool:
+    """VB2: Sequentially `git merge --no-ff` each candidate's branch.
+
+    Returns True iff every branch applied cleanly.  On the first non-zero merge
+    (textual conflict) returns False immediately — the caller (refine) resets to
+    the pre-batch snapshot, so a half-applied batch never persists.
+    """
+    for c in batch:
+        if _live_merge_worktree_branch(c.branch_name) != 0:
+            return False
+    return True
+
+
+def _live_beads_relabel(bead_id: str, label: str) -> None:
+    """VB2: Apply a label to a bead (`beads label <id> <label>`). Fail-safe."""
+    try:
+        subprocess.run(
+            ["beads", "label", bead_id, label],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("beads_relabel failed for %s: %s", bead_id, exc)
+
+
 def make_live_runners() -> Runners:
     """Construct the real (live) Runners instance.
 
@@ -760,6 +910,11 @@ def make_live_runners() -> Runners:
         worktree_create=_live_worktree_create,
         worktree_teardown=_live_worktree_teardown,
         merge_branch=_live_merge_worktree_branch,
+        # VB2 Refinery seams (batch-then-bisect)
+        merge_batch=_live_merge_batch,
+        git_snapshot=_live_git_snapshot,
+        git_reset=_live_git_reset,
+        beads_relabel=_live_beads_relabel,
     )
 
 
@@ -1614,6 +1769,123 @@ def _ledger_capture(
 
 
 # ---------------------------------------------------------------------------
+# VB2 Refinery — batch-then-bisect + anti-starvation scoring
+# ---------------------------------------------------------------------------
+
+def _candidate_score(c: MergeCandidate, now: float) -> float:
+    """Anti-starvation score for a merge candidate (pure).
+
+    Higher score merges first.  Combines wait time (older first), retry count
+    (already-bounced branches prioritized) and bead priority (lower priority
+    number = higher precedence → larger contribution).  ``now`` is injected so
+    the function is fully deterministic in tests (no time.monotonic inside).
+    """
+    age = max(0.0, now - c.verified_at)
+    return (
+        LOOP_REFINERY_W_AGE * age
+        + LOOP_REFINERY_W_RETRY * c.attempts
+        - LOOP_REFINERY_W_PRIO * c.priority
+    )
+
+
+def order_by_score(candidates: List[MergeCandidate], now: float) -> List[MergeCandidate]:
+    """Return candidates ordered highest-score-first (anti-starvation).
+
+    Pure: does not mutate the input.  Deterministic tie-break by bead_id so the
+    orderer is stable regardless of insertion order.
+    """
+    return sorted(
+        candidates,
+        key=lambda c: (-_candidate_score(c, now), c.bead_id),
+    )
+
+
+def _conflict_outcome(c: MergeCandidate, cfg: RunConfig) -> RefineOutcome:
+    """Classify a single-branch failure: re-implement (bounded) or escalate.
+
+    A branch reaching this point either won't apply (textual conflict) or fails
+    V on its own (semantic conflict) — both mean the working branch moved under
+    the worker.  Bounded by cfg.refinery_attempts_max to stop conflict loops.
+    """
+    if c.attempts >= cfg.refinery_attempts_max:
+        return RefineOutcome(candidate=c, kind="exhausted")
+    return RefineOutcome(candidate=c, kind="reimplement")
+
+
+def _try_batch(
+    batch: List[MergeCandidate],
+    runners: Runners,
+    cfg: RunConfig,
+) -> List[RefineOutcome]:
+    """Merge+verify a batch atomically; bisect to isolate offenders on red.
+
+    MUST be called with _MERGE_LOCK already held (refine holds the slot around
+    the whole cycle; the lock is non-reentrant so we never re-acquire here).
+
+    All-green: one verify lands the whole batch (K close for 1 verify).
+    Red: roll back to the pre-batch snapshot, then
+      - len == 1 → the culprit → conflict→re-implement (or escalate).
+      - len  > 1 → split in half and recurse; a clean half merges and stays,
+        only the failing partition is split further (innocent branches never
+        penalized — they land in their green sub-batch).
+    """
+    if not batch:
+        return []
+
+    snapshot = runners.git_snapshot(cfg.branch) if runners.git_snapshot else ""
+    merged_ok = runners.merge_batch(batch) if runners.merge_batch else False
+
+    if merged_ok:
+        verify_exit = runners.run_verify(cfg.verify_cmd, LOOP_VERIFY_TIMEOUT_S)
+        if verify_exit == 0:
+            return [RefineOutcome(candidate=c, kind="merged") for c in batch]
+
+    # Batch is red (textual conflict or combined-V failure) — atomic rollback.
+    if runners.git_reset is not None:
+        runners.git_reset(snapshot)
+
+    if len(batch) == 1:
+        return [_conflict_outcome(batch[0], cfg)]
+
+    mid = len(batch) // 2
+    left = _try_batch(batch[:mid], runners, cfg)
+    right = _try_batch(batch[mid:], runners, cfg)
+    return left + right
+
+
+def refine(
+    merge_queue: List[MergeCandidate],
+    runners: Runners,
+    cfg: RunConfig,
+    now: float,
+) -> List[RefineOutcome]:
+    """Drain up to cfg.batch_max candidates from *merge_queue* (anti-starvation).
+
+    Selects the top-scored batch, removes it from the queue (mutates in place),
+    and processes it under the merge slot (_MERGE_LOCK held around the whole
+    batch-then-bisect cycle — the single-writer / merge-slot invariant).
+    Returns one RefineOutcome per processed candidate; candidates beyond
+    batch_max stay queued and are re-scored on the next call.
+
+    Pure with respect to bead state — the caller applies close / relabel /
+    return-to-ready based on the returned outcomes (Mayor single-writer).
+    """
+    if not merge_queue:
+        return []
+
+    batch_max = max(1, cfg.batch_max)
+    ordered = order_by_score(merge_queue, now)
+    batch = ordered[:batch_max]
+
+    # Remove the selected batch from the queue (leftovers re-scored next call).
+    selected_ids = {id(c) for c in batch}
+    merge_queue[:] = [c for c in merge_queue if id(c) not in selected_ids]
+
+    with _MERGE_LOCK:
+        return _try_batch(batch, runners, cfg)
+
+
+# ---------------------------------------------------------------------------
 # Mayor loop — bounded-concurrent drain
 # ---------------------------------------------------------------------------
 
@@ -1648,6 +1920,30 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
     respawn_counts: Dict[str, int] = {}
     # P2: Mayor-maintained bead status snapshot (injected into reconcile)
     bead_statuses: Dict[str, str] = {}
+    # VB2 Refinery: V-passed branches awaiting integration (drained under the
+    # merge slot each tick) + per-bead re-implement counter (anti-loop, persists
+    # across re-dispatches so the refinery_attempts_max cap is enforced) + the
+    # priority of each dispatched bead (carried onto MergeCandidates for scoring).
+    merge_queue: List[MergeCandidate] = []
+    refinery_attempts: Dict[str, int] = {}
+    bead_priorities: Dict[str, int] = {}
+    # VB2 active only when batch_max > 1 AND the batch seam is wired; otherwise
+    # the V-pass path stays on the VA0b inline merge (full backward compat).
+    refinery_on = cfg.batch_max > 1 and runners.merge_batch is not None
+
+    def _safe_teardown(worktree_path: Optional[str], branch_name: Optional[str], ctx: str) -> None:
+        if worktree_path is not None and runners.worktree_teardown is not None:
+            try:
+                runners.worktree_teardown(worktree_path, branch_name or "")
+            except Exception as td_exc:
+                logger.warning("Mayor: worktree teardown (%s) failed: %s", ctx, td_exc)
+
+    def _safe_relabel(bead_id: str, label: str) -> None:
+        if runners.beads_relabel is not None:
+            try:
+                runners.beads_relabel(bead_id, label)
+            except Exception as rl_exc:
+                logger.warning("Mayor: beads_relabel %s=%s failed: %s", bead_id, label, rl_exc)
 
     state_path: Path = (
         runners.loop_state_path if runners.loop_state_path is not None else LOOP_STATE_PATH
@@ -1715,6 +2011,10 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 if runners.beads_update is not None:
                     runners.beads_update(bead_id, "in_progress")
                 bead_statuses[bead_id] = "in_progress"
+                # VB2: remember priority for anti-starvation scoring of this
+                # bead's eventual MergeCandidate (only the bead_id survives to
+                # the completion handler).
+                bead_priorities[bead_id] = bead.get("priority", 99)
                 future = pool.submit(_mayor_worker, bead, cfg, runners)
                 handle = WorkerHandle(
                     bead_id=bead_id,
@@ -1918,8 +2218,30 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                                 bead_id, td_exc,
                             )
                 elif res.verify_exit == 0:
-                    # V passed — VA0b: merge the named branch (serialized), then close
-                    if res.branch_name is not None and runners.merge_branch is not None:
+                    # V passed.
+                    if refinery_on and res.branch_name is not None:
+                        # VB2 Refinery: enqueue a MergeCandidate; the merge slot
+                        # drains the queue (batch-then-bisect) after this loop.
+                        # The Mayor never merges here — single-writer preserved.
+                        merge_queue.append(MergeCandidate(
+                            bead_id=bead_id,
+                            branch_name=res.branch_name,
+                            worktree_path=res.worktree_path,
+                            model=handle.model,
+                            verified_at=time.monotonic(),
+                            priority=bead_priorities.get(bead_id, 99),
+                            attempts=refinery_attempts.get(bead_id, 0),
+                        ))
+                        _ledger_capture(
+                            runners,
+                            action="verify-pass",
+                            bead_id=bead_id,
+                            molecule=cfg.molecule,
+                            tier=handle.model,
+                            extra=f"verify_exit=0 branch={res.branch_name} queued-for-refinery",
+                        )
+                    # VA0b: merge the named branch (serialized), then close
+                    elif res.branch_name is not None and runners.merge_branch is not None:
                         with _MERGE_LOCK:
                             merge_exit = runners.merge_branch(res.branch_name)
                         if merge_exit != 0:
@@ -2045,6 +2367,71 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                                 "Mayor: worktree teardown (V-fail) for %s: %s",
                                 bead_id, td_exc,
                             )
+
+            # ---- 5b. VB2 Refinery — drain the merge queue under the merge slot ----
+            # Fully drain each tick so no V-passed branch is ever left unmerged
+            # when the loop stops.  refine() holds _MERGE_LOCK around each batch
+            # cycle (single-writer / merge-slot); the Mayor applies outcomes here.
+            while merge_queue:
+                outcomes = refine(merge_queue, runners, cfg, time.monotonic())
+                if not outcomes:
+                    break
+                for outcome in outcomes:
+                    c = outcome.candidate
+                    if outcome.kind == "merged":
+                        runners.beads_close(c.bead_id)
+                        bead_statuses[c.bead_id] = "closed"
+                        summary.closed += 1
+                        any_closed = True
+                        refinery_attempts.pop(c.bead_id, None)
+                        _ledger_capture(
+                            runners, action="batch-merge", bead_id=c.bead_id,
+                            molecule=cfg.molecule, tier=c.model,
+                            extra=f"branch={c.branch_name}",
+                        )
+                        _ledger_capture(
+                            runners, action="close", bead_id=c.bead_id,
+                            molecule=cfg.molecule, tier=c.model,
+                        )
+                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-merged")
+                    elif outcome.kind == "reimplement":
+                        # Typed conflict → relabel + return to ready (re-implement
+                        # against the now-advanced HEAD), bounded by the attempts cap.
+                        refinery_attempts[c.bead_id] = c.attempts + 1
+                        _safe_relabel(c.bead_id, "conflict:re-implement")
+                        _safe_relabel(
+                            c.bead_id,
+                            f"refinery-attempts:{refinery_attempts[c.bead_id]}",
+                        )
+                        if runners.beads_update is not None:
+                            runners.beads_update(c.bead_id, "open")
+                        bead_statuses.pop(c.bead_id, None)
+                        _mayor_capture(
+                            runners,
+                            f"Mayor Refinery: bead {c.bead_id} conflict → re-implement "
+                            f"(attempt {refinery_attempts[c.bead_id]}/{cfg.refinery_attempts_max}).",
+                            "pattern",
+                        )
+                        _ledger_capture(
+                            runners, action="conflict-reimplement", bead_id=c.bead_id,
+                            molecule=cfg.molecule, tier=c.model,
+                            extra=f"branch={c.branch_name} attempt={refinery_attempts[c.bead_id]}",
+                        )
+                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-reimplement")
+                    else:  # "exhausted" — escalate (do NOT respawn; surface to operator)
+                        summary.failed += 1
+                        _mayor_capture(
+                            runners,
+                            f"Mayor Refinery: bead {c.bead_id} EXHAUSTED re-implement cap "
+                            f"({cfg.refinery_attempts_max}) — escalating, left for operator.",
+                            "pattern",
+                        )
+                        _ledger_capture(
+                            runners, action="refinery-exhausted", bead_id=c.bead_id,
+                            molecule=cfg.molecule, tier=c.model,
+                            extra=f"branch={c.branch_name} attempts={c.attempts}",
+                        )
+                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-exhausted")
 
             summary.iterations += 1
             if not any_closed:
@@ -2371,6 +2758,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             f"(default: {LOOP_MAX_RESPAWNS}). Set to 0 to disable respawning."
         ),
     )
+    # VB2 Refinery config
+    parser.add_argument(
+        "--batch-max",
+        type=int,
+        default=1,
+        help=(
+            "VB2 Refinery: max V-passed branches merged+verified per batch "
+            "(default: 1 = VA0b serial merge). Values > 1 activate batch-then-bisect."
+        ),
+    )
+    parser.add_argument(
+        "--refinery-attempts",
+        type=int,
+        default=LOOP_REFINERY_ATTEMPTS_MAX,
+        help=(
+            f"VB2 Refinery: max conflict→re-implement attempts before a bead is "
+            f"escalated (default: {LOOP_REFINERY_ATTEMPTS_MAX})."
+        ),
+    )
     return parser
 
 
@@ -2397,6 +2803,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         stuck_threshold_s=args.stuck_threshold,
         spawning_window_s=args.spawning_window,
         max_respawns=args.max_respawns,
+        batch_max=args.batch_max,
+        refinery_attempts_max=args.refinery_attempts,
     )
 
     if cfg.dry_run:
