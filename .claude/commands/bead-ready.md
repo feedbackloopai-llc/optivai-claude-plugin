@@ -56,7 +56,7 @@ Use `/bead-ready` at the start of a session to find work to do. If there's a rea
 
 ## Related Commands
 
-- `/bead-list` - List all beads
+- `/bead-list` - List all beads (and filter by `repo:<basename>` — see its "Filter by Repo Label" section)
 - `/bead-show` - Show bead details
 - `/bead-link` - Add dependencies
-- `/bead-create` - Create new beads
+- `/bead-create` - Create new beads (see its "Repo-label convention" section — the canonical reference for the `repo:<basename>` labeling rule)

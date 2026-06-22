@@ -1,0 +1,50 @@
+{"input": "Contact our coach at test+1@example.com for support.", "expected_categories": ["pii.contact.email"], "expected_redacted": "Contact our coach at [REDACTED:pii.contact.email] for support."}
+{"input": "Email: test+2@example.com", "expected_categories": ["pii.contact.email"], "expected_redacted": "Email: [REDACTED:pii.contact.email]"}
+{"input": "john.smith@example.com is the primary contact.", "expected_categories": ["pii.contact.email"], "expected_redacted": "[REDACTED:pii.contact.email] is the primary contact."}
+{"input": "reach out to mary.johnson@example.com today", "expected_categories": ["pii.contact.email"], "expected_redacted": "reach out to [REDACTED:pii.contact.email] today"}
+{"input": "multiple contacts: test+3@example.com and test+4@example.com", "expected_categories": ["pii.contact.email", "pii.contact.email"], "expected_redacted": "multiple contacts: [REDACTED:pii.contact.email] and [REDACTED:pii.contact.email]"}
+{"input": "test+5@example.com", "expected_categories": ["pii.contact.email"], "expected_redacted": "[REDACTED:pii.contact.email]"}
+{"input": "Call us: +1-555-210-2100", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "Call us: [REDACTED:pii.contact.phone_us]"}
+{"input": "Phone: 1-555-210-2101", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "Phone: [REDACTED:pii.contact.phone_us]"}
+{"input": "(555) 210-2345", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "[REDACTED:pii.contact.phone_us]"}
+{"input": "555.210.3456", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "[REDACTED:pii.contact.phone_us]"}
+{"input": "Contact: 555-210-4567", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "Contact: [REDACTED:pii.contact.phone_us]"}
+{"input": "+1-555-210-2105", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "[REDACTED:pii.contact.phone_us]"}
+{"input": "(555) 210-6789", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "[REDACTED:pii.contact.phone_us]"}
+{"input": "555.210.7890", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "[REDACTED:pii.contact.phone_us]"}
+{"input": "Address: 123 Test Street, Example City, ST 99999", "expected_categories": ["pii.contact.address_us"], "expected_redacted": "Address: [REDACTED:pii.contact.address_us]"}
+{"input": "Mailing address: 123 Test Street, Example City, ST 99999", "expected_categories": ["pii.contact.address_us"], "expected_redacted": "Mailing address: [REDACTED:pii.contact.address_us]"}
+{"input": "Ship to: 123 Test Street, Example City, ST 99999", "expected_categories": ["pii.contact.address_us"], "expected_redacted": "Ship to: [REDACTED:pii.contact.address_us]"}
+{"input": "Billing: 123 Test Street, Example City, ST 99999", "expected_categories": ["pii.contact.address_us"], "expected_redacted": "Billing: [REDACTED:pii.contact.address_us]"}
+{"input": "Home: 123 Test Street, Example City, ST 99999", "expected_categories": ["pii.contact.address_us"], "expected_redacted": "Home: [REDACTED:pii.contact.address_us]"}
+{"input": "DOB: 01/15/1900", "expected_categories": ["pii.identity.dob"], "expected_redacted": "DOB: [REDACTED:pii.identity.dob]"}
+{"input": "birthdate: 12/31/1985", "expected_categories": ["pii.identity.dob"], "expected_redacted": "birthdate: [REDACTED:pii.identity.dob]"}
+{"input": "Date of birth 06/20/1982", "expected_categories": ["pii.identity.dob"], "expected_redacted": "Date of birth [REDACTED:pii.identity.dob]"}
+{"input": "born: 03/10/1975", "expected_categories": ["pii.identity.dob"], "expected_redacted": "born: [REDACTED:pii.identity.dob]"}
+{"input": "birth date: 11/11/1960", "expected_categories": ["pii.identity.dob"], "expected_redacted": "birth date: [REDACTED:pii.identity.dob]"}
+{"input": "SSN: 123-45-6789", "expected_categories": ["pii.identity.ssn_us"], "expected_redacted": "SSN: [REDACTED:pii.identity.ssn_us]"}
+{"input": "Social Security Number: 234-56-7890", "expected_categories": ["pii.identity.ssn_us"], "expected_redacted": "Social Security Number: [REDACTED:pii.identity.ssn_us]"}
+{"input": "tax id 345-67-8901", "expected_categories": ["pii.identity.ssn_us"], "expected_redacted": "tax id [REDACTED:pii.identity.ssn_us]"}
+{"input": "456-78-9012 is the identifier", "expected_categories": ["pii.identity.ssn_us"], "expected_redacted": "[REDACTED:pii.identity.ssn_us] is the identifier"}
+{"input": "identifier: 567-89-0123", "expected_categories": ["pii.identity.ssn_us"], "expected_redacted": "identifier: [REDACTED:pii.identity.ssn_us]"}
+{"input": "Payment method: 4111-1111-1111-1111 valid Visa", "expected_categories": ["payment.card.pan"], "expected_redacted": "Payment method: [REDACTED:payment.card.pan] valid Visa"}
+{"input": "Charge card 5555-5555-5555-4444 Mastercard", "expected_categories": ["payment.card.pan"], "expected_redacted": "Charge card [REDACTED:payment.card.pan] Mastercard"}
+{"input": "card 378282246310005 (Amex)", "expected_categories": ["payment.card.pan"], "expected_redacted": "card [REDACTED:payment.card.pan] (Amex)"}
+{"input": "Discover: 6011-1111-1111-1117", "expected_categories": ["payment.card.pan"], "expected_redacted": "Discover: [REDACTED:payment.card.pan]"}
+{"input": "Credit card: 4111111111111111", "expected_categories": ["payment.card.pan"], "expected_redacted": "Credit card: [REDACTED:payment.card.pan]"}
+{"input": "Card 4111-1111-1111-1111 exp 12/27 cvv 123", "expected_categories": ["payment.card.pan", "payment.card.expiration", "payment.card.cvv"], "expected_redacted": "Card [REDACTED:payment.card.pan] exp [REDACTED:payment.card.expiration] cvv [REDACTED:payment.card.cvv]"}
+{"input": "IP address: 192.0.2.1", "expected_categories": ["pii.network.ipv4"], "expected_redacted": "IP address: [REDACTED:pii.network.ipv4]"}
+{"input": "server at 192.0.2.100", "expected_categories": ["pii.network.ipv4"], "expected_redacted": "server at [REDACTED:pii.network.ipv4]"}
+{"input": "Connect to 198.51.100.50", "expected_categories": ["pii.network.ipv4"], "expected_redacted": "Connect to [REDACTED:pii.network.ipv4]"}
+{"input": "IPV4: 203.0.113.99", "expected_categories": ["pii.network.ipv4"], "expected_redacted": "IPV4: [REDACTED:pii.network.ipv4]"}
+{"input": "IPv6: 2001:0db8:0000:0000:0000:0000:0000:0001", "expected_categories": ["pii.network.ipv6"], "expected_redacted": "IPv6: [REDACTED:pii.network.ipv6]"}
+{"input": "address: fe80:0000:0000:0000:0000:0000:0000:0001", "expected_categories": ["pii.network.ipv6"], "expected_redacted": "address: [REDACTED:pii.network.ipv6]"}
+{"input": "v6 address 2001:0db8:85a3:0000:0000:8a2e:0370:7334", "expected_categories": ["pii.network.ipv6"], "expected_redacted": "v6 address [REDACTED:pii.network.ipv6]"}
+{"input": "expiration: 12/27", "expected_categories": ["payment.card.expiration"], "expected_redacted": "expiration: [REDACTED:payment.card.expiration]"}
+{"input": "expires 03/29", "expected_categories": ["payment.card.expiration"], "expected_redacted": "expires [REDACTED:payment.card.expiration]"}
+{"input": "CVV: 123", "expected_categories": ["payment.card.cvv"], "expected_redacted": "CVV: [REDACTED:payment.card.cvv]"}
+{"input": "security code 456", "expected_categories": ["payment.card.cvv"], "expected_redacted": "security code [REDACTED:payment.card.cvv]"}
+{"input": "routing number: 021000021", "expected_categories": ["payment.ach.routing"], "expected_redacted": "routing number: [REDACTED:payment.ach.routing]"}
+{"input": "ACH routing 051000017", "expected_categories": ["payment.ach.routing"], "expected_redacted": "ACH routing [REDACTED:payment.ach.routing]"}
+{"input": "test+10@example.com", "expected_categories": ["pii.contact.email"], "expected_redacted": "[REDACTED:pii.contact.email]"}
+{"input": "(555) 210-1500", "expected_categories": ["pii.contact.phone_us"], "expected_redacted": "[REDACTED:pii.contact.phone_us]"}

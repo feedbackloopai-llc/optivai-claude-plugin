@@ -1,0 +1,21 @@
+#!/bin/bash
+# P16-S4 sync-conflict guard: block commits containing files matching
+#   "<name> <space><digit>" pattern (macOS Files-app sync conflicts)
+#   OR ".sync-conflict-<timestamp>" pattern (some sync clients).
+#
+# Override (emergencies only): git commit --no-verify
+
+set -e
+CONFLICTS=$(git diff --cached --name-only --diff-filter=AM | \
+  grep -E '(^| )[^/]+ [0-9]+(\.[a-z0-9]+)?$|\.sync-conflict-' || true)
+if [ -n "$CONFLICTS" ]; then
+  echo "✗ COMMIT BLOCKED — macOS sync-conflict files in staged set:"
+  echo "$CONFLICTS" | sed 's/^/  /'
+  echo ""
+  echo "Fix:  git rm \$(echo \"$CONFLICTS\" | tr '\\n' ' ')"
+  echo "Then: re-stage your real files + retry the commit."
+  echo ""
+  echo "Override (emergencies only): git commit --no-verify"
+  exit 1
+fi
+exit 0

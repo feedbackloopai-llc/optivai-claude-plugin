@@ -1,0 +1,448 @@
+{
+  "version": "1.0",
+  "description": "Cross-harness parity corpus for run_mayor_loop (Python) / runMayorLoop (TS). Verdict = mayor_events_ordered (Mayor-thread only: beads_update + beads_close, deterministic) + dispatch_calls_sorted (worker calls as sorted multiset, order-independent for parallel). Byte-identical copy in test/mayor-parity-corpus.json.",
+  "scenarios": [
+    {
+      "id": "S1-capacity-sequential",
+      "description": "max_workers=1, 3 dep-chained beads. beads_ready reveals each bead only after the previous closes, enforcing sequential execution. Verifies capacity-bound pick ordering and sequential dep-chain unblocking.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s1a", "title": "Implement step A", "priority": 1, "labels": ["tier:implement"], "body": "Step A", "effort": "implement"},
+        {"id": "gz-s1b", "title": "Implement step B", "priority": 2, "labels": ["tier:implement"], "body": "Step B", "effort": "implement"},
+        {"id": "gz-s1c", "title": "Implement step C", "priority": 3, "labels": ["tier:implement"], "body": "Step C", "effort": "implement"}
+      ],
+      "dep_chain": [["gz-s1b", "gz-s1a"], ["gz-s1c", "gz-s1b"]],
+      "worker_outcomes": {
+        "gz-s1a": {"verify_exit": 0, "tokens": 10},
+        "gz-s1b": {"verify_exit": 0, "tokens": 10},
+        "gz-s1c": {"verify_exit": 0, "tokens": 10}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s1a", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s1a"},
+          {"type": "beads_update", "bead_id": "gz-s1b", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s1b"},
+          {"type": "beads_update", "bead_id": "gz-s1c", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s1c"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s1a", "tier": "sonnet"},
+          {"bead_id": "gz-s1b", "tier": "sonnet"},
+          {"bead_id": "gz-s1c", "tier": "sonnet"}
+        ],
+        "closed": ["gz-s1a", "gz-s1b", "gz-s1c"],
+        "failed": [],
+        "stop_reason": "queue-empty"
+      }
+    },
+    {
+      "id": "S2-parallel-independents",
+      "description": "max_workers=3, 3 independent beads. All 3 dispatched in one tick, all close in the same batch. mayor_events_ordered captures beads_update order (by pick priority) and beads_close order (by active insertion order). dispatch_calls_sorted captures all 3 dispatch calls regardless of thread order.",
+      "config": {
+        "max_workers": 3,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s2a", "title": "Parallel task A", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"},
+        {"id": "gz-s2b", "title": "Parallel task B", "priority": 2, "labels": ["tier:implement"], "body": "Task B", "effort": "implement"},
+        {"id": "gz-s2c", "title": "Parallel task C", "priority": 3, "labels": ["tier:implement"], "body": "Task C", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s2a": {"verify_exit": 0, "tokens": 10},
+        "gz-s2b": {"verify_exit": 0, "tokens": 10},
+        "gz-s2c": {"verify_exit": 0, "tokens": 10}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s2a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s2b", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s2c", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s2a"},
+          {"type": "beads_close", "bead_id": "gz-s2b"},
+          {"type": "beads_close", "bead_id": "gz-s2c"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s2a", "tier": "sonnet"},
+          {"bead_id": "gz-s2b", "tier": "sonnet"},
+          {"bead_id": "gz-s2c", "tier": "sonnet"}
+        ],
+        "closed": ["gz-s2a", "gz-s2b", "gz-s2c"],
+        "failed": [],
+        "stop_reason": "queue-empty"
+      }
+    },
+    {
+      "id": "S3-dep-chain-unblocking",
+      "description": "max_workers=2, 4 beads: A and B independent, C depends on A, D depends on B. Tick 1 dispatches A+B (both close). Tick 2 dispatches C+D (both close). Verifies dep-chain unblocking as slots free.",
+      "config": {
+        "max_workers": 2,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s3a", "title": "Independent A", "priority": 1, "labels": ["tier:implement"], "body": "A", "effort": "implement"},
+        {"id": "gz-s3b", "title": "Independent B", "priority": 2, "labels": ["tier:implement"], "body": "B", "effort": "implement"},
+        {"id": "gz-s3c", "title": "Depends on A", "priority": 3, "labels": ["tier:implement"], "body": "C", "effort": "implement"},
+        {"id": "gz-s3d", "title": "Depends on B", "priority": 4, "labels": ["tier:implement"], "body": "D", "effort": "implement"}
+      ],
+      "dep_chain": [["gz-s3c", "gz-s3a"], ["gz-s3d", "gz-s3b"]],
+      "worker_outcomes": {
+        "gz-s3a": {"verify_exit": 0, "tokens": 10},
+        "gz-s3b": {"verify_exit": 0, "tokens": 10},
+        "gz-s3c": {"verify_exit": 0, "tokens": 10},
+        "gz-s3d": {"verify_exit": 0, "tokens": 10}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s3a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s3b", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s3a"},
+          {"type": "beads_close", "bead_id": "gz-s3b"},
+          {"type": "beads_update", "bead_id": "gz-s3c", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s3d", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s3c"},
+          {"type": "beads_close", "bead_id": "gz-s3d"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s3a", "tier": "sonnet"},
+          {"bead_id": "gz-s3b", "tier": "sonnet"},
+          {"bead_id": "gz-s3c", "tier": "sonnet"},
+          {"bead_id": "gz-s3d", "tier": "sonnet"}
+        ],
+        "closed": ["gz-s3a", "gz-s3b", "gz-s3c", "gz-s3d"],
+        "failed": [],
+        "stop_reason": "queue-empty"
+      }
+    },
+    {
+      "id": "S4-verify-pass-close",
+      "description": "Single bead, verify_exit=0. Mayor closes bead after verify pass. Loop stops queue-empty.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 5,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s4a", "title": "Verify pass test", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s4a": {"verify_exit": 0, "tokens": 50}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s4a", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s4a"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s4a", "tier": "sonnet"}
+        ],
+        "closed": ["gz-s4a"],
+        "failed": [],
+        "stop_reason": "queue-empty"
+      }
+    },
+    {
+      "id": "S5-verify-fail-left-open",
+      "description": "Single bead, verify_exit=1, always_return_beads=true. beads_ready always returns the bead so Mayor retries it. max_iterations=2 fires after 2 failed dispatches. Bead never closes.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 2,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "false",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s5a", "title": "Verify fail test", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s5a": {"verify_exit": 1, "tokens": 10}
+      },
+      "always_return_beads": true,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s5a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s5a", "status": "in_progress"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s5a", "tier": "sonnet"},
+          {"bead_id": "gz-s5a", "tier": "sonnet"}
+        ],
+        "closed": [],
+        "failed": ["gz-s5a", "gz-s5a"],
+        "stop_reason": "max-iterations"
+      }
+    },
+    {
+      "id": "S6-crashed-worker-recovery-blocked",
+      "description": "Single bead, worker dispatch raises an error. Mayor moves bead to recovery_blocked. No judge so reconcile returns wait. Governor fires next tick: recovery_blocked=1 >= max_workers=1, active=0 → capacity-exhausted.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 10,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s6a", "title": "Crashing task", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s6a": {"error": "worker exploded", "tokens": 0}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s6a", "status": "in_progress"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s6a", "tier": "sonnet"}
+        ],
+        "closed": [],
+        "failed": [],
+        "stop_reason": "capacity-exhausted-by-stuck-workers"
+      }
+    },
+    {
+      "id": "S7-crashed-worker-judge-kill",
+      "description": "max_workers=2: bead A crashes, bead B succeeds. Governor does NOT fire (recovery_blocked=1 < max_workers=2). Next tick reconcile detects A as 'crashed', judge='kill' frees the slot. Stop: queue-empty.",
+      "config": {
+        "max_workers": 2,
+        "max_iterations": 10,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s7a", "title": "Crash then kill", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"},
+        {"id": "gz-s7b", "title": "Succeeds normally", "priority": 2, "labels": ["tier:implement"], "body": "Task B", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s7a": {"error": "crash", "tokens": 0},
+        "gz-s7b": {"verify_exit": 0, "tokens": 10}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {
+        "gz-s7a": "kill"
+      },
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s7a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s7b", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-s7b"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s7a", "tier": "sonnet"},
+          {"bead_id": "gz-s7b", "tier": "sonnet"}
+        ],
+        "closed": ["gz-s7b"],
+        "failed": [],
+        "stop_reason": "queue-empty"
+      }
+    },
+    {
+      "id": "S8-crashed-judge-respawn-cap-hit",
+      "description": "Single bead, worker crashes → recovery_blocked. max_respawns=0. Reconcile detects 'crashed', judge='respawn', but respawn_count=0 >= max_respawns=0 so demoted to 'wait'. Bead stays blocked. Governor fires: capacity-exhausted.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 10,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 0,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s8a", "title": "Respawn cap task", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s8a": {"error": "crash", "tokens": 0}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {
+        "gz-s8a": "respawn"
+      },
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s8a", "status": "in_progress"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s8a", "tier": "sonnet"}
+        ],
+        "closed": [],
+        "failed": [],
+        "stop_reason": "capacity-exhausted-by-stuck-workers"
+      }
+    },
+    {
+      "id": "S9-stop-queue-empty",
+      "description": "No beads at all. Loop sees empty queue immediately and stops queue-empty. No events.",
+      "config": {
+        "max_workers": 2,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [],
+      "dep_chain": [],
+      "worker_outcomes": {},
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [],
+        "dispatch_calls_sorted": [],
+        "closed": [],
+        "failed": [],
+        "stop_reason": "queue-empty"
+      }
+    },
+    {
+      "id": "S10-stop-capacity-exhausted",
+      "description": "max_workers=2, 2 beads both crash in tick 1. recovery_blocked fills to 2 = max_workers. Governor fires on tick 2: capacity-exhausted-by-stuck-workers.",
+      "config": {
+        "max_workers": 2,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s10a", "title": "Crash A", "priority": 1, "labels": ["tier:implement"], "body": "A", "effort": "implement"},
+        {"id": "gz-s10b", "title": "Crash B", "priority": 2, "labels": ["tier:implement"], "body": "B", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s10a": {"error": "crash", "tokens": 0},
+        "gz-s10b": {"error": "crash", "tokens": 0}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s10a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s10b", "status": "in_progress"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s10a", "tier": "sonnet"},
+          {"bead_id": "gz-s10b", "tier": "sonnet"}
+        ],
+        "closed": [],
+        "failed": [],
+        "stop_reason": "capacity-exhausted-by-stuck-workers"
+      }
+    },
+    {
+      "id": "S11-stop-max-iterations",
+      "description": "max_iterations=1, always_return_beads=true, verify_exit=1. After 1 iteration with failed verify, governor fires max-iterations on tick 2. The one verify-fail adds gz-s11a to the failed list.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 1,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "false",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-s11a", "title": "Max iter test", "priority": 1, "labels": ["tier:implement"], "body": "A", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-s11a": {"verify_exit": 1, "tokens": 10}
+      },
+      "always_return_beads": true,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-s11a", "status": "in_progress"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-s11a", "tier": "sonnet"}
+        ],
+        "closed": [],
+        "failed": ["gz-s11a"],
+        "stop_reason": "max-iterations"
+      }
+    }
+  ]
+}

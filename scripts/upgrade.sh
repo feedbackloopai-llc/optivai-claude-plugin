@@ -91,6 +91,8 @@ REPO_HOOKS_DIR="$REPO_DIR/scripts/hooks"
 if [ -d "$REPO_HOOKS_DIR" ] && [ -d "$HOOKS_DIR" ]; then
     # Core hooks with beads integration
     cp "$REPO_HOOKS_DIR/pre-tool-use.py" "$HOOKS_DIR/"
+    cp "$REPO_HOOKS_DIR/dispatch_gate.py" "$HOOKS_DIR/"   # imported by pre-tool-use.py (subagent dispatch gate)
+    cp "$REPO_DIR/scripts/loop-statusline.py" "$CLAUDE_DIR/"   # OBS3 loop statusline (reads ~/.claude/loop-state.json)
     cp "$REPO_HOOKS_DIR/user-prompt-submit.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/beads_writer.py" "$HOOKS_DIR/"
 
@@ -100,7 +102,7 @@ if [ -d "$REPO_HOOKS_DIR" ] && [ -d "$HOOKS_DIR" ]; then
     cp "$REPO_HOOKS_DIR/redact_secrets.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/subagent_context.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/context_primer.py" "$HOOKS_DIR/"
-    cp "$REPO_HOOKS_DIR/pg_sync.py" "$HOOKS_DIR/"
+    cp "$REPO_DIR/scripts/pg_sync.py" "$HOOKS_DIR/"   # pg_sync.py lives in scripts/, not scripts/hooks/
     cp "$REPO_HOOKS_DIR/stop-hook.sh" "$HOOKS_DIR/"
     chmod +x "$HOOKS_DIR/stop-hook.sh"
 

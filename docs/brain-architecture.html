@@ -1,0 +1,1487 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="description" content="Open Brain v0.2.0 — Neurosymbolic Memory. Architecture explainer for the memory subsystem of the OptivAI Pi + Claude Code coding-agent plugins." />
+<title>Open Brain v0.2.0 — Neurosymbolic Memory</title>
+<style>
+  /* ---------- Tokens ---------- */
+  :root {
+    --bg:        #0a0e1a;
+    --bg-soft:   #0f1424;
+    --bg-card:   #121828;
+    --bg-card-2: #161d31;
+    --line:      #1f273d;
+    --line-2:    #2a334d;
+    --text:      #e8eaf0;
+    --text-soft: #aab1c6;
+    --text-mute: #6e7794;
+    --cyan:      #00d4ff;
+    --cyan-dim:  #0091b3;
+    --pink:      #ff007a;
+    --pink-dim:  #b3005a;
+    --amber:     #ffb547;
+    --green:     #5bd6a4;
+    --red:       #ff5b6e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  }
+  [data-theme="light"] {
+    --bg:        #f7f8fb;
+    --bg-soft:   #ffffff;
+    --bg-card:   #ffffff;
+    --bg-card-2: #f0f3f9;
+    --line:      #dde2ec;
+    --line-2:    #c5cdde;
+    --text:      #0a0e1a;
+    --text-soft: #3b4256;
+    --text-mute: #6e7794;
+    --cyan:      #0080a0;
+    --cyan-dim:  #00b8e0;
+    --pink:      #d40066;
+    --pink-dim:  #ff66a8;
+  }
+
+  /* ---------- Reset / Base ---------- */
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    font-size:16px;
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+    overflow-x:hidden;
+  }
+  /* Grain overlay — adds texture without imagery */
+  body::before{
+    content:"";
+    position:fixed; inset:0;
+    pointer-events:none;
+    z-index:1;
+    opacity:.035;
+    background-image:
+      radial-gradient(circle at 25% 30%, rgba(255,255,255,.4) 1px, transparent 1px),
+      radial-gradient(circle at 75% 70%, rgba(255,255,255,.3) 1px, transparent 1px),
+      radial-gradient(circle at 50% 50%, rgba(255,255,255,.2) 1px, transparent 1px);
+    background-size: 3px 3px, 5px 5px, 7px 7px;
+    mix-blend-mode:overlay;
+  }
+  /* Ambient glow */
+  body::after{
+    content:"";
+    position:fixed; inset:0;
+    pointer-events:none;
+    z-index:0;
+    background:
+      radial-gradient(ellipse 50% 40% at 15% 12%, rgba(0,212,255,.08), transparent 70%),
+      radial-gradient(ellipse 40% 35% at 85% 5%, rgba(255,0,122,.06), transparent 70%);
+  }
+  [data-theme="light"] body::after{
+    background:
+      radial-gradient(ellipse 50% 40% at 15% 12%, rgba(0,128,160,.06), transparent 70%),
+      radial-gradient(ellipse 40% 35% at 85% 5%, rgba(212,0,102,.04), transparent 70%);
+  }
+  main, header, footer { position:relative; z-index:2; }
+
+  a{color:var(--cyan);text-decoration:none;border-bottom:1px solid transparent;transition:border-color .2s}
+  a:hover{border-bottom-color:var(--cyan)}
+  hr{border:none;border-top:1px solid var(--line);margin:4rem 0}
+
+  /* ---------- Top nav ---------- */
+  header.topnav{
+    position:sticky; top:0; z-index:100;
+    backdrop-filter: blur(12px) saturate(1.2);
+    -webkit-backdrop-filter: blur(12px) saturate(1.2);
+    background:color-mix(in oklab, var(--bg) 78%, transparent);
+    border-bottom:1px solid var(--line);
+  }
+  .topnav .row{
+    max-width:1100px;margin:0 auto;
+    padding:.9rem 1.5rem;
+    display:flex;align-items:center;gap:1.25rem;
+  }
+  .brand{
+    font-family:var(--mono);font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--text-soft);
+    display:flex;align-items:center;gap:.6rem;
+  }
+  .brand .dot{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 12px var(--cyan)}
+  .brand strong{color:var(--text);font-weight:600;letter-spacing:.05em}
+  .nav-links{margin-left:auto;display:flex;gap:1.25rem;align-items:center}
+  .nav-links a{
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--text-mute);border:none;
+  }
+  .nav-links a:hover{color:var(--text)}
+  .theme-toggle{
+    background:transparent;border:1px solid var(--line-2);color:var(--text-soft);
+    font-family:var(--mono);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;
+    padding:.4rem .7rem;border-radius:6px;cursor:pointer;
+    transition:border-color .2s,color .2s;
+  }
+  .theme-toggle:hover{border-color:var(--cyan);color:var(--cyan)}
+
+  /* ---------- Container ---------- */
+  .wrap{max-width:1100px;margin:0 auto;padding:0 1.5rem}
+  section{padding:5rem 0;position:relative}
+  section + section{border-top:1px solid var(--line)}
+
+  /* ---------- Typography ---------- */
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:.72rem;
+    letter-spacing:.18em;
+    text-transform:uppercase;
+    color:var(--cyan);
+    margin-bottom:1.25rem;
+    display:inline-flex;align-items:center;gap:.6rem;
+  }
+  .eyebrow::before{
+    content:""; width:24px;height:1px;background:var(--cyan);
+  }
+  h1,h2,h3{font-weight:600;letter-spacing:-.015em;line-height:1.15;margin:0}
+  h1{
+    font-family:var(--sans);
+    font-size:clamp(2.4rem, 5.5vw, 4.2rem);
+    font-weight:600;
+    letter-spacing:-.035em;
+    line-height:1.05;
+  }
+  h1 .accent{
+    background:linear-gradient(110deg, var(--cyan) 30%, var(--pink) 90%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+    font-style:italic;font-weight:500;
+  }
+  h2{font-size:clamp(1.7rem, 3vw, 2.4rem);margin-bottom:1.5rem}
+  h3{font-size:1.2rem;margin-bottom:.75rem;color:var(--text)}
+  p{margin:0 0 1rem;color:var(--text-soft);max-width:68ch}
+  p.lead{font-size:1.15rem;color:var(--text);max-width:60ch}
+  p.dim{color:var(--text-mute);font-size:.95rem}
+  strong{color:var(--text);font-weight:600}
+  code, kbd{
+    font-family:var(--mono);
+    font-size:.88em;
+    background:var(--bg-card);
+    padding:.12em .4em;
+    border-radius:4px;
+    border:1px solid var(--line);
+    color:var(--text);
+  }
+
+  /* ---------- Hero ---------- */
+  .hero{padding:7rem 0 5rem;position:relative}
+  .hero .tag{
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--text-mute);margin-bottom:1.5rem;
+    display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;
+  }
+  .hero .tag .chip{
+    padding:.25rem .55rem;border:1px solid var(--line-2);border-radius:4px;color:var(--text-soft);
+  }
+  .hero .tag .chip.live{border-color:var(--cyan);color:var(--cyan)}
+  .hero-tagline{
+    font-family:var(--serif);
+    font-style:italic;
+    font-size:clamp(1.1rem, 2vw, 1.4rem);
+    color:var(--text-soft);
+    margin-top:1.5rem;
+    max-width:50ch;
+    line-height:1.5;
+  }
+  .hero-sub{margin-top:1.5rem;max-width:60ch;color:var(--text-mute)}
+  .hero-meta{
+    margin-top:3rem;
+    display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;
+    border-top:1px solid var(--line);padding-top:2rem;
+  }
+  .hero-meta .cell{
+    font-family:var(--mono);
+    font-size:.75rem;
+  }
+  .hero-meta .k{color:var(--text-mute);text-transform:uppercase;letter-spacing:.12em;margin-bottom:.4rem;font-size:.65rem}
+  .hero-meta .v{color:var(--text);font-size:1rem}
+  @media (max-width:680px){
+    .hero-meta{grid-template-columns:repeat(2,1fr)}
+  }
+
+  /* ---------- Cards / common ---------- */
+  .card{
+    background:var(--bg-card);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:1.5rem;
+    transition:border-color .25s, transform .25s;
+  }
+  .card:hover{border-color:var(--line-2)}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem}
+  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:1.25rem}
+  @media (max-width:780px){
+    .grid-2,.grid-3{grid-template-columns:1fr}
+  }
+
+  /* ---------- "Before" list ---------- */
+  .missing{
+    list-style:none;padding:0;margin:1.5rem 0 0;
+    display:grid;gap:.6rem;
+  }
+  .missing li{
+    display:flex;align-items:flex-start;gap:1rem;
+    padding:.9rem 1.1rem;
+    background:var(--bg-card);
+    border:1px solid var(--line);
+    border-radius:8px;
+    font-size:.96rem;
+  }
+  .missing li .x{
+    color:var(--red);font-family:var(--mono);font-size:.9rem;
+    flex-shrink:0;margin-top:.05em;
+  }
+  .missing li code{background:transparent;border:none;padding:0;color:var(--cyan)}
+
+  /* ---------- Primitives table ---------- */
+  .primitives{
+    margin-top:2rem;
+    border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;
+    background:var(--bg-card);
+  }
+  .primitives .row{
+    display:grid;grid-template-columns:120px 1fr 1fr;gap:1rem;
+    padding:1.1rem 1.25rem;
+    border-bottom:1px solid var(--line);
+    align-items:flex-start;
+  }
+  .primitives .row:last-child{border-bottom:none}
+  .primitives .row.h{
+    background:var(--bg-card-2);
+    font-family:var(--mono);font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--text-mute);
+  }
+  .primitives .row.h > *{padding:0}
+  .prim-name{
+    font-family:var(--mono);
+    font-size:1.05rem;
+    color:var(--text);
+    font-weight:600;
+  }
+  .prim-name .sub{display:block;font-size:.7rem;color:var(--text-mute);letter-spacing:.1em;text-transform:uppercase;margin-top:.2rem;font-weight:400}
+  .prim-name.wa  { color:var(--cyan) }
+  .prim-name.pv  { color:#7fe5ff }
+  .prim-name.ps  { color:var(--amber) }
+  .prim-name.rb  { color:#c9a4ff }
+  .prim-name.vfe { color:var(--pink) }
+  .primitives .row p{margin:0;font-size:.93rem}
+  .primitives code{font-size:.78rem;background:var(--bg-soft);border-color:var(--line-2)}
+  @media (max-width:780px){
+    .primitives .row{grid-template-columns:1fr;gap:.4rem}
+    .primitives .row.h{display:none}
+  }
+
+  /* ---------- Dependency chain diagram ---------- */
+  .depchain-wrap{margin:2.5rem 0 1rem; padding:2rem 1rem; background:var(--bg-card); border:1px solid var(--line); border-radius:12px; overflow:hidden}
+  .depchain svg{display:block;width:100%;height:auto;max-width:980px;margin:0 auto}
+  .depchain text{font-family:var(--mono);fill:var(--text)}
+  .depchain .label{fill:var(--text);font-size:14px;font-weight:600;letter-spacing:.04em}
+  .depchain .sublabel{fill:var(--text-mute);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+  .depchain .caption{fill:var(--text-soft);font-size:11px;font-family:var(--sans)}
+  .depchain .node-box{stroke-width:1.5}
+  .depchain .arrow{stroke:var(--cyan);stroke-width:1.6;fill:none;stroke-linecap:round;stroke-dasharray:600;stroke-dashoffset:600;animation:none}
+  .depchain.visible .arrow{animation:draw 1.4s ease-out forwards}
+  .depchain.visible .arrow.a2{animation-delay:.25s}
+  .depchain.visible .arrow.a3{animation-delay:.5s}
+  .depchain.visible .node-box{animation:pulseIn .6s ease-out both}
+  .depchain.visible .node-box.n2{animation-delay:.3s}
+  .depchain.visible .node-box.n3{animation-delay:.6s}
+  .depchain.visible .node-box.n4{animation-delay:.9s}
+  @keyframes draw {to{stroke-dashoffset:0}}
+  @keyframes pulseIn{
+    0%{transform:scale(.92);opacity:0}
+    60%{transform:scale(1.02);opacity:1}
+    100%{transform:scale(1);opacity:1}
+  }
+  .depchain-caption{
+    text-align:center;color:var(--text-mute);font-size:.85rem;font-family:var(--mono);
+    margin-top:.5rem;
+  }
+  .depchain-caption .strong{color:var(--text)}
+
+  /* ---------- Schema diagram ---------- */
+  .schema-wrap{margin:2rem 0;padding:1.5rem;background:var(--bg-card);border:1px solid var(--line);border-radius:12px;position:relative;overflow:visible}
+  .schema svg{display:block;width:100%;height:auto;max-width:1000px;margin:0 auto}
+  .schema text{font-family:var(--mono);fill:var(--text)}
+  .schema .tbl-title{font-size:14px;font-weight:700;letter-spacing:.03em}
+  .schema .tbl-sub{font-size:9.5px;fill:var(--text-mute);letter-spacing:.1em;text-transform:uppercase}
+  .schema .tbl-rect{stroke:var(--line-2);stroke-width:1.5;fill:var(--bg-card-2);cursor:pointer;transition:stroke .25s,fill .25s}
+  .schema .tbl-rect:hover, .schema .tbl-group.active .tbl-rect{stroke:var(--cyan);fill:#192038}
+  .schema .tbl-hero .tbl-rect{stroke:var(--pink);stroke-width:2}
+  .schema .tbl-hero .tbl-rect:hover{stroke:var(--pink)}
+  .schema .fk{stroke:var(--cyan-dim);stroke-width:1.5;fill:none;stroke-dasharray:4 4}
+  .schema .fk-label{font-size:9px;fill:var(--text-mute);letter-spacing:.05em}
+  .schema .pii-tag{font-size:8px;fill:var(--amber)}
+  /* Tooltip */
+  .schema-tooltip{
+    position:absolute;
+    pointer-events:none;
+    background:var(--bg-soft);
+    border:1px solid var(--cyan);
+    border-radius:8px;
+    padding:.9rem 1rem;
+    font-family:var(--mono);
+    font-size:.78rem;
+    color:var(--text);
+    max-width:280px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.6), 0 0 0 1px rgba(0,212,255,.15);
+    opacity:0;
+    transform:translate(-50%, -100%) translateY(-12px);
+    transition:opacity .15s;
+    z-index:50;
+    line-height:1.5;
+  }
+  .schema-tooltip.show{opacity:1}
+  .schema-tooltip .ttl{color:var(--cyan);font-weight:700;margin-bottom:.5rem;font-size:.82rem}
+  .schema-tooltip .col{color:var(--text-soft);font-size:.72rem}
+  .schema-tooltip .col em{color:var(--amber);font-style:normal}
+  .schema-tooltip .mig{color:var(--text-mute);font-size:.68rem;margin-top:.55rem;padding-top:.5rem;border-top:1px solid var(--line)}
+
+  /* ---------- Donut chart ---------- */
+  .donut-wrap{
+    display:grid;
+    grid-template-columns: 280px 1fr;
+    gap:2.5rem;
+    align-items:center;
+    margin-top:2rem;
+    background:var(--bg-card);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:2rem;
+  }
+  @media (max-width:700px){
+    .donut-wrap{grid-template-columns:1fr;text-align:center}
+  }
+  .donut-svg{position:relative;width:280px;height:280px;justify-self:center}
+  .donut-svg svg{transform:rotate(-90deg)}
+  .donut-bg{fill:none;stroke:var(--line);stroke-width:18}
+  .donut-fill{
+    fill:none;
+    stroke:url(#donutGrad);
+    stroke-width:18;
+    stroke-linecap:round;
+    stroke-dasharray:0 1000;
+    transition:stroke-dasharray 2.5s cubic-bezier(.2,.7,.1,1);
+  }
+  .donut-svg.animate .donut-fill{stroke-dasharray:var(--fill,754) 1000}
+  .donut-leak{
+    fill:none;stroke:var(--pink);stroke-width:18;
+    stroke-dasharray:0.2 1000;
+    transform-origin:center;
+  }
+  .donut-center{
+    position:absolute; inset:0;
+    display:flex;flex-direction:column;
+    align-items:center;justify-content:center;
+    pointer-events:none;
+  }
+  .donut-pct{
+    font-family:var(--mono);
+    font-size:2.3rem;
+    font-weight:600;
+    color:var(--cyan);
+    letter-spacing:-.02em;
+    line-height:1;
+  }
+  .donut-label{
+    font-family:var(--mono);font-size:.65rem;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--text-mute);margin-top:.5rem;
+  }
+  .math-stack{font-family:var(--mono);font-size:.85rem}
+  .math-stack .ln{display:block;color:var(--text-soft);margin-bottom:.3rem}
+  .math-stack .out{color:var(--cyan);padding-left:1rem;border-left:2px solid var(--cyan);margin:.2rem 0 .7rem}
+  .math-stack .out.dim{color:var(--amber);border-left-color:var(--amber)}
+
+  /* ---------- Delete-after-verify animated sequence ---------- */
+  .dav-wrap{
+    margin:2rem 0;
+    background:var(--bg-card);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:2rem 1.5rem;
+    overflow:hidden;
+  }
+  .dav{
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:1rem;
+    position:relative;
+  }
+  @media (max-width:780px){.dav{grid-template-columns:1fr 1fr}}
+  @media (max-width:480px){.dav{grid-template-columns:1fr}}
+  .dav-step{
+    background:var(--bg-card-2);
+    border:1px solid var(--line-2);
+    border-radius:10px;
+    padding:1.25rem;
+    position:relative;
+    transition:border-color .35s, box-shadow .35s, transform .35s;
+  }
+  .dav-step.active{
+    border-color:var(--cyan);
+    box-shadow:0 0 0 1px var(--cyan), 0 0 32px rgba(0,212,255,.15);
+    transform:translateY(-3px);
+  }
+  .dav-step .n{
+    font-family:var(--mono);font-size:.7rem;letter-spacing:.18em;
+    color:var(--text-mute);margin-bottom:.6rem;
+  }
+  .dav-step.active .n{color:var(--cyan)}
+  .dav-step h4{
+    margin:0 0 .5rem;font-size:1rem;font-weight:600;color:var(--text);
+    font-family:var(--mono);
+  }
+  .dav-step p{margin:0;font-size:.83rem;color:var(--text-soft)}
+  .dav-step .ico{
+    width:32px;height:32px;border-radius:8px;
+    background:var(--bg-soft);
+    display:grid;place-items:center;
+    margin-bottom:.85rem;
+    border:1px solid var(--line);
+  }
+  .dav-step.active .ico{background:var(--bg);border-color:var(--cyan)}
+  .dav-step .ico svg{width:18px;height:18px;stroke:var(--text-soft);fill:none;stroke-width:1.6}
+  .dav-step.active .ico svg{stroke:var(--cyan)}
+  .dav-step.step4 .ico svg{stroke:var(--green)}
+  .dav-step.step4.active .ico svg{stroke:var(--green)}
+
+  /* ---------- Topology / local-cloud ---------- */
+  .topo{
+    margin-top:2rem;
+    display:grid;
+    grid-template-columns: 1fr 80px 1fr;
+    gap:1rem;
+    background:var(--bg-card);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:2rem;
+    align-items:stretch;
+  }
+  @media (max-width:780px){.topo{grid-template-columns:1fr;gap:1.5rem}}
+  .topo-col h3{
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--text-mute);margin-bottom:1rem;
+  }
+  .topo-col.local h3{color:var(--cyan)}
+  .topo-col.cloud h3{color:var(--pink)}
+  .topo-col .row{
+    font-family:var(--mono);font-size:.82rem;color:var(--text-soft);
+    padding:.5rem 0;
+    border-bottom:1px dashed var(--line);
+  }
+  .topo-col .row:last-child{border-bottom:none}
+  .topo-col .row span.note{color:var(--text-mute);font-size:.7rem;display:block;margin-top:.2rem}
+  .topo-mid{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem}
+  .topo-mid svg{width:60px;height:60px}
+  .topo-mid .label{font-family:var(--mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-mute);text-align:center;line-height:1.5}
+  @media (max-width:780px){
+    .topo-mid{flex-direction:row}
+    .topo-mid svg{transform:rotate(90deg)}
+  }
+  .callout{
+    margin-top:1.5rem;
+    border-left:3px solid var(--pink);
+    padding:1rem 1.25rem;
+    background:linear-gradient(90deg, rgba(255,0,122,.07), transparent 60%);
+    font-size:.95rem;
+    color:var(--text);
+    border-radius:0 6px 6px 0;
+  }
+  .callout strong{color:var(--pink)}
+
+  /* ---------- Surface parity table ---------- */
+  .parity{
+    margin-top:2rem;
+    border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;
+    background:var(--bg-card);
+  }
+  .parity .row{
+    display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:1rem;
+    padding:.85rem 1.25rem;
+    border-bottom:1px solid var(--line);
+    align-items:center;
+    font-size:.92rem;
+  }
+  .parity .row:last-child{border-bottom:none}
+  .parity .row.h{
+    background:var(--bg-card-2);
+    font-family:var(--mono);font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--text-mute);
+  }
+  .parity .row code{font-size:.78rem;background:var(--bg-soft);border-color:var(--line-2)}
+  .parity .row.h code{background:transparent;border:none;padding:0;color:var(--text-mute);font-size:.68rem}
+  @media (max-width:780px){
+    .parity .row{grid-template-columns:1fr;gap:.3rem}
+    .parity .row.h{display:none}
+    .parity .row{padding:1rem 1.25rem}
+  }
+
+  /* ---------- Code blocks ---------- */
+  pre.code{
+    font-family:var(--mono);font-size:.82rem;
+    background:var(--bg-soft);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:1rem 1.25rem;
+    overflow-x:auto;
+    margin:1.25rem 0;
+    color:var(--text);
+    line-height:1.7;
+  }
+  pre.code .kw{color:var(--pink)}
+  pre.code .str{color:var(--green)}
+  pre.code .num{color:var(--amber)}
+  pre.code .cmt{color:var(--text-mute);font-style:italic}
+  pre.code .fn{color:var(--cyan)}
+  pre.code .out{color:var(--text-mute)}
+
+  /* ---------- Magic moments ---------- */
+  .magic-card{
+    background:var(--bg-card);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:1.5rem;
+    position:relative;
+    overflow:hidden;
+    transition:border-color .3s, transform .3s;
+  }
+  .magic-card:hover{border-color:var(--cyan);transform:translateY(-2px)}
+  .magic-card::before{
+    content:"";position:absolute;left:0;top:0;width:3px;height:100%;
+    background:var(--accent, var(--cyan));
+  }
+  .magic-card[data-color="pink"]{--accent:var(--pink)}
+  .magic-card[data-color="amber"]{--accent:var(--amber)}
+  .magic-card h3{
+    font-family:var(--mono);font-size:.95rem;letter-spacing:.04em;
+    display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  }
+  .magic-card h3 .cmd{
+    font-size:.7rem;color:var(--accent,var(--cyan));font-weight:400;
+    background:var(--bg-soft);padding:.2rem .5rem;border-radius:4px;border:1px solid var(--line-2);
+  }
+  .magic-card p{font-size:.93rem;margin:0}
+
+  /* ---------- Reveal-on-scroll ---------- */
+  .reveal{opacity:0;transform:translateY(24px);transition:opacity .8s ease,transform .8s ease}
+  .reveal.visible{opacity:1;transform:none}
+
+  /* ---------- Footer ---------- */
+  footer{
+    padding:4rem 0 6rem;
+    border-top:1px solid var(--line);
+    color:var(--text-mute);
+    font-size:.9rem;
+  }
+  footer .grid-2{align-items:flex-start;gap:3rem}
+  footer h3{
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--text-soft);margin-bottom:1rem;
+  }
+  footer ul{list-style:none;padding:0;margin:0}
+  footer li{padding:.3rem 0;color:var(--text-soft)}
+  footer .sig{
+    margin-top:3rem;padding-top:2rem;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.1em;color:var(--text-mute);
+    display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;
+  }
+
+  /* Reduce motion respect */
+  @media (prefers-reduced-motion: reduce){
+    *{animation:none !important;transition:none !important}
+    .reveal{opacity:1;transform:none}
+  }
+
+  /* Selection */
+  ::selection{background:var(--cyan);color:var(--bg)}
+
+  /* ────── Executive summary section ────── */
+  .summary-points{
+    list-style:none; padding:0; margin:1.5rem 0 2rem;
+    display:grid; gap:1rem;
+  }
+  .summary-points > li{
+    display:grid; grid-template-columns:48px 1fr; gap:1.2rem;
+    background:var(--bg-card); border:1px solid var(--line);
+    border-radius:10px; padding:1.1rem 1.2rem;
+    transition:border-color .25s ease, transform .25s ease;
+  }
+  .summary-points > li:hover{
+    border-color:color-mix(in oklab, var(--cyan) 35%, var(--line));
+    transform:translateY(-1px);
+  }
+  .summary-points .num{
+    width:36px; height:36px; display:flex; align-items:center; justify-content:center;
+    border-radius:8px;
+    background:linear-gradient(135deg, color-mix(in oklab, var(--cyan) 18%, transparent), color-mix(in oklab, var(--pink) 18%, transparent));
+    border:1px solid color-mix(in oklab, var(--cyan) 30%, var(--line));
+    font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size:.9rem; color:var(--cyan); font-weight:600;
+  }
+  .summary-points h3{margin:0 0 .35rem; font-size:1.05rem; color:var(--text); font-weight:600}
+  .summary-points p{margin:.3rem 0; color:var(--text-soft); font-size:.93rem; line-height:1.55}
+  .summary-points strong{color:var(--text); font-weight:600}
+  .summary-points code{
+    background:var(--bg-soft); border:1px solid var(--line-2);
+    padding:1px 6px; border-radius:4px; font-size:.85em; color:var(--cyan);
+  }
+
+  .cognitive-mapping{
+    width:100%; border-collapse:collapse; margin:1rem 0 1.5rem;
+    background:var(--bg-card); border:1px solid var(--line); border-radius:8px; overflow:hidden;
+  }
+  .cognitive-mapping th, .cognitive-mapping td{
+    text-align:left; padding:.7rem 1rem; border-bottom:1px solid var(--line);
+    font-size:.92rem;
+  }
+  .cognitive-mapping th{
+    background:var(--bg-card-2); color:var(--text-soft);
+    font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size:.75rem; text-transform:uppercase; letter-spacing:.05em;
+    font-weight:500;
+  }
+  .cognitive-mapping tr:last-child td{border-bottom:none}
+  .cognitive-mapping td:first-child{
+    font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+    color:var(--cyan); font-weight:500; white-space:nowrap;
+  }
+
+  .summary-coda{
+    display:grid; grid-template-columns:1fr 1fr; gap:1.2rem; margin-top:1.5rem;
+  }
+  @media (max-width:760px){.summary-coda{grid-template-columns:1fr}}
+  .summary-coda > div{
+    background:var(--bg-card); border:1px solid var(--line);
+    border-radius:10px; padding:1.2rem 1.3rem;
+  }
+  .summary-coda h3{margin:0 0 .6rem; font-size:1rem}
+  .summary-coda h3.notice{color:var(--cyan)}
+  .summary-coda h3.notnot{color:var(--pink)}
+  .summary-coda ul{margin:.5rem 0 0; padding-left:1.1rem; color:var(--text-soft); font-size:.92rem; line-height:1.6}
+  .summary-coda code{
+    background:var(--bg-soft); border:1px solid var(--line-2);
+    padding:1px 5px; border-radius:4px; font-size:.85em; color:var(--cyan);
+  }
+</style>
+</head>
+<body>
+
+<!-- ============== TOP NAV ============== -->
+<header class="topnav">
+  <div class="row">
+    <div class="brand"><span class="dot"></span> <span>OPEN BRAIN <strong>v0.2.0</strong></span></div>
+    <nav class="nav-links">
+      <a href="#summary">Summary</a>
+      <a href="#primitives">Primitives</a>
+      <a href="#schema">Schema</a>
+      <a href="#magic">Magic</a>
+      <a href="#guarantee">Guarantee</a>
+      <a href="#topology">Topology</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">Light</button>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<!-- ============== HERO ============== -->
+<section class="hero">
+  <div class="wrap">
+    <div class="tag reveal">
+      <span class="chip live">v0.2.0-neurosymbolic</span>
+      <span class="chip">39 brain beads closed</span>
+      <span class="chip">2026-05-22</span>
+    </div>
+    <h1 class="reveal">Open Brain <span class="accent">/ Neurosymbolic Memory</span></h1>
+    <p class="hero-tagline reveal">Five MS_ε primitives. Three magic moments. One private brain per user, in your own Neon cloud.</p>
+    <p class="hero-sub reveal">An architecture explainer for the memory subsystem of the OptivAI Pi + Claude Code coding-agent plugins.</p>
+
+    <div class="hero-meta reveal">
+      <div class="cell"><div class="k">Substrate</div><div class="v">PostgreSQL + pgvector</div></div>
+      <div class="cell"><div class="k">Forget bound</div><div class="v">99.9999793%</div></div>
+      <div class="cell"><div class="k">Sovereignty</div><div class="v">MS_ε (Lin 2026)</div></div>
+      <div class="cell"><div class="k">Tables</div><div class="v">5 / per-user</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== EXECUTIVE SUMMARY ============== -->
+<section id="summary">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Executive summary</div>
+      <h2>What problem does this actually solve?</h2>
+      <p class="lead">
+        Vector RAG (what we had) treats memory as a search problem — find similar things. That's powerful but flat: it answers exactly one question. Six concrete things you couldn't do before and can now.
+      </p>
+    </div>
+
+    <ol class="summary-points reveal">
+      <li>
+        <div class="num">1</div>
+        <div>
+          <h3>"Where did this thought come from?"</h3>
+          <p><strong>Before:</strong> a thought said "decided to go with Y because of X" — but you couldn't see the prior thought X that triggered it. Each capture was isolated. The brain was a bag of facts with no causal links.</p>
+          <p><strong>Now:</strong> every capture stamps <code>wasDerivedFrom</code>. <code>/brain-trace &lt;id&gt;</code> walks back to the original ancestor. You can see how a conclusion was built.</p>
+        </div>
+      </li>
+      <li>
+        <div class="num">2</div>
+        <div>
+          <h3>"What did this look like before?"</h3>
+          <p><strong>Before:</strong> if you updated a thought (or auto-capture rewrote one), the old version was gone. No history.</p>
+          <p><strong>Now:</strong> <code>/brain-inspect &lt;id&gt; --at-revision 1</code> returns the original state. <code>/brain-inspect &lt;id&gt; --at 2026-04-15T12:00:00Z</code> returns whatever was there on April 15. Revisions never get rewritten — even after a rollback creates a new revision, the originals stay queryable forever.</p>
+        </div>
+      </li>
+      <li>
+        <div class="num">3</div>
+        <div>
+          <h3>Actually forget something and prove it.</h3>
+          <p><strong>Before:</strong> <code>DELETE FROM brain.thoughts WHERE thought_id = X</code> removes the row, but: are there embedding neighbors that still surface it? Did metadata cross-reference it? If someone audits this later, what's your evidence the data is gone?</p>
+          <p><strong>Now:</strong> <code>/brain-forget</code> runs 300 probes against the post-delete store, accepts only if k=0 surface, records dual-bound confidence (99.9999793% exact binomial) in an audit row. If any probe leaks, it restores from snapshot. Provable forget.</p>
+        </div>
+      </li>
+      <li>
+        <div class="num">4</div>
+        <div>
+          <h3>Tell the brain "this thought matters more than its similarity score suggests."</h3>
+          <p><strong>Before:</strong> ranking was purely cosine + keyword + recency. There was no way to say "this turned out to be important." The brain didn't learn from feedback.</p>
+          <p><strong>Now:</strong> <code>/brain-promote</code> adds a Hebbian weight (time-decayed <code>(1 + days_since)^-0.7</code>). Boost is gated by a within-kind relevance floor so a heavily-promoted-but-irrelevant thought can't outrank a relevant unpromoted one. The brain gets smarter about what to surface.</p>
+        </div>
+      </li>
+      <li>
+        <div class="num">5</div>
+        <div>
+          <h3>Debug "why did the agent retrieve THAT thought before deciding?"</h3>
+          <p><strong>Before:</strong> nothing. Black box.</p>
+          <p><strong>Now:</strong> <code>brain.replay_log</code> records every brain op with PII-redacted query + result + OTel trace correlation. <code>/brain-replay --session-id X</code> shows you the exact retrieval that triggered the agent's choice.</p>
+        </div>
+      </li>
+      <li>
+        <div class="num">6</div>
+        <div>
+          <h3>Run this on a partner's machine without bleeding contexts.</h3>
+          <p><strong>Before:</strong> <code>$USER</code> env var was the entire isolation story. Anyone could <code>export USER=alice</code> and read alice's brain.</p>
+          <p><strong>Now:</strong> Principal Scoping (PS) enforced at every read/write/forget/promote entry point. Cross-user attempts raise <code>RuntimeError</code>, not silent empty-list. Tested via 25+ multi-tenant isolation tests. (Still per-user-Neon at the deployment layer — but the substrate is multi-tenant-safe if you ever want to revisit that.)</p>
+        </div>
+      </li>
+    </ol>
+
+    <div class="reveal">
+      <h3 style="margin-top:2rem">The deeper difference</h3>
+      <p style="color:var(--text-soft); line-height:1.65">
+        Vector RAG treats memory as a search problem: "find similar things." That's powerful but flat. What v0.2.0 adds is the ability to <strong>reason ABOUT the memory, not just retrieve FROM it.</strong> Each primitive maps to a cognitive function:
+      </p>
+      <table class="cognitive-mapping">
+        <thead>
+          <tr>
+            <th>Primitive</th>
+            <th>What it answers</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>PV (provenance)</td><td>"Where did I learn this?"</td></tr>
+          <tr><td>RB (versioning)</td><td>"What did I used to think?"</td></tr>
+          <tr><td>VF_ε (verified forget)</td><td>"Stop bringing that up — and prove it's gone."</td></tr>
+          <tr><td>Hebbian (promote/demote)</td><td>"This is what matters."</td></tr>
+          <tr><td>Replay log</td><td>"How did I get here?"</td></tr>
+        </tbody>
+      </table>
+      <p style="color:var(--text-soft); line-height:1.65">
+        Vector RAG answers exactly one question: "what's similar to this query?" That's still the foundation — every primitive sits ON TOP of pgvector cosine. We didn't replace the search engine; we added context to what the search engine retrieves and what happens after.
+      </p>
+    </div>
+
+    <div class="summary-coda reveal">
+      <div>
+        <h3 class="notice">What you'll actually notice</h3>
+        <p style="color:var(--text-soft); font-size:.93rem; margin:.4rem 0">Most days: your existing <code>/brain-search</code> works the same, just with Hebbian-boosted ranking when you've promoted something. <code>/brain-capture</code> works the same, just stamping provenance silently. The new behavior surfaces when:</p>
+        <ul>
+          <li>You want to undo something you regret capturing → <code>/brain-forget</code></li>
+          <li>The agent does something weird and you want to know what it retrieved → <code>/brain-replay</code></li>
+          <li>A thought says "X but actually we decided Y later" → <code>/brain-trace</code> shows the chain; <code>/brain-inspect</code> shows what X was originally</li>
+          <li>You want to reinforce a pattern after the agent finally got it right → <code>/brain-promote</code></li>
+        </ul>
+      </div>
+      <div>
+        <h3 class="notnot">What it's NOT</h3>
+        <p style="color:var(--text-soft); font-size:.93rem; margin:.4rem 0">It's not a different brain. It's the same pgvector substrate with five new capabilities layered on. If you turned the new primitives off tomorrow, search would still work — you'd just lose the explainability + auditability + verified-forget guarantees.</p>
+        <p style="color:var(--text-soft); font-size:.93rem; margin:.6rem 0 0; padding-top:.6rem; border-top:1px solid var(--line)">
+          The honest one-liner: <strong style="color:var(--text)">vector RAG with operational rigor.</strong> Same intelligence, much more accountability.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== BEFORE ============== -->
+<section id="before">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">The "before"</div>
+      <h2>What v0.1.x couldn't do</h2>
+      <p class="lead">
+        v0.1.x was vector RAG with auto-extracted metadata — pgvector cosine search over thoughts captured by a Claude Haiku metadata extractor. It was effective for "find similar things." It was <em>structurally lossy</em> for everything else.
+      </p>
+    </div>
+    <ul class="missing reveal">
+      <li><span class="x">·/·</span><span>No way to ask <code>where did this thought come from?</code> — no provenance trail back to the originating agent, activity, or source URI.</span></li>
+      <li><span class="x">·/·</span><span>No way to ask <code>what did this thought look like last week?</code> — no versioned history; updates overwrote the row.</span></li>
+      <li><span class="x">·/·</span><span>No way to <em>verifiably</em> forget something — <code>DELETE</code> ran but nothing proved the embedding-space residue was gone.</span></li>
+      <li><span class="x">·/·</span><span>No way to tell the brain <em>this one matters more than its raw similarity score</em> — no Hebbian boost lane.</span></li>
+      <li><span class="x">·/·</span><span>No audit trail of brain operations — searches, captures, and forgets vanished into the ether.</span></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============== PRIMITIVES + DEPENDENCY CHAIN ============== -->
+<section id="primitives">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">MS_ε · five primitives</div>
+      <h2>Mnemonic sovereignty, from the paper to the substrate</h2>
+      <p class="lead">
+        From Lin / Li / Chen 2026, <em>Mnemonic Sovereignty in Language Model Memory Systems</em> (arXiv 2604.16548), §12.1. The framework defines memory as sovereign iff five properties hold simultaneously — and they have a <strong>dependency pre-order</strong>, which is not aesthetic. It is the engineering build order.
+      </p>
+    </div>
+
+    <!-- Dependency-chain diagram -->
+    <div class="depchain-wrap reveal" id="depChainWrap">
+      <div class="depchain" id="depChain">
+        <svg viewBox="0 0 960 240" xmlns="http://www.w3.org/2000/svg" aria-label="MS_ε dependency pre-order">
+          <defs>
+            <marker id="arrCyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#00d4ff"/>
+            </marker>
+            <linearGradient id="boxGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"  stop-color="#161d31"/>
+              <stop offset="100%" stop-color="#0f1424"/>
+            </linearGradient>
+          </defs>
+
+          <!-- header -->
+          <text x="480" y="32" text-anchor="middle" class="sublabel">Dependency pre-order · build it in this order</text>
+
+          <!-- Box 1: VF_ε -->
+          <g class="node n1">
+            <rect class="node-box n1" x="40" y="80" width="170" height="100" rx="8" fill="url(#boxGrad)" stroke="#ff007a"/>
+            <text x="125" y="115" text-anchor="middle" class="label" style="fill:#ff007a">VF_ε</text>
+            <text x="125" y="135" text-anchor="middle" class="sublabel">Verified Forgetting</text>
+            <text x="125" y="160" text-anchor="middle" class="caption">delete-after-verify</text>
+          </g>
+
+          <!-- arrow 1 -->
+          <path class="arrow a1" d="M210 130 Q 235 130 250 130" marker-end="url(#arrCyan)"/>
+          <text x="232" y="118" text-anchor="middle" class="sublabel" style="fill:#00d4ff">requires</text>
+
+          <!-- Box 2: RB -->
+          <g class="node n2">
+            <rect class="node-box n2" x="265" y="80" width="170" height="100" rx="8" fill="url(#boxGrad)" stroke="#c9a4ff"/>
+            <text x="350" y="115" text-anchor="middle" class="label" style="fill:#c9a4ff">RB</text>
+            <text x="350" y="135" text-anchor="middle" class="sublabel">Rollbackability</text>
+            <text x="350" y="160" text-anchor="middle" class="caption">versioned history</text>
+          </g>
+
+          <!-- arrow 2 -->
+          <path class="arrow a2" d="M435 130 Q 460 130 475 130" marker-end="url(#arrCyan)"/>
+          <text x="457" y="118" text-anchor="middle" class="sublabel" style="fill:#00d4ff">requires</text>
+
+          <!-- Box 3: PV -->
+          <g class="node n3">
+            <rect class="node-box n3" x="490" y="80" width="170" height="100" rx="8" fill="url(#boxGrad)" stroke="#7fe5ff"/>
+            <text x="575" y="115" text-anchor="middle" class="label" style="fill:#7fe5ff">PV</text>
+            <text x="575" y="135" text-anchor="middle" class="sublabel">Provenance Visibility</text>
+            <text x="575" y="160" text-anchor="middle" class="caption">W3C PROV-DM 1.3</text>
+          </g>
+
+          <!-- arrow 3 -->
+          <path class="arrow a3" d="M660 130 Q 685 130 700 130" marker-end="url(#arrCyan)"/>
+          <text x="682" y="118" text-anchor="middle" class="sublabel" style="fill:#00d4ff">requires</text>
+
+          <!-- Box 4: WA -->
+          <g class="node n4">
+            <rect class="node-box n4" x="715" y="80" width="170" height="100" rx="8" fill="url(#boxGrad)" stroke="#00d4ff"/>
+            <text x="800" y="115" text-anchor="middle" class="label" style="fill:#00d4ff">WA</text>
+            <text x="800" y="135" text-anchor="middle" class="sublabel">Write Authorization</text>
+            <text x="800" y="160" text-anchor="middle" class="caption">auth + PII gate</text>
+          </g>
+
+          <!-- baseline pre-order legend -->
+          <text x="480" y="215" text-anchor="middle" class="caption">
+            <tspan style="fill:#ff007a">VF_ε</tspan>
+            <tspan dx="6">⪯</tspan>
+            <tspan dx="6" style="fill:#c9a4ff">RB</tspan>
+            <tspan dx="6">⪯</tspan>
+            <tspan dx="6" style="fill:#7fe5ff">PV</tspan>
+            <tspan dx="6">⪯</tspan>
+            <tspan dx="6" style="fill:#00d4ff">WA</tspan>
+          </text>
+        </svg>
+      </div>
+      <div class="depchain-caption">
+        Without <span class="strong">provenance</span> you can't rollback meaningfully. Without <span class="strong">rollback</span> you can't verify forgetting. The Wave-1 shipping order — PV, then RB, then VF_ε — was not a choice; it was the only order this could be built in.
+      </div>
+    </div>
+
+    <!-- Primitives table -->
+    <div class="primitives reveal">
+      <div class="row h"><span>Primitive</span><span>Definition</span><span>CLI surface</span></div>
+      <div class="row">
+        <span class="prim-name wa">WA<span class="sub">Write Authorization</span></span>
+        <p>Every write has an authenticated source + PII redaction at the gate. Anonymous writes are rejected at the type level.</p>
+        <p><code>--capture</code></p>
+      </div>
+      <div class="row">
+        <span class="prim-name pv">PV<span class="sub">Provenance Visibility</span></span>
+        <p>Every thought carries W3C PROV-DM 1.3 fields — agent, activity, wasGeneratedBy, wasDerivedFrom, sourceUri.</p>
+        <p><code>--capture --prov-agent --derived-from</code><br/><code>--trace</code> walks chains</p>
+      </div>
+      <div class="row">
+        <span class="prim-name ps">PS<span class="sub">Principal Scoping</span></span>
+        <p>Reads and writes scoped to <code>user_id</code>. Cross-user access is structurally impossible, not policy-impossible.</p>
+        <p>enforced on every op</p>
+      </div>
+      <div class="row">
+        <span class="prim-name rb">RB<span class="sub">Rollbackability</span></span>
+        <p>Every mutation creates a new revision in <code>thought_versions</code>. Rollback <strong>creates new history</strong> — it does not rewrite.</p>
+        <p><code>--snapshot</code> <code>--versions</code> <code>--rollback</code> <code>--diff</code> <code>--inspect</code></p>
+      </div>
+      <div class="row">
+        <span class="prim-name vfe">VF_ε<span class="sub">Verified Forgetting</span></span>
+        <p>Delete-after-verify: pre-snapshot → delete → n=300 probes → accept iff k=0. Dual-bound audit (Hoeffding + exact binomial) per row.</p>
+        <p><code>--forget</code></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== SCHEMA ============== -->
+<section id="schema">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">PostgreSQL schema · 5 tables</div>
+      <h2>The substrate, in your own Neon project</h2>
+      <p class="lead">
+        Five tables in a <code>brain</code> schema in your own Neon Postgres. Hover any table for columns and the migration that created it.
+      </p>
+    </div>
+
+    <div class="schema-wrap reveal" id="schemaWrap">
+      <div class="schema">
+        <svg viewBox="0 0 1000 540" xmlns="http://www.w3.org/2000/svg" aria-label="Brain schema diagram">
+          <defs>
+            <marker id="arrCyanS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#0091b3"/>
+            </marker>
+          </defs>
+
+          <!-- center: thoughts -->
+          <g class="tbl-group tbl-hero" data-key="thoughts" transform="translate(390,210)">
+            <rect class="tbl-rect" x="0" y="0" width="220" height="120" rx="10"/>
+            <text x="110" y="36" text-anchor="middle" class="tbl-title" style="fill:#ff007a">brain.thoughts</text>
+            <text x="110" y="58" text-anchor="middle" class="tbl-sub">memories · pgvector · +5 PROV-DM cols</text>
+            <text x="110" y="86" text-anchor="middle" style="font-size:10px;fill:#aab1c6">thought_id · user_id · text · embedding</text>
+            <text x="110" y="102" text-anchor="middle" class="pii-tag">PII REDACTED AT WRITE</text>
+          </g>
+
+          <!-- top left: thought_versions -->
+          <g class="tbl-group" data-key="versions" transform="translate(80,60)">
+            <rect class="tbl-rect" x="0" y="0" width="220" height="90" rx="10"/>
+            <text x="110" y="32" text-anchor="middle" class="tbl-title">brain.thought_versions</text>
+            <text x="110" y="54" text-anchor="middle" class="tbl-sub">RB · versioned history</text>
+            <text x="110" y="76" text-anchor="middle" style="font-size:10px;fill:#aab1c6">revision · snapshot_jsonb</text>
+          </g>
+
+          <!-- top right: forget_audit -->
+          <g class="tbl-group" data-key="audit" transform="translate(700,60)">
+            <rect class="tbl-rect" x="0" y="0" width="220" height="90" rx="10"/>
+            <text x="110" y="32" text-anchor="middle" class="tbl-title">brain.forget_audit</text>
+            <text x="110" y="54" text-anchor="middle" class="tbl-sub">VF_ε · dual-bound trail</text>
+            <text x="110" y="76" text-anchor="middle" style="font-size:10px;fill:#aab1c6">hoeffding + exact-binomial</text>
+          </g>
+
+          <!-- bottom left: promotions -->
+          <g class="tbl-group" data-key="promotions" transform="translate(80,400)">
+            <rect class="tbl-rect" x="0" y="0" width="220" height="90" rx="10"/>
+            <text x="110" y="32" text-anchor="middle" class="tbl-title">brain.promotions</text>
+            <text x="110" y="54" text-anchor="middle" class="tbl-sub">Hebbian weights · time-decay</text>
+            <text x="110" y="76" text-anchor="middle" style="font-size:10px;fill:#aab1c6">weight · created_at</text>
+          </g>
+
+          <!-- bottom right: replay_log -->
+          <g class="tbl-group" data-key="replay" transform="translate(700,400)">
+            <rect class="tbl-rect" x="0" y="0" width="220" height="90" rx="10"/>
+            <text x="110" y="32" text-anchor="middle" class="tbl-title">brain.replay_log</text>
+            <text x="110" y="54" text-anchor="middle" class="tbl-sub">OTel-correlated audit · no FK</text>
+            <text x="110" y="76" text-anchor="middle" style="font-size:10px;fill:#aab1c6">op · params (PII-redacted)</text>
+          </g>
+
+          <!-- FK arrows -->
+          <!-- versions → thoughts (CASCADE) -->
+          <path class="fk" d="M300 130 Q 380 165 400 210" marker-end="url(#arrCyanS)"/>
+          <text x="354" y="158" class="fk-label">FK · ON DELETE CASCADE</text>
+
+          <!-- promotions → thoughts (CASCADE) -->
+          <path class="fk" d="M300 415 Q 380 380 400 330" marker-end="url(#arrCyanS)"/>
+          <text x="332" y="395" class="fk-label">FK · ON DELETE CASCADE</text>
+
+          <!-- forget_audit → thoughts (no FK enforced) -->
+          <path class="fk" d="M700 130 Q 620 165 600 210" marker-end="url(#arrCyanS)" style="stroke-dasharray:2 4"/>
+          <text x="608" y="158" class="fk-label">thought_id (no FK · forgotten)</text>
+
+          <!-- thoughts self FK was_derived_from -->
+          <path class="fk" d="M610 240 Q 660 240 660 270 Q 660 300 610 300" marker-end="url(#arrCyanS)"/>
+          <text x="668" y="274" class="fk-label">self-FK · was_derived_from</text>
+          <text x="668" y="290" class="fk-label">ON DELETE SET NULL</text>
+
+          <!-- replay_log floats -->
+          <text x="810" y="395" text-anchor="middle" class="fk-label">no FK · standalone</text>
+        </svg>
+      </div>
+      <div class="schema-tooltip" id="schemaTooltip" role="tooltip"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== MAGIC MOMENTS ============== -->
+<section id="magic">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Wave-2 · three magic moments</div>
+      <h2>What you can do that v0.1.x couldn't</h2>
+      <p class="lead">
+        Three "wow" capabilities layered on the substrate. Each is one CLI flag, but each requires every primitive underneath to work.
+      </p>
+    </div>
+
+    <div class="grid-3 reveal" style="margin-top:2rem">
+      <article class="magic-card" data-color="cyan">
+        <h3>CITATION <span class="cmd">--trace</span></h3>
+        <p>Walk a thought's provenance chain back to the original ancestor. Handles cycles, max-depth, and orphans where parents were forgotten. Useful for <em>"where did this knowledge come from?"</em></p>
+      </article>
+      <article class="magic-card" data-color="pink">
+        <h3>INSPECT <span class="cmd">--inspect</span></h3>
+        <p>Query historical state by ISO timestamp or revision number. Because rollback never rewrites, revision 1 stays queryable forever — even after a rollback that produced revision N+M.</p>
+      </article>
+      <article class="magic-card" data-color="amber">
+        <h3>REPLAY-LOG <span class="cmd">--replay</span></h3>
+        <p>Chronological PII-redacted OTel-correlated audit trail of every brain op. Useful for <em>"what did the agent retrieve before deciding X?"</em></p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============== GUARANTEE ============== -->
+<section id="guarantee">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">VF_ε · the forget guarantee</div>
+      <h2>The 99.9999793% number, in math you can run</h2>
+      <p class="lead">
+        At n=300 probes, k=0 surfaced, ε=0.05 target: the residue probability is dual-bounded. The exact-binomial confidence is the headline number; the Hoeffding bound is recorded alongside for distribution-free conservatism. Both go into <code>brain.forget_audit</code> as distinct, labeled fields — so a reader can always see which number is being quoted.
+      </p>
+    </div>
+
+    <div class="donut-wrap reveal" id="donutWrap">
+      <div class="donut-svg" id="donutSvg">
+        <svg viewBox="0 0 240 240" aria-label="99.9999793% forget confidence donut">
+          <defs>
+            <linearGradient id="donutGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%"  stop-color="#00d4ff"/>
+              <stop offset="100%" stop-color="#7fe5ff"/>
+            </linearGradient>
+          </defs>
+          <!-- circumference ≈ 2π·120 ≈ 754 -->
+          <circle class="donut-bg"   cx="120" cy="120" r="100"/>
+          <circle class="donut-fill" cx="120" cy="120" r="100" style="--fill:628.3"/>
+          <!-- The leak window — visible but tiny (~0.2 of dash) representing residue -->
+          <circle class="donut-leak" cx="120" cy="120" r="100" stroke-dashoffset="-625"/>
+        </svg>
+        <div class="donut-center">
+          <div class="donut-pct">99.99998%</div>
+          <div class="donut-label">exact-binomial</div>
+        </div>
+      </div>
+
+      <div>
+        <div class="math-stack">
+          <span class="ln"># Exact binomial · k=0 · n=300 · ε=0.05 (the headline)</span>
+          <pre class="code" style="margin:.25rem 0 .75rem"><span class="kw">python3</span> -c <span class="str">"print((1 - 0.05) ** 300)"</span>
+<span class="out"># 2.075303347768056e-07</span>
+<span class="kw">python3</span> -c <span class="str">"print(1 - (1 - 0.05) ** 300)"</span>
+<span class="out"># 0.9999997924696653</span></pre>
+
+          <span class="ln"># Hoeffding one-sided · same params (the conservative complement)</span>
+          <pre class="code" style="margin:.25rem 0 0"><span class="kw">python3</span> -c <span class="str">"import math; print(math.exp(-2 * 300 * 0.05**2))"</span>
+<span class="out"># 0.22313016014842982   <span class="cmt"># residue bound</span></span>
+<span class="cmt"># → 77.69% confidence · distribution-free, loose</span></pre>
+        </div>
+        <p class="dim" style="margin-top:1.25rem">
+          The audit row carries <code>exactBinomialBound</code>, <code>exactBinomialConfidence</code>, <code>hoeffdingBound</code>, <code>hoeffdingConfidence</code>, and <code>probeQuality</code> as <strong>distinct labeled fields</strong>. The 99.9999793% figure is the exact binomial confidence (5 sig figs), <em>never</em> the Hoeffding bound.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== DELETE-AFTER-VERIFY ============== -->
+<section id="dav">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">VF_ε · delete-after-verify</div>
+      <h2>Why the naive ordering loses data, and the shipped pattern doesn't</h2>
+      <p class="lead">
+        The naive design — <em>"verify first, then delete"</em> — can't work: probes need the post-deletion state to be queryable, which means the delete has to happen first. The next-naive design — <em>"delete, verify, rollback if leak"</em> — had a data-loss window between delete and verify. The shipped pattern collapses both failure modes: snapshot the live state in memory, delete, probe against the post-delete store, and either accept or restore from the snapshot.
+      </p>
+    </div>
+
+    <div class="dav-wrap reveal" id="davWrap">
+      <div class="dav" id="davSteps">
+        <div class="dav-step step1">
+          <div class="ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></svg></div>
+          <div class="n">STEP · 01</div>
+          <h4>Snapshot</h4>
+          <p>Capture <code>forgotten_text</code> + top-50 semantic neighbors into in-memory <code>ProbeSeedSnapshot</code>. Live row untouched.</p>
+        </div>
+        <div class="dav-step step2">
+          <div class="ico"><svg viewBox="0 0 24 24"><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13"/></svg></div>
+          <div class="n">STEP · 02</div>
+          <h4>Delete</h4>
+          <p>Remove the live row. <code>thought_versions</code> cascade-deletes. Embedding space now reflects the post-delete reality.</p>
+        </div>
+        <div class="dav-step step3">
+          <div class="ico"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20 20"/></svg></div>
+          <div class="n">STEP · 03</div>
+          <h4>Probe</h4>
+          <p>n=300 queries against the post-delete store, distributed <code>40 / 30 / 20 / 10</code> across semantic / paraphrase / partial-fragment / embedding-perturb.</p>
+        </div>
+        <div class="dav-step step4">
+          <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12l5 5L20 6"/></svg></div>
+          <div class="n">STEP · 04</div>
+          <h4>Accept or restore</h4>
+          <p>If <code>k=0</code>: commit + audit <em>forgotten</em>. If <code>k&gt;0</code> or verify errors: restore from snapshot + audit <em>forget-failed-residue</em>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== TOPOLOGY ============== -->
+<section id="topology">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Deployment topology</div>
+      <h2>Local scripts. Cloud data. Per-user, not shared.</h2>
+      <p class="lead">
+        The brain is split cleanly: thought / scoring / probe logic runs locally on your machine; the data + vector compute lives in your own Neon project. There is no central infrastructure and no proxy service between them.
+      </p>
+    </div>
+
+    <div class="topo reveal">
+      <div class="topo-col local">
+        <h3>· Local · your machine</h3>
+        <div class="row">scripts/open_brain.py <span class="note">CLI · all 11 verbs</span></div>
+        <div class="row">scripts/vf_probe.py <span class="note">n=300 probe runner</span></div>
+        <div class="row">scripts/citation_walker.py <span class="note">trace + cycle detection</span></div>
+        <div class="row">scripts/time_travel.py <span class="note">inspect at ISO ts / revision</span></div>
+        <div class="row">all-mpnet-base-v2 (CPU) <span class="note">local embedding model</span></div>
+        <div class="row">brain_hook.py auto-capture <span class="note">hooks into Claude Code session</span></div>
+        <div class="row">Claude Haiku metadata <span class="note">one API call per capture</span></div>
+      </div>
+
+      <div class="topo-mid">
+        <svg viewBox="0 0 60 60" aria-hidden="true">
+          <defs>
+            <marker id="arrR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#00d4ff"/></marker>
+            <marker id="arrL" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ff007a"/></marker>
+          </defs>
+          <path d="M5 22 L52 22" stroke="#00d4ff" stroke-width="2" fill="none" marker-end="url(#arrR)"/>
+          <path d="M55 38 L8 38" stroke="#ff007a" stroke-width="2" fill="none" marker-end="url(#arrL)"/>
+        </svg>
+        <div class="label">TLS<br/>pgvector wire</div>
+      </div>
+
+      <div class="topo-col cloud">
+        <h3>· Cloud · your Neon project</h3>
+        <div class="row">brain.thoughts <span class="note">memories · vector(768)</span></div>
+        <div class="row">brain.thought_versions <span class="note">RB substrate</span></div>
+        <div class="row">brain.forget_audit <span class="note">VF_ε dual-bound trail</span></div>
+        <div class="row">brain.promotions <span class="note">Hebbian weights</span></div>
+        <div class="row">brain.replay_log <span class="note">PII-redacted audit</span></div>
+        <div class="row">pgvector cosine <span class="note">retrieval compute</span></div>
+      </div>
+    </div>
+
+    <div class="callout reveal">
+      <strong>Per-user, not shared.</strong> Each partner runs their own Neon project. No central service holds anyone's thoughts. The connection string is on the user's machine; if their laptop is gone, the brain is gone — and that is the design.
+    </div>
+  </div>
+</section>
+
+<!-- ============== SURFACE PARITY ============== -->
+<section id="surfaces">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Surface parity</div>
+      <h2>Two shells, one substrate</h2>
+      <p class="lead">
+        Same eleven operations, exposed in two places: a Claude Code slash command and a Pi native registered tool. Both call the same underlying Python scripts. No surface drift.
+      </p>
+    </div>
+
+    <div class="parity reveal">
+      <div class="row h"><span>Operation</span><span>Claude Code · slash</span><span>Pi · native tool</span></div>
+      <div class="row"><span>capture (with PROV-DM)</span><code>/brain-capture</code><code>brain_capture</code></div>
+      <div class="row"><span>search (with Hebbian boost)</span><code>/brain-search</code><code>brain_search</code></div>
+      <div class="row"><span>forget (VF_ε)</span><code>/brain-forget</code><code>brain_forget</code></div>
+      <div class="row"><span>trace (citation)</span><code>/brain-trace</code><code>brain_trace</code></div>
+      <div class="row"><span>inspect (time-travel)</span><code>/brain-inspect</code><code>brain_inspect</code></div>
+      <div class="row"><span>promote (Hebbian +)</span><code>/brain-promote</code><code>brain_promote</code></div>
+      <div class="row"><span>demote (Hebbian −)</span><code>/brain-demote</code><code>brain_demote</code></div>
+      <div class="row"><span>replay (audit log)</span><code>/brain-replay</code><code>brain_replay</code></div>
+      <div class="row"><span>snapshot / versions / rollback / diff (RB)</span><span style="color:var(--text-mute);font-family:var(--mono);font-size:.78rem">CLI direct</span><span style="color:var(--text-mute);font-family:var(--mono);font-size:.78rem">CLI direct</span></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ============== FOOTER ============== -->
+<footer>
+  <div class="wrap">
+    <div class="grid-2">
+      <div>
+        <h3>Further reading</h3>
+        <ul>
+          <li>Lin, Li, Chen 2026 — <em>Mnemonic Sovereignty in Language Model Memory Systems</em> · arXiv 2604.16548</li>
+          <li>W3C PROV-DM 1.3 — provenance data model</li>
+          <li><code>docs/MS_EPS_PRIMER.md</code> — deeper math walkthrough</li>
+          <li><code>docs/OPEN_BRAIN_PARTNER_SETUP.md</code> — partner setup</li>
+        </ul>
+      </div>
+      <div>
+        <h3>This delivery cycle</h3>
+        <ul>
+          <li>39 brain beads closed</li>
+          <li>5 tables · per-user, in your own Neon</li>
+          <li>11 CLI verbs · 8 slash commands · 8 Pi native tools</li>
+          <li>VF_ε accept ratio: 1.000 across all probes to date</li>
+        </ul>
+      </div>
+    </div>
+    <div class="sig">
+      <span>Open Brain v0.2.0 · neurosymbolic</span>
+      <span>OptivAI Pi + Claude Code · 2026-05-22</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(() => {
+  // ---------- Theme toggle ----------
+  const root = document.documentElement;
+  const btn  = document.getElementById('themeToggle');
+  const setTheme = (t) => {
+    root.setAttribute('data-theme', t);
+    btn.textContent = (t === 'dark') ? 'Light' : 'Dark';
+    try { localStorage.setItem('ob-theme', t); } catch(_) {}
+  };
+  try {
+    const saved = localStorage.getItem('ob-theme');
+    if (saved) setTheme(saved);
+  } catch(_) {}
+  btn.addEventListener('click', () => {
+    setTheme(root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  });
+
+  // ---------- Reveal on scroll ----------
+  const reveals = document.querySelectorAll('.reveal');
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('visible');
+        io.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: '0px 0px -60px 0px' });
+  reveals.forEach(el => io.observe(el));
+
+  // ---------- Dependency-chain animation ----------
+  const depWrap = document.getElementById('depChainWrap');
+  const dep = document.getElementById('depChain');
+  if (depWrap && dep) {
+    const depIo = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          dep.classList.add('visible');
+          depIo.unobserve(e.target);
+        }
+      });
+    }, { threshold: 0.3 });
+    depIo.observe(depWrap);
+  }
+
+  // ---------- Donut animation ----------
+  const donut = document.getElementById('donutSvg');
+  if (donut) {
+    const donutIo = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          // 99.9999793% of the 754-unit dasharray = ~753.84... use 753 to leave a visible leak gap
+          const fill = donut.querySelector('.donut-fill');
+          if (fill) fill.style.setProperty('--fill', '753');
+          donut.classList.add('animate');
+          donutIo.unobserve(e.target);
+        }
+      });
+    }, { threshold: 0.4 });
+    donutIo.observe(donut);
+  }
+
+  // ---------- Delete-after-verify looping animation ----------
+  const davWrap = document.getElementById('davWrap');
+  const davSteps = davWrap ? davWrap.querySelectorAll('.dav-step') : [];
+  if (davSteps.length) {
+    let i = 0;
+    let interval = null;
+    const tick = () => {
+      davSteps.forEach(s => s.classList.remove('active'));
+      davSteps[i].classList.add('active');
+      i = (i + 1) % davSteps.length;
+    };
+    const davIo = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting && !interval) {
+          tick();
+          interval = setInterval(tick, 1600);
+        } else if (!e.isIntersecting && interval) {
+          clearInterval(interval); interval = null;
+          davSteps.forEach(s => s.classList.remove('active'));
+        }
+      });
+    }, { threshold: 0.3 });
+    davIo.observe(davWrap);
+  }
+
+  // ---------- Schema tooltips ----------
+  const tooltip = document.getElementById('schemaTooltip');
+  const schemaWrap = document.getElementById('schemaWrap');
+  const tooltipData = {
+    thoughts: {
+      title: 'brain.thoughts',
+      cols: [
+        'thought_id  uuid PRIMARY KEY',
+        'user_id     uuid NOT NULL',
+        'text        text NOT NULL  <em>· PII redacted</em>',
+        'embedding   vector(768)',
+        'kind        text',
+        'created_at  timestamptz',
+        '— PROV-DM 1.3 (Wave-1) —',
+        'prov_agent           text',
+        'prov_activity        text',
+        'was_generated_by     timestamptz',
+        'was_derived_from     uuid  <em>· self-FK SET NULL</em>',
+        'source_uri           text'
+      ],
+      mig: '0001_initial + 0004_provenance.sql'
+    },
+    versions: {
+      title: 'brain.thought_versions',
+      cols: [
+        'version_id   uuid PRIMARY KEY',
+        'thought_id   uuid  <em>· FK CASCADE</em>',
+        'revision     int   <em>· monotonic per thought</em>',
+        'snapshot     jsonb  <em>· full row state</em>',
+        'op           text   <em>· capture / update / rollback</em>',
+        'created_at   timestamptz'
+      ],
+      mig: '0005_rollback.sql'
+    },
+    audit: {
+      title: 'brain.forget_audit',
+      cols: [
+        'audit_id              uuid PRIMARY KEY',
+        'thought_id            uuid  <em>· no FK · target gone</em>',
+        'n_probes              int   <em>· typically 300</em>',
+        'k_surfaced            int   <em>· hits in probe set</em>',
+        'epsilon               float',
+        '— dual-bound (Wave-1) —',
+        'hoeffding_bound       float',
+        'hoeffding_confidence  float',
+        'exact_binomial_bound  float',
+        'exact_binomial_conf   float',
+        'probe_quality         jsonb  <em>· 40/30/20/10 dist</em>',
+        'outcome               text   <em>· forgotten | residue</em>',
+        'created_at            timestamptz'
+      ],
+      mig: '0006_vfe_dual_bound.sql'
+    },
+    promotions: {
+      title: 'brain.promotions',
+      cols: [
+        'promotion_id  uuid PRIMARY KEY',
+        'thought_id    uuid  <em>· FK CASCADE</em>',
+        'weight        float  <em>· Hebbian raw boost</em>',
+        'reason        text',
+        'created_at    timestamptz  <em>· for time-decay</em>'
+      ],
+      mig: '0003_hebbian.sql'
+    },
+    replay: {
+      title: 'brain.replay_log',
+      cols: [
+        'event_id    uuid PRIMARY KEY',
+        'user_id     uuid NOT NULL',
+        'op          text   <em>· capture/search/forget/…</em>',
+        'params      jsonb  <em>· PII redacted at gate</em>',
+        'trace_id    text   <em>· OTel correlation</em>',
+        'span_id     text',
+        'created_at  timestamptz'
+      ],
+      mig: '0007_replay_log.sql'
+    }
+  };
+  if (schemaWrap && tooltip) {
+    const groups = schemaWrap.querySelectorAll('.tbl-group');
+    groups.forEach(g => {
+      const key = g.getAttribute('data-key');
+      const data = tooltipData[key];
+      if (!data) return;
+      g.addEventListener('mouseenter', (e) => {
+        const rect = g.getBoundingClientRect();
+        const wrapRect = schemaWrap.getBoundingClientRect();
+        tooltip.innerHTML =
+          '<div class="ttl">' + data.title + '</div>' +
+          data.cols.map(c => '<div class="col">' + c + '</div>').join('') +
+          '<div class="mig">migration · ' + data.mig + '</div>';
+        const x = rect.left + rect.width / 2 - wrapRect.left;
+        const y = rect.top - wrapRect.top;
+        tooltip.style.left = x + 'px';
+        tooltip.style.top  = y + 'px';
+        tooltip.classList.add('show');
+        g.classList.add('active');
+      });
+      g.addEventListener('mouseleave', () => {
+        tooltip.classList.remove('show');
+        g.classList.remove('active');
+      });
+    });
+  }
+})();
+</script>
+
+</body>
+</html>

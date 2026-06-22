@@ -63,5 +63,6 @@ beads update gz-abc12 --status in_progress --priority 1 --assignee "claude"
 ## Related Commands
 
 - `/bead-show` - View current bead state
-- `/bead-list` - List beads by status
+- `/bead-list` - List beads by status (and filter by `repo:<basename>` — see its "Filter by Repo Label" section)
 - `/bead-ready` - Check what's unblocked
+- `/bead-create` - Create new bead (see its "Repo-label convention" section — the canonical reference for the `repo:<basename>` labeling rule)

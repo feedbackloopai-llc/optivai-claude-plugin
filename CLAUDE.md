@@ -65,8 +65,7 @@ Agents run via `Task` tool with `subagent_type` parameter.
 
 | Agent | Model | Use Case |
 |-------|-------|----------|
-| `postgresql-specialist` | opus | Indexes, partitioning, pgvector, optimization |
-| `sql-developer` | opus | Complex SQL, stored procs, cross-DB |
+| `sql-developer` | opus | Complex SQL, stored procs, pgvector, cross-DB |
 | `etl-pipeline-developer` | opus | Data pipelines, transformations |
 | `data-architect` | opus | Schema design, data modeling |
 | `solution-architect-planner` | opus | Technical planning, architecture |
@@ -105,6 +104,10 @@ session restarts, and compaction. It is permanent and perfect.
 
 **Task memory** (Beads) — Active work items with dependencies and status flow.
 What I'm working on, what's blocked, what's done. My to-do list with a dependency graph.
+
+### NAL-lite truth values (T2.6)
+
+Every atom carries `stv: {f, c}` — NAL frequency (degree of positive evidence, 0–1) and confidence (weight of evidence, 0–1). Atoms with `c < 0.35` are flagged `[LOW-CONFIDENCE]` in search results. At capture time, seed explicit values with `--stv-f FREQ --stv-c CONF`; the default derives `c` from the LLM-extracted confidence label (high=0.9, medium=0.7, low/absent=0.5). Adding a `verifies` link to an atom raises its confidence; a `refutes` link revises it toward `f=0.0`. Use `--revise ID_A ID_B` to fuse two atoms about the same proposition via NAL evidential-horizon revision — the derived atom's `c` is strictly higher than either premise (evidence accumulation), and `derives_from` links to both premises make the resolution auditable by `/brain-trace`. This is NAL-lite: revision + evidence propagation only — not a general inference engine.
 
 ### Memory Commands (USE THESE — don't wait to be asked)
 
@@ -327,10 +330,11 @@ Molecules are reusable workflow templates that instantiate as dependency-wired b
 
 ### Storage
 
-- **Project beads:** `.beads/` in project directory
-- **Global beads:** `~/.claude/beads/` (cross-project)
+- **Canonical store:** ONE physical DB at `~/.beads/issues.jsonl`. `beads` resolves its DB by walking up from the cwd; `~/.beads` is the universal ancestor, so every repo resolves to this single store.
+- **NEVER run `beads init` inside a repo** — it creates a local `.beads/` that shadows the canonical store by walk-up, re-splitting the tracker and making cross-repo dependency edges undrawable. If a repo-local `.beads/` ever reappears, merge its beads into `~/.beads` and delete it (drop the tracked `config.yaml` too).
 - **Format:** JSONL (append-only, git-friendly)
 - **Locking:** FileLock for concurrent safety
+- **Repo labels:** carry a `repo:<basename>` label on each bead to sort/filter by repo without polluting the bead ID.
 
 ### Auto-Created Beads (beads_writer.py hook)
 
@@ -379,7 +383,7 @@ python3 scripts/open_brain.py --stats --json
 
 `decision` | `insight` | `person_note` | `meeting` | `idea` | `task` | `reflection` | `preference` | `impression` | `pattern` | `working_memory`
 
-Metadata (type, topics, people, action_items, summary, confidence, scope) is **auto-extracted** by Cortex LLM on capture — no manual tagging needed.
+Metadata (type, topics, people, action_items, summary, confidence, scope) is **auto-extracted** by Anthropic Claude (Haiku model, with Ollama fallback) on capture — no manual tagging needed.
 
 ### Architecture
 - **Schema**: `brain.thoughts` (Neon PostgreSQL)
@@ -481,9 +485,11 @@ When enabled, a PreToolUse hook **blocks** tool execution unless:
 
 | Topic | File |
 |-------|------|
-| Session Recovery | `CCODE_SESSION_RECOVERY_GUIDE.md` |
-| Memory System Plan | `docs/plans/2026-03-02-open-brain.md` |
-| Memory Schema DDL | `sql/BRAIN_SCHEMA.sql` |
+| Brain partner setup | `docs/OPEN_BRAIN_PARTNER_SETUP.md` |
+| Neon / pgvector setup | `docs/NEON_SETUP_GUIDE.md` |
+| Brain migration guide | `docs/MIGRATION_GUIDE.md` |
+| MS_ε primer (sovereignty primitives) | `docs/MS_EPS_PRIMER.md` |
+| Memory Schema DDL | `sql/BRAIN_SCHEMA_PG.sql` |
 
 ---
 

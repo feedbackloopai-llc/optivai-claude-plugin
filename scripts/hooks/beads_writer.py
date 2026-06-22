@@ -15,20 +15,92 @@ Design decisions:
 
 import os
 import re
+import subprocess
 import sys
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
-# Import secret redaction (fail silently if not available)
-try:
-    from redact_secrets import redact_secrets, redact_dict
-except ImportError:
-    # Fallback: no redaction if module unavailable
-    def redact_secrets(text):
+# Import composed redaction pipeline (fblai-1ybnr).
+# Primary path: use the full defense-in-depth pipeline from scripts/redact/
+# (same coverage as open_brain.py: secrets + PII + entropy).
+# Fallback: emit a loud WARNING to stderr — silent identity fallback is
+# intentionally replaced by an audible signal so redaction gaps are never hidden.
+import sys as _redact_sys
+import os as _redact_os
+
+
+def _bootstrap_redact_pipeline():
+    """Return (redact_fn, redact_dict_fn) from the composed pipeline if importable."""
+    _this_dir = _redact_os.path.dirname(_redact_os.path.abspath(__file__))
+    _candidates = [
+        _redact_os.path.dirname(_this_dir),  # repo: scripts/hooks/ -> scripts/
+        _this_dir,                            # flat: ~/.claude/hooks/ -> hooks/ (redact is sibling)
+    ]
+    for _p in _candidates:
+        if _p not in _redact_sys.path:
+            _redact_sys.path.insert(0, _p)
+    try:
+        from redact.default_pipeline import redact_pii as _rpii  # noqa: F401
+
+        def _redact_text(text):
+            return _rpii(text) if text is not None else text
+
+        def _redact_dict_fn(data, max_depth=10):
+            """Walk a dict/list and redact all string values."""
+            if isinstance(data, str):
+                return _rpii(data) or data
+            if isinstance(data, dict):
+                return {k: _redact_dict_fn(v, max_depth - 1) if max_depth > 0 else v
+                        for k, v in data.items()}
+            if isinstance(data, list):
+                return [_redact_dict_fn(item, max_depth - 1) if max_depth > 0 else item
+                        for item in data]
+            return data
+
+        return _redact_text, _redact_dict_fn
+    except Exception:
+        return None, None
+
+
+def _make_loud_fallbacks():
+    """Return loud-fallback redact functions that warn exactly once."""
+    _warned = [False]
+
+    def _loud_redact(text):
+        if not _warned[0]:
+            print(
+                "WARNING: redaction pipeline unavailable — redaction DISABLED",
+                file=_redact_sys.stderr,
+            )
+            _warned[0] = True
         return text
-    def redact_dict(data, max_depth=10):
+
+    def _loud_redact_dict(data, max_depth=10):
+        if not _warned[0]:
+            print(
+                "WARNING: redaction pipeline unavailable — redaction DISABLED",
+                file=_redact_sys.stderr,
+            )
+            _warned[0] = True
         return data
+
+    return _loud_redact, _loud_redact_dict
+
+
+_redact_fn, _redact_dict_fn = _bootstrap_redact_pipeline()
+if _redact_fn is None:
+    _redact_fn, _redact_dict_fn = _make_loud_fallbacks()
+
+
+def redact_secrets(text):
+    """Redact PII and secrets from text using the composed pipeline."""
+    return _redact_fn(text)
+
+
+def redact_dict(data, max_depth=10):
+    """Redact PII and secrets from all string values in a dict/list."""
+    return _redact_dict_fn(data, max_depth)
 
 # Global beads location
 GLOBAL_BEADS_DIR = Path.home() / ".claude" / "beads"
@@ -138,6 +210,79 @@ def _truncate(text: str, max_len: int = 100) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+
+def _detect_repo_label(cwd: str) -> Optional[str]:
+    """
+    Return ``repo:<basename>`` if ``cwd`` (or any ancestor) is inside a
+    git working tree, otherwise None.
+
+    Implementation: shell out to ``git rev-parse --show-toplevel`` from the
+    given cwd. This honors git's own resolution rules (worktrees, submodules,
+    GIT_DIR overrides) without re-implementing them. Failure (non-zero exit,
+    missing git binary, OSError) is treated as "not in a repo" and returns
+    None — never raises.
+    """
+    if not cwd:
+        return None
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    repo_root = (result.stdout or '').strip()
+    if not repo_root:
+        return None
+    basename = os.path.basename(repo_root)
+    if not basename:
+        return None
+    return f"repo:{basename}"
+
+
+def _apply_repo_label(bead_id: str, repo_label: str) -> bool:
+    """
+    Invoke ``beads label <bead_id> <repo_label>`` as a subprocess.
+
+    Returns True on exit 0 (which `beads label` also returns when the label
+    is already present — the command is idempotent). Returns False on
+    non-zero exit, missing binary, or any subprocess error. **Never raises.**
+
+    This is the "fail-open" application path called after a successful bead
+    creation. Per the labeling convention spec, label failures MUST NOT roll
+    back the bead — they are logged once to stderr and execution proceeds.
+    """
+    if not bead_id or not repo_label:
+        return False
+    try:
+        result = subprocess.run(
+            ['beads', 'label', bead_id, repo_label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as e:
+        print(
+            f"[beads_writer] Warning: failed to apply {repo_label} to "
+            f"{bead_id}: {e}",
+            file=sys.stderr,
+        )
+        return False
+    if result.returncode != 0:
+        stderr = (result.stderr or '').strip() or '(no stderr)'
+        print(
+            f"[beads_writer] Warning: `beads label {bead_id} {repo_label}` "
+            f"exited {result.returncode}: {stderr}",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _is_significant_operation(operation: str, details: Dict[str, Any]) -> bool:
@@ -334,13 +479,23 @@ class BeadsWriter:
             if subagent_context and subagent_context.get('is_subagent'):
                 labels.append('subagent')
 
-            self.db.create(
+            issue = self.db.create(
                 title=title,
                 type=bead_type,
                 description=description,
                 labels=labels,
                 created_by=f"hook:{session_id}"
             )
+
+            # Auto-label with repo:<basename> when running inside a git tree.
+            # Per the labeling convention (AGENTS.md), every bead created from
+            # within a repo carries a `repo:<basename>` label so beads can be
+            # filtered by source repo without polluting the ID. Fail-open:
+            # label errors are logged to stderr and never roll back creation.
+            new_id = getattr(issue, 'id', None)
+            repo_label = _detect_repo_label(cwd)
+            if new_id and repo_label:
+                _apply_repo_label(new_id, repo_label)
 
         except Exception as e:
             self._log_error(f"Failed to create bead: {e}")
@@ -375,13 +530,19 @@ class BeadsWriter:
             title = redact_secrets(_create_bead_title('user_prompt', details))
             description = redact_secrets(_create_bead_description('user_prompt', details, session_id, project, cwd))
 
-            self.db.create(
+            issue = self.db.create(
                 title=title,
                 type='note',  # User prompts are notes, not tasks
                 description=description,
                 labels=['auto', 'user_prompt'],
                 created_by=f"hook:{session_id}"
             )
+
+            # Auto-label with repo:<basename> (see on_tool_use for rationale).
+            new_id = getattr(issue, 'id', None)
+            repo_label = _detect_repo_label(cwd)
+            if new_id and repo_label:
+                _apply_repo_label(new_id, repo_label)
 
         except Exception as e:
             self._log_error(f"Failed to create user_prompt bead: {e}")

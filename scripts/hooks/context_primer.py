@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import argparse
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
@@ -124,10 +125,199 @@ def format_as_json(entries: List[Dict[str, Any]]) -> str:
     return json.dumps(entries, indent=2)
 
 
+def _open_brain_path() -> Path:
+    """Resolve the open_brain.py script path (sibling of this file)."""
+    return Path(__file__).resolve().parent / "open_brain.py"
+
+
+def _normalize_atom(raw: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Reduce a raw open_brain.py JSON record to the fields we render.
+
+    open_brain.py emits UPPERCASE keys (THOUGHT_ID, SUMMARY, THOUGHT_TYPE,
+    CREATED_AT). We also accept lowercase aliases (id, summary, type, date)
+    in case the shape ever evolves. Records missing an id are dropped.
+    """
+    atom_id = raw.get("THOUGHT_ID") or raw.get("id")
+    if not atom_id:
+        return None
+    summary = (
+        raw.get("SUMMARY")
+        or raw.get("summary")
+        or raw.get("RAW_TEXT")
+        or ""
+    )
+    thought_type = raw.get("THOUGHT_TYPE") or raw.get("type") or "atom"
+    created_at = raw.get("CREATED_AT") or raw.get("date") or ""
+    # Trim summary so block stays compact (one-line per atom).
+    summary = " ".join(str(summary).split())
+    if len(summary) > 140:
+        summary = summary[:137] + "..."
+    # Date column: keep just YYYY-MM-DD if possible.
+    date_str = str(created_at)
+    if len(date_str) >= 10 and date_str[4] == "-" and date_str[7] == "-":
+        date_str = date_str[:10]
+    return {
+        "id": str(atom_id),
+        "summary": summary,
+        "type": str(thought_type),
+        "date": date_str,
+    }
+
+
+def _format_atom_line(atom: Dict[str, str]) -> str:
+    """Render one atom as a bullet line for the Markdown block."""
+    return f"- {atom['date']} | {atom['type']} | {atom['id']} — {atom['summary']}"
+
+
+def _run_open_brain(args: List[str], timeout: int = 8) -> List[Dict[str, Any]]:
+    """Shell open_brain.py with the given args and return parsed JSON list.
+
+    Raises subprocess.CalledProcessError, subprocess.TimeoutExpired, or
+    json.JSONDecodeError on failure — caller is responsible for fail-open.
+    """
+    brain_script = _open_brain_path()
+    cmd = ["python3", str(brain_script)] + args
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=True,
+    )
+    parsed = json.loads(proc.stdout)
+    if not isinstance(parsed, list):
+        raise json.JSONDecodeError("expected list", proc.stdout, 0)
+    return parsed
+
+
+def enrich_with_brain_context(
+    working_dir: str,
+    days: int = 3,
+    recall_k: int = 5,
+) -> str:
+    """Return a Markdown block of recent + project-relevant brain atoms.
+
+    Two subprocess calls (each capped at 8s):
+      1. open_brain.py --recent --days <days> --json --limit 10
+      2. open_brain.py --search "<basename of working_dir>" --json --limit <recall_k>
+
+    Atoms are deduplicated by id and the combined output is capped at 15
+    atoms. Fail-open semantics: any subprocess error, timeout, JSON parse
+    failure, or generic exception returns "" and logs a one-line warning
+    to stderr — this function MUST never raise and MUST never block
+    session priming.
+    """
+    try:
+        basename = os.path.basename(working_dir.rstrip("/")) or working_dir
+    except Exception as exc:  # pragma: no cover — defensive only
+        print(f"warn: brain enrich basename failed: {exc}", file=sys.stderr)
+        return ""
+
+    recent_raw: List[Dict[str, Any]] = []
+    search_raw: List[Dict[str, Any]] = []
+
+    try:
+        recent_raw = _run_open_brain(
+            ["--recent", "--days", str(days), "--json", "--limit", "10"],
+            timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        print("warn: brain --recent timed out (8s); skipping brain block",
+              file=sys.stderr)
+        return ""
+    except subprocess.CalledProcessError as exc:
+        print(f"warn: brain --recent exited {exc.returncode}; skipping brain block",
+              file=sys.stderr)
+        return ""
+    except json.JSONDecodeError as exc:
+        print(f"warn: brain --recent JSON parse failed: {exc}; skipping brain block",
+              file=sys.stderr)
+        return ""
+    except Exception as exc:
+        print(f"warn: brain --recent unexpected error: {exc}; skipping brain block",
+              file=sys.stderr)
+        return ""
+
+    try:
+        search_raw = _run_open_brain(
+            ["--search", basename, "--json", "--limit", str(recall_k)],
+            timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        print("warn: brain --search timed out (8s); rendering recent-only block",
+              file=sys.stderr)
+        search_raw = []
+    except subprocess.CalledProcessError as exc:
+        print(f"warn: brain --search exited {exc.returncode}; rendering recent-only block",
+              file=sys.stderr)
+        search_raw = []
+    except json.JSONDecodeError as exc:
+        print(f"warn: brain --search JSON parse failed: {exc}; rendering recent-only block",
+              file=sys.stderr)
+        search_raw = []
+    except Exception as exc:
+        print(f"warn: brain --search unexpected error: {exc}; rendering recent-only block",
+              file=sys.stderr)
+        search_raw = []
+
+    # Normalize + dedup. Recent atoms are added first (priority); project-
+    # relevant atoms only appear if their id was not already seen.
+    seen_ids: set = set()
+    recent_atoms: List[Dict[str, str]] = []
+    for raw in recent_raw:
+        atom = _normalize_atom(raw)
+        if atom is None or atom["id"] in seen_ids:
+            continue
+        seen_ids.add(atom["id"])
+        recent_atoms.append(atom)
+
+    search_atoms: List[Dict[str, str]] = []
+    for raw in search_raw:
+        atom = _normalize_atom(raw)
+        if atom is None or atom["id"] in seen_ids:
+            continue
+        seen_ids.add(atom["id"])
+        search_atoms.append(atom)
+
+    # Cap combined output at 15 atoms; trim project-relevant first so the
+    # recent slice is preserved.
+    total_cap = 15
+    if len(recent_atoms) + len(search_atoms) > total_cap:
+        remaining = max(0, total_cap - len(recent_atoms))
+        search_atoms = search_atoms[:remaining]
+        recent_atoms = recent_atoms[:total_cap]
+
+    if not recent_atoms and not search_atoms:
+        return ""
+
+    lines: List[str] = ["## Recent neurosymbolic context", ""]
+
+    lines.append(f"### Last 3 days (top {len(recent_atoms)})")
+    if recent_atoms:
+        for atom in recent_atoms:
+            lines.append(_format_atom_line(atom))
+    else:
+        lines.append("- (no recent atoms returned)")
+    lines.append("")
+
+    lines.append(f"### Project-relevant ({basename})")
+    if search_atoms:
+        for atom in search_atoms:
+            lines.append(_format_atom_line(atom))
+    else:
+        lines.append("- (no project-relevant atoms returned)")
+
+    return "\n".join(lines)
+
+
 def format_as_context(entries: List[Dict[str, Any]]) -> str:
     """Format entries as context for agent priming"""
     if not entries:
-        return "No recent activity to prime context."
+        base = "No recent activity to prime context."
+        brain_block = enrich_with_brain_context(os.getcwd())
+        if brain_block:
+            return base + "\n\n" + brain_block
+        return base
 
     lines = ["<recent_session_context>"]
 
@@ -168,7 +358,17 @@ def format_as_context(entries: List[Dict[str, Any]]) -> str:
 
     lines.append("</recent_session_context>")
 
-    return "\n".join(lines)
+    base_output = "\n".join(lines)
+
+    # Append the neurosymbolic brain block (recent atoms + project-scoped
+    # recall). Fail-open: empty string if the brain backend is unreachable.
+    project_dir = None
+    if entries:
+        project_dir = entries[0].get("project")
+    brain_block = enrich_with_brain_context(project_dir or os.getcwd())
+    if brain_block:
+        return base_output + "\n\n" + brain_block
+    return base_output
 
 
 def main():

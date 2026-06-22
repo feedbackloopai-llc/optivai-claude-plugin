@@ -235,8 +235,17 @@ install_ollama() {
 }
 
 # Detect operating system
+# Returns one of: windows | macos | linux | wsl | unknown
+#
+# WSL detection: uname -s returns "Linux" inside WSL, which would otherwise
+# take the generic linux path. We detect WSL by checking /proc/version (WSL1)
+# and /proc/sys/kernel/osrelease (WSL2) for the "microsoft" or "WSL" string
+# (case-insensitive). WSL is treated like linux for file-copy/pip/merge steps,
+# but the daemon and keychain notes differ.
 detect_os() {
-    case "$(uname -s)" in
+    local kernel
+    kernel="$(uname -s)"
+    case "$kernel" in
         MINGW*|MSYS*|CYGWIN*)
             echo "windows"
             ;;
@@ -244,7 +253,13 @@ detect_os() {
             echo "macos"
             ;;
         Linux*)
-            echo "linux"
+            # Check for WSL before returning generic "linux"
+            if grep -qiE "microsoft|wsl" /proc/version 2>/dev/null \
+               || grep -qiE "microsoft|wsl" /proc/sys/kernel/osrelease 2>/dev/null; then
+                echo "wsl"
+            else
+                echo "linux"
+            fi
             ;;
         *)
             echo "unknown"
@@ -316,6 +331,19 @@ uninstall_unix() {
         else
             print_warning "Launchd daemon not found (already removed)"
         fi
+    elif [ "$OS_TYPE" = "wsl" ]; then
+        # WSL: daemon was installed via cron (no systemd assumed)
+        if crontab -l 2>/dev/null | grep -q "pg_sync.py"; then
+            crontab -l 2>/dev/null | grep -v "pg_sync.py" | crontab - 2>/dev/null || true
+            print_status "Removed cron job (WSL)"
+        else
+            print_warning "No cron entry for pg_sync found (already removed)"
+        fi
+        # Best-effort removal of Windows Task Scheduler entry if schtasks available
+        if command -v schtasks.exe &> /dev/null; then
+            schtasks.exe /delete /tn "OptivAI-PgSync" /f 2>/dev/null && \
+                print_status "Removed Windows Task Scheduler entry OptivAI-PgSync" || true
+        fi
     else
         # Linux: Remove systemd service
         if systemctl --user is-enabled "$SYSTEMD_SERVICE" 2>/dev/null; then
@@ -337,26 +365,35 @@ uninstall_unix() {
     if [ -d "$HOOKS_DIR" ]; then
         print_info "Removing hook scripts..."
         local hook_files=(
-            "log_writer.py"
-            "pre-tool-use.py"
-            "user-prompt-submit.py"
-            "pg_sync.py"
-            "memory_writer.py"
-            "subagent_context.py"
-            "context_primer.py"
+            "auto_recall_hook.py"
             "beads_writer.py"
+            "brain_hook.py"
+            "citation_walker.py"
+            "context_primer.py"
+            "dispatch_gate.py"
+            "log_writer.py"
+            "memory_writer.py"
+            "open_brain.py"
+            "pg_sync.py"
+            "post_tool_use.py"
+            "pre-tool-use.py"
             "redact_secrets.py"
             "session_summary.py"
-            "stop-hook.sh"
             "stop-hook.py"
-            "brain_hook.py"
+            "stop-hook.sh"
+            "subagent_context.py"
             "till_done.py"
-            "open_brain.py"
+            "time_travel.py"
+            "user-prompt-submit.py"
+            "vf_probe.py"
         )
 
         for file in "${hook_files[@]}"; do
             rm -f "$HOOKS_DIR/$file"
         done
+
+        # Remove redact/ package
+        rm -rf "$HOOKS_DIR/redact"
 
         # Remove __pycache__
         rm -rf "$HOOKS_DIR/__pycache__"
@@ -391,12 +428,16 @@ uninstall_unix() {
         fi
     fi
 
-    # Remove settings.json (backup first)
+    # Remove ONLY the plugin's hook commands from settings.json.
+    # Every other user preference (model, permissions, enabledPlugins, etc.)
+    # and every non-plugin hook is left untouched. A timestamped backup is
+    # created first so the user can always roll back.
     if [ -f "$SETTINGS_FILE" ]; then
         local backup_file="${SETTINGS_FILE}.uninstall-backup.$(date +%Y%m%d-%H%M%S)"
         cp "$SETTINGS_FILE" "$backup_file"
-        rm -f "$SETTINGS_FILE"
-        print_status "Removed settings.json (backed up to $backup_file)"
+        print_status "Backed up settings.json to: $backup_file"
+        python3 "$SCRIPT_DIR/merge_settings.py" "$SETTINGS_FILE" --uninstall
+        print_status "Removed plugin hooks from settings.json (user preferences preserved)"
     fi
 
     echo ""
@@ -429,6 +470,29 @@ install_unix() {
     echo "║   Platform: $OS_TYPE                                            ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
+
+    # WSL-specific information block
+    if [ "$OS_TYPE" = "wsl" ]; then
+        echo -e "${CYAN}========================================${NC}"
+        echo -e "${CYAN}  WSL (Windows Subsystem for Linux) Detected${NC}"
+        echo -e "${CYAN}========================================${NC}"
+        echo ""
+        print_info "WSL uses the Linux install path for all file-copy and pip steps."
+        print_info "A few WSL-specific notes:"
+        echo "  • macOS Keychain is NOT available in WSL."
+        echo "    Database credentials must be provided via environment variables:"
+        echo "      export DATABASE_URL=\"postgresql://user:pass@host/db?sslmode=require\""
+        echo "      export ANTHROPIC_API_KEY=\"sk-ant-....\""
+        echo "    Add these to ~/.bashrc or ~/.zshrc to persist across sessions."
+        echo "  • launchd (macOS daemon) is NOT available in WSL."
+        echo "    Daemon options for WSL:"
+        echo "    1. Use a cron job (see daemon section below for --skip-daemon guidance)"
+        echo "    2. Run pg_sync.py manually when needed:"
+        echo "         python3 ~/.claude/hooks/pg_sync.py --once"
+        echo "    3. Set up a Windows Task Scheduler task that calls:"
+        echo "         wsl python3 ~/.claude/hooks/pg_sync.py --once"
+        echo ""
+    fi
 
     # Check prerequisites
     print_header "Checking Prerequisites"
@@ -463,21 +527,25 @@ install_unix() {
     # Install hook scripts
     print_header "Installing Hook Scripts"
 
+    # Files sourced from scripts/hooks/ → ~/.claude/hooks/
+    # Add new hook files here (one entry per line).
     local hook_files=(
-        "log_writer.py"
-        "pre-tool-use.py"
-        "user-prompt-submit.py"
-        "pg_sync.py"
-        "memory_writer.py"
-        "subagent_context.py"
-        "context_primer.py"
+        "auto_recall_hook.py"
         "beads_writer.py"
+        "brain_hook.py"
+        "context_primer.py"
+        "dispatch_gate.py"
+        "log_writer.py"
+        "memory_writer.py"
+        "post_tool_use.py"
+        "pre-tool-use.py"
         "redact_secrets.py"
         "session_summary.py"
-        "stop-hook.sh"
         "stop-hook.py"
-        "brain_hook.py"
+        "stop-hook.sh"
+        "subagent_context.py"
         "till_done.py"
+        "user-prompt-submit.py"
     )
 
     local REPO_HOOKS_DIR="$REPO_DIR/scripts/hooks"
@@ -490,10 +558,29 @@ install_unix() {
     done
     chmod +x "$HOOKS_DIR/stop-hook.sh" 2>/dev/null || true
 
-    # Deploy open_brain.py from scripts/ (not hooks/)
-    if [ -f "$REPO_DIR/scripts/open_brain.py" ]; then
-        cp "$REPO_DIR/scripts/open_brain.py" "$HOOKS_DIR/"
+    # Files sourced from scripts/ top-level → ~/.claude/hooks/
+    # These live at scripts/ (not scripts/hooks/) for historical or build reasons.
+    local scripts_top_files=(
+        "open_brain.py"        # brain CLI + Pi bridge
+        "citation_walker.py"   # citation graph walker used by time_travel
+        "time_travel.py"       # temporal memory retrieval hook
+        "vf_probe.py"          # VF_ε verified-forget probe runner
+        "pg_sync.py"           # activity-log-to-Postgres sync daemon
+    )
+    for file in "${scripts_top_files[@]}"; do
+        if [ -f "$REPO_DIR/scripts/$file" ]; then
+            cp "$REPO_DIR/scripts/$file" "$HOOKS_DIR/"
+            count=$((count + 1))
+        fi
+    done
+
+    # Deploy redact/ package (scripts/redact/ → ~/.claude/hooks/redact/)
+    # Required by memory_writer.py and open_brain.py for PII/secret redaction.
+    # Without this a fresh install will fail on import at first hook fire.
+    if [ -d "$REPO_DIR/scripts/redact" ]; then
+        cp -R "$REPO_DIR/scripts/redact" "$HOOKS_DIR/"
         count=$((count + 1))
+        print_status "Installed redact/ PII-redaction package"
     fi
 
     # Deploy BRAIN_SCHEMA_PG.sql so --init works post-install
@@ -530,10 +617,13 @@ install_unix() {
     print_header "Installing Skills"
 
     if [ -d "$REPO_DIR/skills" ]; then
-        cp "$REPO_DIR/skills/"* "$SKILLS_DIR/" 2>/dev/null || true
+        # Skills follow the agentskills.io layout: each skill is a directory
+        # containing SKILL.md plus optional reference files. Recursive copy
+        # preserves that layout. Loose top-level files (legacy) are also copied.
+        cp -R "$REPO_DIR/skills/"* "$SKILLS_DIR/" 2>/dev/null || true
         SKILL_COUNT=$(ls -1 "$SKILLS_DIR" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$SKILL_COUNT" -gt 0 ]; then
-            print_status "Installed $SKILL_COUNT skill files to $SKILLS_DIR"
+            print_status "Installed $SKILL_COUNT skill entries to $SKILLS_DIR"
         fi
     fi
 
@@ -598,15 +688,13 @@ install_unix() {
         configure_postgresql
     fi
 
-    # Generate settings.json
+    # Merge plugin hooks/env into settings.json without clobbering user settings.
+    # merge_settings.py is settings-aware: it PRESERVES every existing top-level key
+    # (model, effortLevel, permissions, enabledPlugins, etc.) and adds/updates only
+    # the plugin's required env keys and hook commands idempotently.
+    # --force no longer destroys user settings; it simply re-runs the merge
+    # (a fresh baseline is the empty-merge case).
     print_header "Configuring Claude Code Settings"
-
-    if [ -f "$SETTINGS_FILE" ] && [ "$FORCE" = false ]; then
-        print_warning "settings.json already exists"
-        BACKUP_FILE="${SETTINGS_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "$SETTINGS_FILE" "$BACKUP_FILE"
-        print_status "Backed up to: $BACKUP_FILE"
-    fi
 
     # Prompt for user email (for token usage attribution)
     print_header "User Identity Configuration"
@@ -614,71 +702,57 @@ install_unix() {
     USER_EMAIL=$(prompt_with_default "Your company email" "")
     ORG_NAME=$(prompt_with_default "Organization name" "FeedbackLoopAI")
 
-    # Build env block
-    local ENV_BLOCK=""
-    if [ -n "$USER_EMAIL" ] || [ -n "$ORG_NAME" ]; then
-        ENV_BLOCK=$(cat << ENVBLOCK
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "CLAUDE_USER_EMAIL": "$USER_EMAIL",
-    "CLAUDE_ORG_NAME": "$ORG_NAME"
-  },
-ENVBLOCK
-)
-    else
-        ENV_BLOCK=$(cat << ENVBLOCK
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
-  },
-ENVBLOCK
-)
+    # Safety backup before any write (keeps a timestamped snapshot regardless
+    # of whether settings.json already exists, so the user can always roll back).
+    if [ -f "$SETTINGS_FILE" ]; then
+        BACKUP_FILE="${SETTINGS_FILE}.pre-merge-backup.$(date +%Y%m%d-%H%M%S)"
+        cp "$SETTINGS_FILE" "$BACKUP_FILE"
+        print_status "Backed up existing settings.json to: $BACKUP_FILE"
     fi
 
-    cat > "$SETTINGS_FILE" << SETTINGS
-{
-$ENV_BLOCK
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/pre-tool-use.py"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/user-prompt-submit.py"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/session_summary.py"
-          },
-          {
-            "type": "command",
-            "command": "bash \"\$HOME/.claude/hooks/stop-hook.sh\""
-          }
-        ]
-      }
-    ]
-  }
-}
-SETTINGS
+    # Build the merge argument list
+    local MERGE_ARGS=("$SETTINGS_FILE")
+    if [ -n "$USER_EMAIL" ]; then
+        MERGE_ARGS+=("--email" "$USER_EMAIL")
+    fi
+    if [ -n "$ORG_NAME" ]; then
+        MERGE_ARGS+=("--org" "$ORG_NAME")
+    fi
 
-    print_status "Generated settings.json"
+    # Run the merge helper (invoked from $SCRIPT_DIR — no need to copy to ~/.claude).
+    python3 "$SCRIPT_DIR/merge_settings.py" "${MERGE_ARGS[@]}"
+
+    print_status "Merged plugin hooks/env into settings.json (user preferences preserved)"
+
+    # ─── brain-v0.2.0 upgrade detection (deploy-S2) ─────────────────────────────
+    # If brain.thoughts exists but lacks the PROV-DM columns, this is a pre-v0.2.0
+    # install — run migrate-all.sh to upgrade. Idempotent: safe on fresh installs.
+    if [[ -n "${DATABASE_URL:-}" ]]; then
+      HAS_PROV=$(python3 -c "
+import os, sys
+try:
+    import psycopg2
+    conn = psycopg2.connect(os.environ['DATABASE_URL'])
+    cur = conn.cursor()
+    cur.execute(\"\"\"
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='brain' AND table_name='thoughts'
+          AND column_name='prov_agent'
+    \"\"\")
+    print('yes' if cur.fetchone() else 'no')
+    conn.close()
+except Exception:
+    print('error', file=sys.stderr)
+    sys.exit(0)  # don't block install on DB issues — user can re-run
+" 2>/dev/null || echo "no")
+
+      if [[ "$HAS_PROV" == "no" ]]; then
+        echo "→ Upgrading brain schema to v0.2.0..."
+        bash "$REPO_DIR/scripts/migrate-all.sh"
+      elif [[ "$HAS_PROV" == "yes" ]]; then
+        echo "✓ Brain schema is at v0.2.0 — no upgrade needed."
+      fi
+    fi
 
     # Install PostgreSQL sync daemon
     if [ "$SKIP_DAEMON" = false ]; then
@@ -690,12 +764,21 @@ SETTINGS
             else
                 print_warning "install-launchd.sh not found, skipping daemon setup"
             fi
+        elif [ "$OS_TYPE" = "wsl" ]; then
+            # WSL: launchd is unavailable; systemd is rarely enabled in WSL2 by
+            # default; use cron or print guidance to run manually / via Windows
+            # Task Scheduler.
+            install_wsl_daemon
         else
             # Linux: Use systemd or cron
             install_linux_daemon
         fi
     else
         print_info "Skipping daemon installation (--skip-daemon specified)"
+        if [ "$OS_TYPE" = "wsl" ]; then
+            print_info "To run the sync manually in WSL:"
+            echo "  python3 ~/.claude/hooks/pg_sync.py --once"
+        fi
     fi
 
     # Installation complete
@@ -708,6 +791,9 @@ SETTINGS
     echo "Verify installation:"
     if [ "$OS_TYPE" = "macos" ]; then
         echo "  • Check daemon: launchctl list | grep claude-pg"
+    elif [ "$OS_TYPE" = "wsl" ]; then
+        echo "  • Check cron: crontab -l | grep pg_sync"
+        echo "  • Run sync manually: python3 ~/.claude/hooks/pg_sync.py --once"
     else
         echo "  • Check daemon: systemctl --user status $SYSTEMD_SERVICE"
     fi
@@ -715,6 +801,47 @@ SETTINGS
     echo "  • Test sync: python3 ~/.claude/hooks/pg_sync.py --status"
     echo ""
     print_status "Installation complete!"
+}
+
+install_wsl_daemon() {
+    # WSL daemon setup: systemd is typically NOT available in WSL1 and may
+    # require explicit opt-in in WSL2 (requires /etc/wsl.conf + Windows 11).
+    # Rather than silently fail or require systemd, we prefer cron which works
+    # in all WSL configurations, and print clear guidance for Windows Task
+    # Scheduler as an alternative.
+    local SYNC_SCRIPT="$HOOKS_DIR/pg_sync.py"
+    local LOG_FILE="$LOGS_DIR/sync_daemon.log"
+
+    print_info "WSL detected — using cron for pg_sync daemon (systemd not assumed)"
+
+    # Check if cron is available
+    if command -v crontab &> /dev/null; then
+        local CRON_CMD="* * * * * /usr/bin/python3 $SYNC_SCRIPT --once >> $LOG_FILE 2>&1"
+        # Add to crontab idempotently
+        if crontab -l 2>/dev/null | grep -q "pg_sync.py"; then
+            print_status "cron entry for pg_sync already present"
+        else
+            (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+            print_status "Added cron job for pg_sync (runs every minute)"
+            echo "  Verify: crontab -l | grep pg_sync"
+        fi
+        echo ""
+        print_info "Note: cron in WSL only runs while the WSL session is active."
+        print_info "Alternative — Windows Task Scheduler (runs even when WSL is idle):"
+        echo "  schtasks /create /tn \"OptivAI-PgSync\" /tr \"wsl python3 ~/.claude/hooks/pg_sync.py --once\" \\"
+        echo "    /sc MINUTE /mo 5 /ru \"%USERNAME%\" /f"
+        echo ""
+        print_info "Or run manually whenever needed:"
+        echo "  python3 ~/.claude/hooks/pg_sync.py --once"
+    else
+        print_warning "crontab not found in WSL environment"
+        print_info "Run the sync daemon manually:"
+        echo "  python3 $SYNC_SCRIPT --once"
+        echo ""
+        print_info "Or set up Windows Task Scheduler from a PowerShell window:"
+        echo "  schtasks /create /tn \"OptivAI-PgSync\" /tr \"wsl python3 ~/.claude/hooks/pg_sync.py --once\" \\"
+        echo "    /sc MINUTE /mo 5 /ru \"%USERNAME%\" /f"
+    fi
 }
 
 install_linux_daemon() {
@@ -767,7 +894,9 @@ case "$OS" in
     windows)
         install_windows
         ;;
-    macos|linux)
+    macos|linux|wsl)
+        # wsl takes the same file-copy/pip/merge path as linux; daemon and
+        # keychain handling differ (see install_wsl_daemon + WSL info block).
         install_unix "$OS"
         ;;
     *)

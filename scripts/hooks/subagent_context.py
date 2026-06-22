@@ -12,11 +12,49 @@ Auto-expires: 30 minutes of inactivity
 import os
 import json
 import time
-import fcntl
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from uuid import uuid4
+
+# ---------------------------------------------------------------------------
+# Portable file-lock shim
+#
+# fcntl is Unix-only (Linux, macOS) and is absent on Windows-native Python.
+# The subagent context file stores ephemeral execution-stack state; the brain's
+# concurrency story tolerates best-effort locking (a missed lock at worst
+# produces a slightly stale read on a heavily-concurrent machine — not data
+# loss). On Windows-native Python we therefore degrade gracefully to a no-op
+# lock rather than hard-crashing on ImportError.
+#
+# Alternative considered: use msvcrt.locking for real Windows locking.
+# Rejected: msvcrt.locking requires knowing the byte-range to lock, making it
+# significantly more complex to wire around json.load/json.dump boundaries.
+# No-op is simpler and the degradation is documented and acceptable.
+# ---------------------------------------------------------------------------
+try:
+    import fcntl as _fcntl
+
+    def _lock_sh(fd: int) -> None:
+        _fcntl.flock(fd, _fcntl.LOCK_SH)
+
+    def _lock_ex(fd: int) -> None:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+
+    def _lock_un(fd: int) -> None:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+
+except ImportError:
+    # Windows-native Python: no fcntl available.
+    # All three helpers become no-ops; locking is best-effort on this platform.
+    def _lock_sh(fd: int) -> None:  # noqa: F811
+        pass
+
+    def _lock_ex(fd: int) -> None:  # noqa: F811
+        pass
+
+    def _lock_un(fd: int) -> None:  # noqa: F811
+        pass
 
 
 # Configuration
@@ -50,12 +88,12 @@ class SubagentContext:
 
         try:
             with open(self.context_path, 'r', encoding='utf-8') as f:
-                # Get shared lock for reading
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                # Get shared lock for reading (no-op on Windows-native Python)
+                _lock_sh(f.fileno())
                 try:
                     context = json.load(f)
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    _lock_un(f.fileno())
 
                 # Check for expiration
                 last_updated = context.get("last_updated", 0)
@@ -73,12 +111,12 @@ class SubagentContext:
 
         try:
             with open(self.context_path, 'w', encoding='utf-8') as f:
-                # Get exclusive lock for writing
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                # Get exclusive lock for writing (no-op on Windows-native Python)
+                _lock_ex(f.fileno())
                 try:
                     json.dump(context, f, indent=2)
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    _lock_un(f.fileno())
         except IOError as e:
             # Log error but don't fail the operation
             self._log_error(f"Failed to write context: {e}")

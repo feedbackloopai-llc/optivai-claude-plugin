@@ -94,5 +94,8 @@ class TestBeadsManager:
         global_issue = manager.create(title="Global", scope="global")
         project_issue = manager.create(title="Project", scope="project")
 
-        assert project_issue.id.startswith("gz-")
-        assert global_issue.id.startswith("gzg-")
+        # BeadsManager defaults: project='optivai', global='optivai-g'
+        # (the standalone CLI in scripts/beads/cli.py still defaults to 'gz' —
+        # the test exercises the Manager API, not the CLI default)
+        assert project_issue.id.startswith("optivai-")
+        assert global_issue.id.startswith("optivai-g-")

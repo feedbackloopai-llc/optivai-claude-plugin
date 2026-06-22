@@ -20,7 +20,7 @@ Execute the 'Activity Review', 'Run', 'Read', and 'Report' sections to understan
 
 ## Activity Review (Comprehensive Context System)
 
-**IMPORTANT**: When a project path is provided, this performs a DEEP search of that project's history:
+When a project path is provided, this performs a deep search of that project's history:
 - Searches the project's `.claude/logs/` directory directly (not global search)
 - Looks back 90 days by default (not just recent activity)
 - Tracks file modification history
@@ -165,15 +165,15 @@ cd "$TARGET_DIR" && git ls-files 2>/dev/null | grep -E '\.(py|sql|ts|tsx|md)$' |
 
 **Target Directory**: The context files below should be read from the target directory specified earlier. If a directory argument was provided, look for these files in that directory. Otherwise, use the current working directory.
 
-### ⚠️ TOKEN EFFICIENCY RULES (When Directory Argument Provided)
+### Token Efficiency (When Directory Argument Provided)
 
-**CRITICAL**: If a directory path argument was provided to `/prime-agent`, you MUST restrict ALL file operations to that directory:
+If a directory path argument was provided to `/prime-agent`, restrict all file operations to that directory:
 
-1. **ONLY read files** from within `$TARGET_DIR` and its subdirectories
-2. **ONLY search** (glob/grep) within `$TARGET_DIR`
-3. **DO NOT** explore parent directories or sibling directories
-4. **DO NOT** read files from the broader repository if a subdirectory was specified
-5. **SKIP** reading files that don't exist in the target directory (e.g., if no CLAUDE.md exists there, don't go looking elsewhere)
+1. Read files only from within `$TARGET_DIR` and its subdirectories
+2. Search (glob/grep) only within `$TARGET_DIR`
+3. Do not explore parent directories or sibling directories
+4. Do not read files from the broader repository if a subdirectory was specified
+5. Skip reading files that don't exist in the target directory (e.g., if no CLAUDE.md exists there, don't look elsewhere)
 
 **Rationale**: When the user specifies a subdirectory like `/prime-agent ./src/api`, they want focused context on that specific area. Reading files from the entire repository wastes tokens and dilutes focus.
 
@@ -200,17 +200,17 @@ Read these files from the **target directory** (the directory argument if provid
 
 #### 2. Development Standards & Organization
 
-## CRITICAL RULES
-- **NEVER USE --no-verify** when committing code
-- **NEVER implement mock mode** - always use real data/APIs
-- **NEVER remove code comments** unless provably false
-- **NEVER reimplement from scratch** without explicit permission
-- **SQL-first** - Python only when SQL alone is insufficient
+## Code Rules
+- Do not use `--no-verify` when committing code
+- Do not implement mock mode — use real data/APIs
+- Do not remove code comments unless provably false
+- Do not reimplement from scratch without explicit permission
+- **SQL-first** — Python only when SQL alone is insufficient
 - **Log to DataFixLog** for data operations (not local markdown)
 
 ## Context Rot Detection (User Identity)
 
-**IMPORTANT**: At the start of this session, generate a random 8-character alphanumeric identifier and assign the user a name in the format `User-XXXXXXXX` (e.g., `User-k7m9p2x4`).
+At the start of this session, generate a random 8-character alphanumeric identifier and assign the user a name in the format `User-XXXXXXXX` (e.g., `User-k7m9p2x4`).
 
 **Instructions:**
 
@@ -242,10 +242,10 @@ Read these files from the **target directory** (the directory argument if provid
 - One script per purpose: <=200 lines/file, <=40 lines/function
 
 ## Testing (TDD Required)
-- **NO EXCEPTIONS**: Every project MUST have unit, integration, AND e2e tests
+- Every project requires unit, integration, and e2e tests — no exceptions
 - Write failing test -> minimal code to pass -> refactor -> repeat
 - Test output must be pristine to pass
-- Need explicit "I AUTHORIZE YOU TO SKIP WRITING TESTS THIS TIME" to bypass
+- Need explicit written authorization from the user to skip tests
 
 ## Git Protocol
 **Mandatory Pre-Commit Failure Response:**

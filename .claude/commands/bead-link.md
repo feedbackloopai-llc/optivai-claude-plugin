@@ -66,5 +66,5 @@ beads depend gz-final gz-step3
 
 - `/bead-ready` - Show beads ready to work (not blocked)
 - `/bead-show` - View bead dependencies
-- `/bead-create` - Create new beads
+- `/bead-create` - Create new beads (see its "Repo-label convention" section — the canonical reference for the `repo:<basename>` labeling rule that every bead created inside a git tree must carry)
 - `/mol-pour` - Auto-create dependencies from molecule template
