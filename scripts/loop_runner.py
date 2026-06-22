@@ -89,6 +89,14 @@ _REPO_DEFAULT_VERIFY_CMD = "cd /Users/erato949/dev/optivai-claude-plugin/scripts
 _WORKTREE_LOCK: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Merge serialization lock (VA0b)
+# Merges from mayor/<bead_id> branches into the working branch must be
+# serialized so concurrent workers never race on the same git index.
+# Held only during merge (Mayor main thread), not during worker dispatch.
+# ---------------------------------------------------------------------------
+_MERGE_LOCK: threading.Lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # §2 Iteration state object
 # ---------------------------------------------------------------------------
 
@@ -123,6 +131,11 @@ class WorkerResult:
     Workers are read-only with respect to bead state — they return this struct
     and the Mayor (main thread) performs all status mutations (the single-writer
     invariant).
+
+    VA0b fields: the Mayor needs branch_name + worktree_path to perform the
+    merge-on-pass and then tear down the worktree.  The worker NEVER merges —
+    it only reports the coordinates.  Both are None when worktree isolation is
+    not in use (backward-compatible).
     """
 
     bead_id: str
@@ -130,6 +143,9 @@ class WorkerResult:
     verify_exit: Optional[int]     # exit code of V, or None on error
     error: Optional[Exception]     # set if the worker raised
     timed_out: bool = False        # set if the future timed out before completion
+    # VA0b: coordinates for the Mayor's merge-on-pass path
+    branch_name: Optional[str] = None    # "mayor/<bead_id>" branch created by worktree_manager
+    worktree_path: Optional[str] = None  # path on disk; Mayor tears this down after merge
 
 
 @dataclass
@@ -221,6 +237,23 @@ class Runners:
     # Injected so tests use a fake; live path is a cheap-tier dispatch.
     # Fail-safe: reconcile treats None/raises as "wait" — never auto-kill on judge failure.
     judge: Optional[Callable[..., str]] = None
+    # VA0b verify-in-worktree seam: run_verify_in_cwd(cmd, timeout_s, cwd) → int
+    # When present, the worker calls this with the worktree cwd so V sees the
+    # worker's committed changes.  Falls back to run_verify(cmd, timeout_s)
+    # when None (backward-compatible for tests that don't exercise worktrees).
+    run_verify_in_cwd: Optional[Callable[[str, int, str], int]] = None
+    # VA0b named-branch worktree lifecycle seam (all three must be set together).
+    # When worktree_create is present, _mayor_worker uses the new lifecycle:
+    #   worktree_create(bead_id) → Optional[tuple[str, str]]  (path, branch_name)
+    #     Returns None if git is unavailable or worktree add failed.
+    #   worktree_teardown(path, branch_name) → None
+    #     Called by the Mayor after merge decision; never by the worker itself.
+    #   merge_branch(branch_name) → int
+    #     Called by the Mayor under _MERGE_LOCK on V-pass.  Returns git exit code.
+    # When absent, falls back to the old worktree_manager context-manager path.
+    worktree_create: Optional[Callable[[str], Optional[tuple]]] = None
+    worktree_teardown: Optional[Callable[[str, str], None]] = None
+    merge_branch: Optional[Callable[[str], int]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +396,14 @@ def _live_dispatch_with_cwd(
 
     ``cwd`` is the working directory for the subprocess (a per-worker git worktree
     path, or None to inherit the current process directory).
+
+    VA0a: Strip ANTHROPIC_API_KEY from the subprocess env so that `claude -p`
+    uses the Max-plan OAuth token (stored in ~/.claude/credentials) rather than
+    a potentially depleted API key inherited from the parent process env.
     """
+    # Build a clean env: inherit everything EXCEPT ANTHROPIC_API_KEY so that
+    # `claude -p` falls back to the Max-plan OAuth credentials on disk.
+    dispatch_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "json"],
@@ -372,6 +412,7 @@ def _live_dispatch_with_cwd(
             timeout=timeout_s,
             check=False,
             cwd=cwd,
+            env=dispatch_env,
         )
         try:
             data = json.loads(result.stdout)
@@ -400,9 +441,34 @@ def _live_run_verify(cmd: str, timeout_s: int) -> int:
         return 1
 
 
+def _live_run_verify_in_cwd(cmd: str, timeout_s: int, cwd: str) -> int:
+    """Run the verification command inside a specific directory, return its exit code.
+
+    VA0b: V must run with cwd=<worktree path> so it sees the worker's committed
+    changes in isolation rather than the stale working-branch checkout.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=False,
+            timeout=timeout_s,
+            check=False,
+            cwd=cwd,
+        )
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        logger.warning("verify command timed out after %ds (cwd=%s)", timeout_s, cwd)
+        return 1
+
+
 @contextlib.contextmanager
 def _live_worktree_manager(bead_id: str) -> Iterator[Optional[str]]:
     """Create an isolated git worktree for *bead_id*, yield its path, then remove it.
+
+    LEGACY CONTEXT-MANAGER PATH — kept for backward compatibility with tests and
+    callers that do not use the VA0b named-branch lifecycle.  New production code
+    uses _live_worktree_create / _live_worktree_teardown instead.
 
     Serialized through _WORKTREE_LOCK so concurrent workers never race on
     `git worktree add` (which modifies the shared .git/config and packed-refs).
@@ -474,8 +540,140 @@ def _live_worktree_manager(bead_id: str) -> Iterator[Optional[str]]:
                 )
 
 
+def _discover_repo_root() -> Optional[str]:
+    """Return the git repo root for the current working directory, or None."""
+    try:
+        rev_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if rev_result.returncode != 0:
+            return None
+        return rev_result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def _live_worktree_create(bead_id: str) -> Optional[tuple]:
+    """VA0b: Create a named-branch worktree for *bead_id*.
+
+    Creates worktree on branch ``mayor/<bead_id>`` (not detached) so the
+    worker's commits are reachable for merge.
+
+    Returns ``(worktree_path: str, branch_name: str)`` on success, or None if
+    git is unavailable or `git worktree add` fails.
+
+    Serialized through _WORKTREE_LOCK — safe for concurrent workers.
+    """
+    repo_root = _discover_repo_root()
+    if repo_root is None:
+        return None
+
+    # Sanitize bead_id for branch name and directory
+    safe_id = bead_id.replace("/", "_").replace("\\", "_")
+    branch_name = f"mayor/{bead_id}"
+    wt_dir = os.path.join(
+        tempfile.gettempdir(),
+        f"mayor-wt-{safe_id}-{threading.get_ident()}",
+    )
+
+    with _WORKTREE_LOCK:
+        add_result = subprocess.run(
+            ["git", "worktree", "add", "-b", branch_name, wt_dir, "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=repo_root,
+        )
+        if add_result.returncode != 0:
+            logger.warning(
+                "git worktree add (named branch) failed for bead %s: %s",
+                bead_id,
+                add_result.stderr.strip(),
+            )
+            return None
+
+    return (wt_dir, branch_name)
+
+
+def _live_worktree_teardown(worktree_path: str, branch_name: str) -> None:
+    """VA0b: Remove a worktree and delete its branch.
+
+    Always called by the Mayor after merge decision — never by the worker.
+    Serialized through _WORKTREE_LOCK to match creation serialization.
+    Fail-safe: errors are logged and swallowed (teardown must not crash the Mayor).
+    """
+    repo_root = _discover_repo_root()
+
+    with _WORKTREE_LOCK:
+        try:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", worktree_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=repo_root or ".",
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            logger.warning("worktree teardown (remove) failed for %s: %s", worktree_path, exc)
+
+        # Delete the named branch so it doesn't accumulate
+        if repo_root and branch_name:
+            try:
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=repo_root,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                logger.warning("worktree branch delete failed for %s: %s", branch_name, exc)
+
+
+def _live_merge_worktree_branch(branch_name: str) -> int:
+    """VA0b: Merge *branch_name* into the current working branch.
+
+    Called by the Mayor (serialized under _MERGE_LOCK) after V passes.
+    Returns the git merge exit code (0 = success, non-zero = conflict/error).
+    Fail-safe: any subprocess error is logged and returns 1.
+    """
+    repo_root = _discover_repo_root()
+    if repo_root is None:
+        logger.warning("merge_worktree_branch: not in a git repo, skipping merge")
+        return 1
+
+    try:
+        result = subprocess.run(
+            ["git", "merge", "--no-ff", branch_name,
+             "-m", f"Mayor: merge {branch_name} (V passed)"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "merge %s failed (exit %d): %s",
+                branch_name, result.returncode, result.stderr.strip(),
+            )
+        return result.returncode
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("merge_worktree_branch raised: %s", exc)
+        return 1
+
+
 def make_live_runners() -> Runners:
-    """Construct the real (live) Runners instance."""
+    """Construct the real (live) Runners instance.
+
+    VA0b: wires the named-branch worktree lifecycle (worktree_create /
+    worktree_teardown / merge_branch) alongside the legacy worktree_manager
+    (kept for backward compat).  When worktree_create is present,
+    _mayor_worker uses the VA0b path; otherwise it falls back to the context-
+    manager path.
+    """
     return Runners(
         beads_ready=_live_beads_ready,
         beads_close=_live_beads_close,
@@ -484,8 +682,13 @@ def make_live_runners() -> Runners:
         brain_capture=_live_brain_capture,
         dispatch=_live_dispatch,
         run_verify=_live_run_verify,
+        run_verify_in_cwd=_live_run_verify_in_cwd,
         worktree_manager=_live_worktree_manager,
         dispatch_with_cwd=_live_dispatch_with_cwd,
+        # VA0b named-branch worktree lifecycle
+        worktree_create=_live_worktree_create,
+        worktree_teardown=_live_worktree_teardown,
+        merge_branch=_live_merge_worktree_branch,
     )
 
 
@@ -1088,70 +1291,146 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
             error=exc,
         )
 
+    # ------------------------------------------------------------------
     # EXECUTE — dispatch the subagent inside an isolated worktree when available.
-    # If runners.worktree_manager is None, fall back to the plain dispatch path
-    # (backward-compatible for tests and sequential runners that don't need isolation).
-    wt_ctx: Any = (
-        runners.worktree_manager(bead_id)
-        if runners.worktree_manager is not None
-        else contextlib.nullcontext(None)
-    )
+    #
+    # VA0b (named-branch lifecycle): when runners.worktree_create is set, use
+    # the new lifecycle where the Mayor controls teardown after merge decision.
+    # The worker creates the worktree, dispatches, runs V in the worktree, then
+    # RETURNS without tearing down — the Mayor tears down after merge-or-discard.
+    #
+    # Legacy (context-manager): when worktree_create is None but worktree_manager
+    # is set, fall back to the old path (context manager handles creation +
+    # teardown, backward-compatible with existing tests).
+    #
+    # No isolation: fall back to plain dispatch (backward-compatible).
+    # ------------------------------------------------------------------
 
-    try:
-        with wt_ctx as worktree_path:
-            # Choose the dispatch callable: cwd-aware when worktree is active
-            if worktree_path is not None and runners.dispatch_with_cwd is not None:
-                dispatch_fn = lambda p, m, t: runners.dispatch_with_cwd(p, m, t, worktree_path)
-            else:
-                dispatch_fn = runners.dispatch
+    if runners.worktree_create is not None:
+        # ---- VA0b named-branch path ----
+        wt_info = runners.worktree_create(bead_id)
+        if wt_info is not None:
+            wt_path, wt_branch = wt_info
+        else:
+            wt_path, wt_branch = None, None
 
+        # Choose dispatch callable
+        if wt_path is not None and runners.dispatch_with_cwd is not None:
+            dispatch_fn = lambda p, m, t: runners.dispatch_with_cwd(p, m, t, wt_path)
+        else:
+            dispatch_fn = runners.dispatch
+
+        try:
+            dispatch_result = dispatch_fn(prompt, tier, LOOP_ITER_TIMEOUT_S)
+        except Exception as exc:
+            runners.brain_capture(
+                f"Mayor dispatch exception for bead {bead_id}: {exc}",
+                "pattern",
+            )
+            return WorkerResult(
+                bead_id=bead_id,
+                dispatch_result={"tokens": 0, "output": ""},
+                verify_exit=None,
+                error=exc,
+                branch_name=wt_branch,
+                worktree_path=wt_path,
+            )
+
+        # VERIFY — run V IN the worktree so it sees the worker's committed code
+        if verify_cmd:
             try:
-                dispatch_result = dispatch_fn(prompt, tier, LOOP_ITER_TIMEOUT_S)
+                if wt_path is not None and runners.run_verify_in_cwd is not None:
+                    exit_code = runners.run_verify_in_cwd(
+                        verify_cmd, LOOP_VERIFY_TIMEOUT_S, wt_path
+                    )
+                else:
+                    exit_code = runners.run_verify(verify_cmd, LOOP_VERIFY_TIMEOUT_S)
             except Exception as exc:
-                runners.brain_capture(
-                    f"Mayor dispatch exception for bead {bead_id}: {exc}",
-                    "pattern",
-                )
                 return WorkerResult(
                     bead_id=bead_id,
-                    dispatch_result={"tokens": 0, "output": ""},
+                    dispatch_result=dispatch_result,
                     verify_exit=None,
                     error=exc,
+                    branch_name=wt_branch,
+                    worktree_path=wt_path,
                 )
+        else:
+            exit_code = None  # No verify cmd — Mayor will escalate
 
-            # VERIFY — run V in the worker (reads env, does not mutate bead state)
-            if verify_cmd:
+        # Worker returns WITHOUT tearing down.  The Mayor merges (on V-pass) or
+        # discards (on V-fail) and then tears down via runners.worktree_teardown.
+        return WorkerResult(
+            bead_id=bead_id,
+            dispatch_result=dispatch_result,
+            verify_exit=exit_code,
+            error=None,
+            branch_name=wt_branch,
+            worktree_path=wt_path,
+        )
+
+    else:
+        # ---- Legacy context-manager path (unchanged) ----
+        wt_ctx: Any = (
+            runners.worktree_manager(bead_id)
+            if runners.worktree_manager is not None
+            else contextlib.nullcontext(None)
+        )
+
+        try:
+            with wt_ctx as worktree_path:
+                # Choose the dispatch callable: cwd-aware when worktree is active
+                if worktree_path is not None and runners.dispatch_with_cwd is not None:
+                    dispatch_fn = lambda p, m, t: runners.dispatch_with_cwd(p, m, t, worktree_path)
+                else:
+                    dispatch_fn = runners.dispatch
+
                 try:
-                    exit_code = runners.run_verify(verify_cmd, LOOP_VERIFY_TIMEOUT_S)
+                    dispatch_result = dispatch_fn(prompt, tier, LOOP_ITER_TIMEOUT_S)
                 except Exception as exc:
+                    runners.brain_capture(
+                        f"Mayor dispatch exception for bead {bead_id}: {exc}",
+                        "pattern",
+                    )
                     return WorkerResult(
                         bead_id=bead_id,
-                        dispatch_result=dispatch_result,
+                        dispatch_result={"tokens": 0, "output": ""},
                         verify_exit=None,
                         error=exc,
                     )
-            else:
-                exit_code = None  # No verify cmd — Mayor will escalate
 
-    except Exception as exc:
-        # Catch any unexpected exception from the worktree lifecycle itself
-        runners.brain_capture(
-            f"Mayor worktree lifecycle exception for bead {bead_id}: {exc}",
-            "pattern",
-        )
+                # VERIFY — run V in the worker (reads env, does not mutate bead state)
+                if verify_cmd:
+                    try:
+                        exit_code = runners.run_verify(verify_cmd, LOOP_VERIFY_TIMEOUT_S)
+                    except Exception as exc:
+                        return WorkerResult(
+                            bead_id=bead_id,
+                            dispatch_result=dispatch_result,
+                            verify_exit=None,
+                            error=exc,
+                        )
+                else:
+                    exit_code = None  # No verify cmd — Mayor will escalate
+
+        except Exception as exc:
+            # Catch any unexpected exception from the worktree lifecycle itself
+            runners.brain_capture(
+                f"Mayor worktree lifecycle exception for bead {bead_id}: {exc}",
+                "pattern",
+            )
+            return WorkerResult(
+                bead_id=bead_id,
+                dispatch_result={"tokens": 0, "output": ""},
+                verify_exit=None,
+                error=exc,
+            )
+
         return WorkerResult(
             bead_id=bead_id,
-            dispatch_result={"tokens": 0, "output": ""},
-            verify_exit=None,
-            error=exc,
+            dispatch_result=dispatch_result,
+            verify_exit=exit_code,
+            error=None,
         )
-
-    return WorkerResult(
-        bead_id=bead_id,
-        dispatch_result=dispatch_result,
-        verify_exit=exit_code,
-        error=None,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1478,33 +1757,116 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                         tier=handle.model,
                         extra=f"timed_out={res.timed_out} error={res.error}",
                     )
+                    # VA0b: tear down worktree even on crash (discard the code)
+                    if res.worktree_path is not None and runners.worktree_teardown is not None:
+                        try:
+                            runners.worktree_teardown(
+                                res.worktree_path, res.branch_name or ""
+                            )
+                        except Exception as td_exc:
+                            logger.warning(
+                                "Mayor: worktree teardown (crash) for %s failed: %s",
+                                bead_id, td_exc,
+                            )
                 elif res.verify_exit == 0:
-                    # V passed — Mayor closes the bead (single-writer)
-                    runners.beads_close(bead_id)
-                    bead_statuses[bead_id] = "closed"
-                    summary.closed += 1
-                    any_closed = True
-                    _mayor_capture(
-                        runners,
-                        f"Mayor: bead {bead_id} closed after verify_exit=0.",
-                        "decision",
-                    )
-                    # P3.2 — ledger: verify passed then close
-                    _ledger_capture(
-                        runners,
-                        action="verify-pass",
-                        bead_id=bead_id,
-                        molecule=cfg.molecule,
-                        tier=handle.model,
-                        extra="verify_exit=0",
-                    )
-                    _ledger_capture(
-                        runners,
-                        action="close",
-                        bead_id=bead_id,
-                        molecule=cfg.molecule,
-                        tier=handle.model,
-                    )
+                    # V passed — VA0b: merge the named branch (serialized), then close
+                    if res.branch_name is not None and runners.merge_branch is not None:
+                        with _MERGE_LOCK:
+                            merge_exit = runners.merge_branch(res.branch_name)
+                        if merge_exit != 0:
+                            # Merge conflict — treat as failure; leave bead open
+                            bead_statuses.pop(bead_id, None)
+                            summary.failed += 1
+                            _mayor_capture(
+                                runners,
+                                f"Mayor: bead {bead_id} merge FAILED (exit={merge_exit}) "
+                                f"for branch {res.branch_name}. Bead left open.",
+                                "pattern",
+                            )
+                            _ledger_capture(
+                                runners,
+                                action="merge-fail",
+                                bead_id=bead_id,
+                                molecule=cfg.molecule,
+                                tier=handle.model,
+                                extra=f"branch={res.branch_name} merge_exit={merge_exit}",
+                            )
+                            # Teardown without close
+                            if res.worktree_path is not None and runners.worktree_teardown is not None:
+                                try:
+                                    runners.worktree_teardown(
+                                        res.worktree_path, res.branch_name
+                                    )
+                                except Exception as td_exc:
+                                    logger.warning(
+                                        "Mayor: worktree teardown (merge-fail) for %s: %s",
+                                        bead_id, td_exc,
+                                    )
+                            # Skip close — continue to next bead
+                        else:
+                            # Merge succeeded — now close and teardown
+                            runners.beads_close(bead_id)
+                            bead_statuses[bead_id] = "closed"
+                            summary.closed += 1
+                            any_closed = True
+                            _mayor_capture(
+                                runners,
+                                f"Mayor: bead {bead_id} closed after V=0 + merge {res.branch_name}.",
+                                "decision",
+                            )
+                            _ledger_capture(
+                                runners,
+                                action="verify-pass",
+                                bead_id=bead_id,
+                                molecule=cfg.molecule,
+                                tier=handle.model,
+                                extra=f"verify_exit=0 branch={res.branch_name}",
+                            )
+                            _ledger_capture(
+                                runners,
+                                action="close",
+                                bead_id=bead_id,
+                                molecule=cfg.molecule,
+                                tier=handle.model,
+                            )
+                            # Teardown AFTER close (Mayor is single-writer)
+                            if res.worktree_path is not None and runners.worktree_teardown is not None:
+                                try:
+                                    runners.worktree_teardown(
+                                        res.worktree_path, res.branch_name
+                                    )
+                                except Exception as td_exc:
+                                    logger.warning(
+                                        "Mayor: worktree teardown (post-close) for %s: %s",
+                                        bead_id, td_exc,
+                                    )
+                    else:
+                        # No VA0b branch — plain V-passed path (backward compat)
+                        runners.beads_close(bead_id)
+                        bead_statuses[bead_id] = "closed"
+                        summary.closed += 1
+                        any_closed = True
+                        _mayor_capture(
+                            runners,
+                            f"Mayor: bead {bead_id} closed after verify_exit=0.",
+                            "decision",
+                        )
+                        # P3.2 — ledger: verify passed then close
+                        _ledger_capture(
+                            runners,
+                            action="verify-pass",
+                            bead_id=bead_id,
+                            molecule=cfg.molecule,
+                            tier=handle.model,
+                            extra="verify_exit=0",
+                        )
+                        _ledger_capture(
+                            runners,
+                            action="close",
+                            bead_id=bead_id,
+                            molecule=cfg.molecule,
+                            tier=handle.model,
+                        )
                 else:
                     # V failed or no verify cmd — leave open for reconciler/next round
                     bead_statuses.pop(bead_id, None)
@@ -1523,6 +1885,17 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                         tier=handle.model,
                         extra=f"verify_exit={res.verify_exit}",
                     )
+                    # VA0b: tear down worktree on V-fail (discard code, bead stays open)
+                    if res.worktree_path is not None and runners.worktree_teardown is not None:
+                        try:
+                            runners.worktree_teardown(
+                                res.worktree_path, res.branch_name or ""
+                            )
+                        except Exception as td_exc:
+                            logger.warning(
+                                "Mayor: worktree teardown (V-fail) for %s: %s",
+                                bead_id, td_exc,
+                            )
 
             summary.iterations += 1
             if not any_closed:

@@ -6,6 +6,21 @@ Tests for bead fblai-rbvj9:
 3. Worktrees are torn down after the worker finishes (and on worker error).
 4. Single-writer invariant preserved (no bead-status mutation from worker threads).
 
+VA0b lifecycle note (2026-06-22):
+  Tests 1–4 above exercise the LEGACY context-manager path (_mayor_worker with
+  worktree_manager set, worktree_create=None).  In the legacy path, teardown is
+  controlled by the context manager and fires when _mayor_worker exits, which is
+  the behavior these tests assert.
+
+  The NEW VA0b lifecycle (worktree_create / worktree_teardown / merge_branch) is
+  tested in test_worktree_integration.py, where teardown is the Mayor's
+  responsibility and fires AFTER the merge decision.
+
+  These isolation guarantees all hold in both paths:
+    - Workers receive DISTINCT worktree paths.
+    - git worktree add/remove is serialized through _WORKTREE_LOCK.
+    - Single-writer invariant: workers never call beads_close or beads_update.
+
 Run: python3 -m pytest scripts/tests/test_worktree_isolation.py -q
 """
 
@@ -881,4 +896,137 @@ class TestLiveWorktreeManager:
 
         assert paths[0] != paths[1], (
             f"Two worktrees got the same path: {paths[0]!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — VA0b lifecycle: worker does NOT tear down (Mayor controls teardown)
+# ---------------------------------------------------------------------------
+
+class TestVA0bWorkerDoesNotTeardown:
+    """In the VA0b lifecycle (worktree_create set), _mayor_worker must NOT tear down
+    the worktree.  Teardown is the Mayor's responsibility after merge decision.
+
+    These tests use fake worktree_create / worktree_teardown to confirm the
+    lifecycle separation without needing a real git repo.
+    """
+
+    def test_worker_does_not_call_worktree_teardown(self) -> None:
+        """With VA0b runners, _mayor_worker must not call worktree_teardown."""
+        teardown_calls: List[tuple] = []
+        create_calls: List[str] = []
+
+        def _fake_create(bead_id: str) -> Optional[tuple]:
+            create_calls.append(bead_id)
+            return (f"/tmp/fake-wt-{bead_id}", f"mayor/{bead_id}")
+
+        def _fake_teardown(path: str, branch: str) -> None:
+            teardown_calls.append((path, branch))
+
+        bead = _make_bead("fblai-va0b-no-teardown")
+        cfg = _make_cfg()
+
+        runners = Runners(
+            beads_ready=MagicMock(return_value=[]),
+            beads_close=MagicMock(),
+            beads_update=MagicMock(),
+            brain_recall=MagicMock(return_value=""),
+            brain_capture=MagicMock(),
+            dispatch=MagicMock(return_value={"tokens": 5, "output": "done"}),
+            run_verify=MagicMock(return_value=0),
+            run_verify_in_cwd=MagicMock(return_value=0),
+            dispatch_with_cwd=MagicMock(return_value={"tokens": 5, "output": "done"}),
+            worktree_create=_fake_create,
+            worktree_teardown=_fake_teardown,
+            merge_branch=MagicMock(return_value=0),
+        )
+
+        result = _mayor_worker(bead, cfg, runners)
+
+        # Worker should have created the worktree
+        assert len(create_calls) == 1
+        # Worker must NOT have called teardown — that's the Mayor's job
+        assert len(teardown_calls) == 0, (
+            f"worktree_teardown was called {len(teardown_calls)} time(s) from "
+            "_mayor_worker — in the VA0b lifecycle, only the Mayor tears down"
+        )
+        # Worker must NOT have called merge_branch
+        runners.merge_branch.assert_not_called()
+        # Worker must return branch and path coordinates for the Mayor
+        assert result.branch_name == f"mayor/{bead['id']}"
+        assert result.worktree_path is not None
+
+    def test_worker_returns_branch_name_and_worktree_path(self) -> None:
+        """WorkerResult must carry branch_name and worktree_path for the Mayor."""
+        bead_id = "fblai-va0b-coords"
+        bead = _make_bead(bead_id)
+        cfg = _make_cfg()
+
+        expected_path = f"/tmp/fake-wt-{bead_id}"
+        expected_branch = f"mayor/{bead_id}"
+
+        runners = Runners(
+            beads_ready=MagicMock(return_value=[]),
+            beads_close=MagicMock(),
+            beads_update=MagicMock(),
+            brain_recall=MagicMock(return_value=""),
+            brain_capture=MagicMock(),
+            dispatch=MagicMock(return_value={"tokens": 5, "output": "done"}),
+            run_verify=MagicMock(return_value=0),
+            run_verify_in_cwd=MagicMock(return_value=0),
+            dispatch_with_cwd=MagicMock(return_value={"tokens": 5, "output": "done"}),
+            worktree_create=lambda bid: (expected_path, expected_branch),
+            worktree_teardown=MagicMock(),
+            merge_branch=MagicMock(return_value=0),
+        )
+
+        result = _mayor_worker(bead, cfg, runners)
+
+        assert result.branch_name == expected_branch, (
+            f"Expected branch_name={expected_branch!r}, got {result.branch_name!r}"
+        )
+        assert result.worktree_path == expected_path, (
+            f"Expected worktree_path={expected_path!r}, got {result.worktree_path!r}"
+        )
+        assert result.error is None
+
+    def test_va0b_path_when_worktree_create_set_not_legacy(self) -> None:
+        """When worktree_create is set, _mayor_worker uses VA0b path not legacy path.
+
+        Confirms by checking worktree_manager (legacy) is NOT called when
+        worktree_create is set.
+        """
+        legacy_wt_calls: List[str] = []
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def _legacy_manager(bead_id: str):
+            legacy_wt_calls.append(bead_id)
+            yield "/tmp/legacy-path"
+
+        bead = _make_bead("fblai-va0b-path-check")
+        cfg = _make_cfg()
+
+        runners = Runners(
+            beads_ready=MagicMock(return_value=[]),
+            beads_close=MagicMock(),
+            beads_update=MagicMock(),
+            brain_recall=MagicMock(return_value=""),
+            brain_capture=MagicMock(),
+            dispatch=MagicMock(return_value={"tokens": 5, "output": "done"}),
+            run_verify=MagicMock(return_value=0),
+            run_verify_in_cwd=MagicMock(return_value=0),
+            dispatch_with_cwd=MagicMock(return_value={"tokens": 5, "output": "done"}),
+            worktree_manager=_legacy_manager,     # legacy path — must NOT be called
+            worktree_create=lambda bid: ("/tmp/new-path", f"mayor/{bid}"),  # VA0b path
+            worktree_teardown=MagicMock(),
+            merge_branch=MagicMock(return_value=0),
+        )
+
+        _mayor_worker(bead, cfg, runners)
+
+        assert len(legacy_wt_calls) == 0, (
+            f"Legacy worktree_manager was called {len(legacy_wt_calls)} time(s) "
+            "despite worktree_create being set — VA0b path not taken"
         )
