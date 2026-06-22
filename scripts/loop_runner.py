@@ -146,6 +146,10 @@ class WorkerResult:
     # VA0b: coordinates for the Mayor's merge-on-pass path
     branch_name: Optional[str] = None    # "mayor/<bead_id>" branch created by worktree_manager
     worktree_path: Optional[str] = None  # path on disk; Mayor tears this down after merge
+    # VA1: rate-limit backpressure.  True when the dispatch hit a provider
+    # rate-limit (NOT a code failure).  The Mayor returns the bead to the ready
+    # set (never burns it) and the governor pause-stops for a clean resume.
+    rate_limited: bool = False
 
 
 @dataclass
@@ -168,6 +172,11 @@ class MayorSummary:
     iterations: int = 0             # completion-rounds, not individual beads
     total_tokens: int = 0
     consecutive_zero_close: int = 0
+    # VA1: set True once any worker reports a rate-limit.  Triggers the governor
+    # pause-stop ("rate-limited").  rate_limited_beads counts how many beads were
+    # returned to the ready set by backpressure (none were burned/failed).
+    rate_limited: bool = False
+    rate_limited_beads: int = 0
 
 
 @dataclass
@@ -414,13 +423,24 @@ def _live_dispatch_with_cwd(
             cwd=cwd,
             env=dispatch_env,
         )
+        # VA1: scan the full CLI response (stdout + stderr) for a rate-limit
+        # signature.  A rate-limited dispatch is reported structurally via the
+        # ``rate_limited`` key so the worker classifies it without re-scanning.
+        blob = f"{result.stdout or ''}\n{result.stderr or ''}"
         try:
             data = json.loads(result.stdout)
             tokens = data.get("usage", {}).get("output_tokens", 0)
             output = data.get("result", result.stdout)
-            return {"tokens": tokens, "output": output}
+            rate_limited = bool(data.get("is_error")) and is_rate_limited(
+                {"output": f"{output}\n{result.stderr or ''}"}, None
+            )
+            return {"tokens": tokens, "output": output, "rate_limited": rate_limited}
         except json.JSONDecodeError:
-            return {"tokens": 0, "output": result.stdout}
+            return {
+                "tokens": 0,
+                "output": result.stdout,
+                "rate_limited": is_rate_limited({"output": blob}, None),
+            }
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         raise RuntimeError(f"dispatch failed: {exc}") from exc
 
@@ -460,6 +480,57 @@ def _live_run_verify_in_cwd(cmd: str, timeout_s: int, cwd: str) -> int:
     except subprocess.TimeoutExpired:
         logger.warning("verify command timed out after %ds (cwd=%s)", timeout_s, cwd)
         return 1
+
+
+# ---------------------------------------------------------------------------
+# VA1 — Rate-limit classifier (pure; shared by live dispatch + worker)
+# ---------------------------------------------------------------------------
+
+# Case-insensitive substrings that mark a provider rate-limit / usage-limit.
+# A rate-limit is a backpressure signal — NOT a code failure.  Keep this list
+# focused: a false positive only pauses the run (the bead is never burned and a
+# resume re-dispatches it), but over-broad matching would pause needlessly.
+_RATE_LIMIT_SIGNATURES = (
+    "rate limit",
+    "rate_limit",
+    "rate-limit",
+    "ratelimit",
+    "429",
+    "too many requests",
+    "usage limit",          # Max-plan: "Claude AI usage limit reached"
+    "quota exceeded",
+)
+
+
+def is_rate_limited(
+    dispatch_result: Optional[dict],
+    error: Optional[BaseException],
+) -> bool:
+    """Classify a dispatch outcome as RATE_LIMITED (VA1).
+
+    RATE_LIMITED is treated DISTINCTLY from FAILED: a True result means the
+    Mayor returns the bead to the ready set (never burns it) and the governor
+    pause-stops so the loop resumes cleanly once the rate-limit window clears.
+
+    Detection sources (any one is sufficient):
+      1. An explicit truthy ``rate_limited`` key on the dispatch_result dict —
+         the structured signal set by the live dispatch when it can detect the
+         limit from the CLI response.  This is the primary, lowest-noise path.
+      2. A rate-limit signature substring in the dispatch_result ``output`` text.
+      3. A rate-limit signature substring in ``str(error)`` (a raised exception,
+         e.g. an API 429 surfaced as a RuntimeError).
+    """
+    if dispatch_result is not None:
+        if dispatch_result.get("rate_limited"):
+            return True
+        text = str(dispatch_result.get("output", "") or "").lower()
+        if any(sig in text for sig in _RATE_LIMIT_SIGNATURES):
+            return True
+    if error is not None:
+        etext = str(error).lower()
+        if any(sig in etext for sig in _RATE_LIMIT_SIGNATURES):
+            return True
+    return False
 
 
 @contextlib.contextmanager
@@ -1323,6 +1394,18 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
         try:
             dispatch_result = dispatch_fn(prompt, tier, LOOP_ITER_TIMEOUT_S)
         except Exception as exc:
+            # VA1: a rate-limit raised as an exception is backpressure, not a
+            # crash — flag it so the Mayor returns the bead to the ready set.
+            if is_rate_limited(None, exc):
+                return WorkerResult(
+                    bead_id=bead_id,
+                    dispatch_result={"tokens": 0, "output": str(exc)},
+                    verify_exit=None,
+                    error=None,
+                    rate_limited=True,
+                    branch_name=wt_branch,
+                    worktree_path=wt_path,
+                )
             runners.brain_capture(
                 f"Mayor dispatch exception for bead {bead_id}: {exc}",
                 "pattern",
@@ -1332,6 +1415,19 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
                 dispatch_result={"tokens": 0, "output": ""},
                 verify_exit=None,
                 error=exc,
+                branch_name=wt_branch,
+                worktree_path=wt_path,
+            )
+
+        # VA1: rate-limit detected in the dispatch response — skip V (no real
+        # work happened) and let the Mayor return the bead to the ready set.
+        if is_rate_limited(dispatch_result, None):
+            return WorkerResult(
+                bead_id=bead_id,
+                dispatch_result=dispatch_result,
+                verify_exit=None,
+                error=None,
+                rate_limited=True,
                 branch_name=wt_branch,
                 worktree_path=wt_path,
             )
@@ -1387,6 +1483,15 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
                 try:
                     dispatch_result = dispatch_fn(prompt, tier, LOOP_ITER_TIMEOUT_S)
                 except Exception as exc:
+                    # VA1: rate-limit raised as an exception → backpressure, not a crash.
+                    if is_rate_limited(None, exc):
+                        return WorkerResult(
+                            bead_id=bead_id,
+                            dispatch_result={"tokens": 0, "output": str(exc)},
+                            verify_exit=None,
+                            error=None,
+                            rate_limited=True,
+                        )
                     runners.brain_capture(
                         f"Mayor dispatch exception for bead {bead_id}: {exc}",
                         "pattern",
@@ -1396,6 +1501,16 @@ def _mayor_worker(bead: dict, cfg: RunConfig, runners: Runners) -> WorkerResult:
                         dispatch_result={"tokens": 0, "output": ""},
                         verify_exit=None,
                         error=exc,
+                    )
+
+                # VA1: rate-limit detected in the dispatch response — skip V.
+                if is_rate_limited(dispatch_result, None):
+                    return WorkerResult(
+                        bead_id=bead_id,
+                        dispatch_result=dispatch_result,
+                        verify_exit=None,
+                        error=None,
+                        rate_limited=True,
                     )
 
                 # VERIFY — run V in the worker (reads env, does not mutate bead state)
@@ -1737,7 +1852,41 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 # Accumulate tokens inline — res is available here; no second future.result call needed.
                 summary.total_tokens += res.dispatch_result.get("tokens", 0)
 
-                if res.timed_out or res.error is not None:
+                if res.rate_limited:
+                    # VA1: RATE_LIMITED ≠ FAILED.  Never burn the bead — return it
+                    # to the ready set (open) so a clean resume re-dispatches it
+                    # once the rate-limit window clears.  Discard any partial
+                    # worktree code and flag the governor to pause-stop the run.
+                    bead_statuses.pop(bead_id, None)
+                    summary.rate_limited = True
+                    summary.rate_limited_beads += 1
+                    if runners.beads_update is not None:
+                        runners.beads_update(bead_id, "open")
+                    _mayor_capture(
+                        runners,
+                        f"Mayor: bead {bead_id} RATE_LIMITED — returned to ready set, "
+                        f"pausing run for clean resume (not a failure).",
+                        "pattern",
+                    )
+                    _ledger_capture(
+                        runners,
+                        action="rate-limited",
+                        bead_id=bead_id,
+                        molecule=cfg.molecule,
+                        tier=handle.model,
+                    )
+                    # Discard partial worktree code (VA0b lifecycle).
+                    if res.worktree_path is not None and runners.worktree_teardown is not None:
+                        try:
+                            runners.worktree_teardown(
+                                res.worktree_path, res.branch_name or ""
+                            )
+                        except Exception as td_exc:
+                            logger.warning(
+                                "Mayor: worktree teardown (rate-limited) for %s: %s",
+                                bead_id, td_exc,
+                            )
+                elif res.timed_out or res.error is not None:
                     # Worker crashed or timed out — slot stays occupied
                     recovery_blocked.add(bead_id)
                     bead_statuses[bead_id] = "in_progress"  # stays in_progress until reconciled
@@ -1954,6 +2103,12 @@ def should_continue_mayor(
         return False, "max-iterations"
     if summary.total_tokens >= cfg.budget_tokens:
         return False, "budget-exhausted"
+    # VA1: rate-limit pause-stop — a graceful, resumable stop.  Checked before
+    # the capacity/no-progress signals: the rate-limited bead has been returned
+    # to the ready set (never burned), so stopping here lets the run resume
+    # cleanly once the provider rate-limit window clears rather than spinning.
+    if summary.rate_limited:
+        return False, "rate-limited"
     # capacity-exhausted before no-progress: when workers fill all slots with crashes,
     # the specific reason is more diagnostic than the generic no-progress signal.
     if len(recovery_blocked) >= cfg.max_workers and not active:
@@ -2265,6 +2420,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "queue-empty", "once", "max-iterations",
             "budget-exhausted", "no-progress",
             "capacity-exhausted-by-stuck-workers",
+            # VA1: a rate-limit pause is an expected, resumable exit — exit 0 so
+            # the scheduling layer re-invokes cleanly rather than flagging a crash.
+            "rate-limited",
         )
         return 0 if mayor_summary.stop_reason in _clean_exits else 1
 
