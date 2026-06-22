@@ -93,6 +93,8 @@ if [ -d "$REPO_HOOKS_DIR" ] && [ -d "$HOOKS_DIR" ]; then
     cp "$REPO_HOOKS_DIR/pre-tool-use.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/dispatch_gate.py" "$HOOKS_DIR/"   # imported by pre-tool-use.py (subagent dispatch gate)
     cp "$REPO_DIR/scripts/loop-statusline.py" "$CLAUDE_DIR/"   # OBS3 loop statusline (reads ~/.claude/loop-state.json)
+    cp "$REPO_DIR/scripts/loop_runner.py" "$CLAUDE_DIR/"   # Mayor v1 runner (deployed; invoke from target-repo cwd; --max-workers >1 = bounded-concurrent Mayor)
+    cp "$REPO_DIR/scripts/reconciler.py" "$CLAUDE_DIR/"    # Mayor reconciler (sibling import by loop_runner.py)
     cp "$REPO_HOOKS_DIR/user-prompt-submit.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/beads_writer.py" "$HOOKS_DIR/"
 
