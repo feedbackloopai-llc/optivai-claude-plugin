@@ -443,6 +443,131 @@
         "failed": ["gz-s11a"],
         "stop_reason": "max-iterations"
       }
+    },
+    {
+      "id": "VA1-S12-single-rate-limited",
+      "description": "VA1: single bead, dispatch throws 'rate limit exceeded'. Mayor marks in_progress before dispatch, then returns the bead to open (never burned). Governor pause-stops with rate-limited. Bead not closed, not failed.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-va1-a", "title": "Rate-limited task", "priority": 1, "labels": ["tier:implement"], "body": "Task A", "effort": "implement"}
+      ],
+      "dep_chain": [],
+      "worker_outcomes": {
+        "gz-va1-a": {"error": "rate limit exceeded", "tokens": 0}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-va1-a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-va1-a", "status": "open"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-va1-a", "tier": "sonnet"}
+        ],
+        "closed": [],
+        "failed": [],
+        "stop_reason": "rate-limited"
+      }
+    },
+    {
+      "id": "VA1-S13-rate-limit-mid-drain",
+      "description": "VA1: 2 beads in dep-chain (B depends on A, max_workers=1). A succeeds and closes. B then dispatches and hits rate-limit — returned to open. Governor pause-stops with rate-limited. A closed, B not closed not failed.",
+      "config": {
+        "max_workers": 1,
+        "max_iterations": 25,
+        "budget_tokens": 10000000,
+        "stuck_threshold_s": 1800,
+        "spawning_window_s": 300,
+        "max_respawns": 1,
+        "verify_cmd": "true",
+        "molecule": "test-molecule",
+        "repo": "/test/repo",
+        "branch": "main"
+      },
+      "beads": [
+        {"id": "gz-va1-b1", "title": "First task succeeds", "priority": 1, "labels": ["tier:implement"], "body": "Task B1", "effort": "implement"},
+        {"id": "gz-va1-b2", "title": "Second task rate-limited", "priority": 2, "labels": ["tier:implement"], "body": "Task B2", "effort": "implement"}
+      ],
+      "dep_chain": [["gz-va1-b2", "gz-va1-b1"]],
+      "worker_outcomes": {
+        "gz-va1-b1": {"verify_exit": 0, "tokens": 10},
+        "gz-va1-b2": {"error": "rate limit exceeded", "tokens": 0}
+      },
+      "always_return_beads": false,
+      "judge_decisions": {},
+      "expected_verdict": {
+        "mayor_events_ordered": [
+          {"type": "beads_update", "bead_id": "gz-va1-b1", "status": "in_progress"},
+          {"type": "beads_close", "bead_id": "gz-va1-b1"},
+          {"type": "beads_update", "bead_id": "gz-va1-b2", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-va1-b2", "status": "open"}
+        ],
+        "dispatch_calls_sorted": [
+          {"bead_id": "gz-va1-b1", "tier": "sonnet"},
+          {"bead_id": "gz-va1-b2", "tier": "sonnet"}
+        ],
+        "closed": ["gz-va1-b1"],
+        "failed": [],
+        "stop_reason": "rate-limited"
+      }
+    },
+    {
+      "id": "VB2-S14-age-dominates",
+      "scenario_type": "order_by_score",
+      "description": "VB2 refinery scoring: age-dominates when attempts and priority are equal. now=1000000.0. Candidate A (verified_at=999900, age=100s) scores higher than B (age=50s) scores higher than C (age=10s). Score = W_AGE*age + W_RETRY*attempts - W_PRIO*priority = 1.0*age + 120*0 - 30*99. Expected order: A, B, C.",
+      "now": 1000000.0,
+      "candidates": [
+        {"bead_id": "gz-vb2-s14a", "branch_name": "mayor/gz-vb2-s14a", "model": "sonnet", "verified_at": 999900.0, "priority": 99, "attempts": 0},
+        {"bead_id": "gz-vb2-s14b", "branch_name": "mayor/gz-vb2-s14b", "model": "sonnet", "verified_at": 999950.0, "priority": 99, "attempts": 0},
+        {"bead_id": "gz-vb2-s14c", "branch_name": "mayor/gz-vb2-s14c", "model": "sonnet", "verified_at": 999990.0, "priority": 99, "attempts": 0}
+      ],
+      "expected_order": ["gz-vb2-s14a", "gz-vb2-s14b", "gz-vb2-s14c"]
+    },
+    {
+      "id": "VB2-S15-retry-bump",
+      "scenario_type": "order_by_score",
+      "description": "VB2 refinery scoring: retry-bump overrides age. Both candidates same verified_at=999990 (age=10s) and priority=99. Candidate A has attempts=1 (score = 10 + 120 - 2970 = -2840), B has attempts=0 (score = 10 + 0 - 2970 = -2960). A merges first.",
+      "now": 1000000.0,
+      "candidates": [
+        {"bead_id": "gz-vb2-s15a", "branch_name": "mayor/gz-vb2-s15a", "model": "sonnet", "verified_at": 999990.0, "priority": 99, "attempts": 1},
+        {"bead_id": "gz-vb2-s15b", "branch_name": "mayor/gz-vb2-s15b", "model": "sonnet", "verified_at": 999990.0, "priority": 99, "attempts": 0}
+      ],
+      "expected_order": ["gz-vb2-s15a", "gz-vb2-s15b"]
+    },
+    {
+      "id": "VB2-S16-priority-ordering",
+      "scenario_type": "order_by_score",
+      "description": "VB2 refinery scoring: lower priority number = higher precedence (W_PRIO is subtracted). All candidates same verified_at=999990 (age=10s) and attempts=0. Priority 1 scores -20, priority 3 scores -80, priority 5 scores -140. Expected order: A(prio=1), B(prio=3), C(prio=5).",
+      "now": 1000000.0,
+      "candidates": [
+        {"bead_id": "gz-vb2-s16a", "branch_name": "mayor/gz-vb2-s16a", "model": "sonnet", "verified_at": 999990.0, "priority": 1, "attempts": 0},
+        {"bead_id": "gz-vb2-s16b", "branch_name": "mayor/gz-vb2-s16b", "model": "sonnet", "verified_at": 999990.0, "priority": 3, "attempts": 0},
+        {"bead_id": "gz-vb2-s16c", "branch_name": "mayor/gz-vb2-s16c", "model": "sonnet", "verified_at": 999990.0, "priority": 5, "attempts": 0}
+      ],
+      "expected_order": ["gz-vb2-s16a", "gz-vb2-s16b", "gz-vb2-s16c"]
+    },
+    {
+      "id": "VB2-S17-tie-break-by-bead-id",
+      "scenario_type": "order_by_score",
+      "description": "VB2 refinery scoring: when scores are identical, lexicographic bead_id tie-break ensures deterministic ordering. Both candidates same verified_at=999990 (age=10s), attempts=0, priority=99 → identical score=-2960. gz-vb2-s17a < gz-vb2-s17b alphabetically, so A comes first.",
+      "now": 1000000.0,
+      "candidates": [
+        {"bead_id": "gz-vb2-s17b", "branch_name": "mayor/gz-vb2-s17b", "model": "sonnet", "verified_at": 999990.0, "priority": 99, "attempts": 0},
+        {"bead_id": "gz-vb2-s17a", "branch_name": "mayor/gz-vb2-s17a", "model": "sonnet", "verified_at": 999990.0, "priority": 99, "attempts": 0}
+      ],
+      "expected_order": ["gz-vb2-s17a", "gz-vb2-s17b"]
     }
   ]
 }
