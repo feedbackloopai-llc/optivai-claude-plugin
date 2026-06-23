@@ -4,7 +4,7 @@ Loads the shared corpus from mayor_parity_corpus.json, runs each scenario
 through run_mayor_loop with scripted fakes, collects the recorded verdict,
 and asserts it equals the expected_verdict in the corpus.
 
-Verdict model:
+Verdict model (mayor_loop scenarios):
   - mayor_events_ordered: Mayor-thread events only (beads_update + beads_close),
     recorded in deterministic order. Excludes dispatch (worker threads, non-deterministic).
   - dispatch_calls_sorted: dispatch calls as a sorted list by (bead_id, tier),
@@ -12,6 +12,11 @@ Verdict model:
   - closed: bead_ids closed by the Mayor in order.
   - failed: bead_ids that completed with non-zero verify_exit.
   - stop_reason: the MayorSummary.stop_reason.
+
+Verdict model (order_by_score scenarios):
+  - Calls order_by_score(candidates, now) directly (pure function, no loop needed).
+  - expected_order: bead_ids in the expected merge order (highest-score-first,
+    tie-broken by bead_id lexicographic ascending).
 
 The corpus sha256 is pinned below and verified at module import time so any
 divergence between the Python and TypeScript copies fails immediately.
@@ -21,7 +26,6 @@ Run: cd /Users/erato949/dev/optivai-claude-plugin-mayor && python3 -m pytest scr
 
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
 import json
 import sys
@@ -44,8 +48,10 @@ for _p in (_SCRIPTS_DIR, _HOOKS_DIR):
 
 from loop_runner import (
     MayorSummary,
+    MergeCandidate,
     RunConfig,
     Runners,
+    order_by_score,
     run_mayor_loop,
 )
 
@@ -58,7 +64,7 @@ _CORPUS_PATH = Path(__file__).parent / "mayor_parity_corpus.json"
 # Byte-identity pin — same value pinned in test/mayor-parity.test.ts.
 # Both tests assert their local corpus file's sha256 equals this constant.
 # Value is set after the corpus is finalised and byte-identical in both repos.
-CORPUS_SHA256 = "e935438f5f50f4d6395c358d4f45d48040e6b41ea0c95323b715b969848a2717"
+CORPUS_SHA256 = "c4adb68d2eca780e7435e95ec5d44decf68b2fff02a4d445901520f51c492045"
 
 
 def _corpus_sha256() -> str:
@@ -128,12 +134,12 @@ def _extract_bead_id_from_prompt(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Scenario runner
+# Mayor-loop scenario runner
 # ---------------------------------------------------------------------------
 
 
 def _run_scenario(scenario: dict, tmp_path: Path) -> dict:
-    """Run one corpus scenario through run_mayor_loop and return the observed verdict.
+    """Run one mayor_loop corpus scenario through run_mayor_loop and return the observed verdict.
 
     Returns:
       {
@@ -193,15 +199,6 @@ def _run_scenario(scenario: dict, tmp_path: Path) -> dict:
         verdict.record_mayor_event({"type": "beads_close", "bead_id": bead_id})
         with verdict._lock:
             verdict.closed.append(bead_id)
-
-    def _dispatch(prompt: str, model: str, timeout_s: int) -> dict:
-        bead_id = _extract_bead_id_from_prompt(prompt)
-        outcome = outcomes.get(bead_id, {})
-        # Worker-thread event — non-deterministic ordering for parallel scenarios
-        verdict.record_dispatch(bead_id, model)
-        if "error" in outcome:
-            raise RuntimeError(outcome["error"])
-        return {"tokens": outcome.get("tokens", 10), "output": "done"}
 
     # Per-worker verify_exit lookup: keyed by bead_id.
     # We use a thread-local to carry the bead_id from dispatch into run_verify
@@ -280,6 +277,40 @@ def _run_scenario(scenario: dict, tmp_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# VB2 order_by_score scenario runner
+# ---------------------------------------------------------------------------
+
+
+def _run_order_by_score_scenario(scenario: dict) -> List[str]:
+    """Run one order_by_score corpus scenario through the pure orderer.
+
+    Builds MergeCandidate objects from the corpus, calls order_by_score(candidates, now),
+    and returns the bead_ids in highest-score-first order (tie-broken by bead_id).
+
+    Returns:
+      List of bead_ids in the order produced by order_by_score.
+    """
+    now: float = float(scenario["now"])
+    raw_candidates: List[dict] = scenario["candidates"]
+
+    candidates: List[MergeCandidate] = [
+        MergeCandidate(
+            bead_id=c["bead_id"],
+            branch_name=c["branch_name"],
+            worktree_path=None,
+            model=c["model"],
+            verified_at=float(c["verified_at"]),
+            priority=int(c["priority"]),
+            attempts=int(c["attempts"]),
+        )
+        for c in raw_candidates
+    ]
+
+    ordered = order_by_score(candidates, now)
+    return [c.bead_id for c in ordered]
+
+
+# ---------------------------------------------------------------------------
 # Test: corpus sha256 byte-identity
 # ---------------------------------------------------------------------------
 
@@ -322,11 +353,25 @@ _SCENARIO_IDS = [s["id"] for s in _CORPUS.get("scenarios", [])]
 
 @pytest.mark.parametrize("scenario_id", _SCENARIO_IDS)
 def test_mayor_parity(scenario_id: str, tmp_path: Path) -> None:
-    """For each corpus scenario: run run_mayor_loop with scripted fakes,
-    assert the observed verdict equals the expected_verdict."""
+    """For each corpus scenario: dispatch to the correct runner based on scenario_type,
+    then assert the observed verdict matches the expected values in the corpus."""
     scenario = next(s for s in _CORPUS["scenarios"] if s["id"] == scenario_id)
-    expected = scenario["expected_verdict"]
+    scenario_type = scenario.get("scenario_type", "mayor_loop")
 
+    if scenario_type == "order_by_score":
+        # VB2: pure orderer — no loop involved.
+        expected_order: List[str] = scenario["expected_order"]
+        observed_order = _run_order_by_score_scenario(scenario)
+
+        assert observed_order == expected_order, (
+            f"[{scenario_id}] order_by_score mismatch:\n"
+            f"  observed: {observed_order}\n"
+            f"  expected: {expected_order}"
+        )
+        return
+
+    # Default: mayor_loop scenario.
+    expected = scenario["expected_verdict"]
     observed = _run_scenario(scenario, tmp_path)
 
     # 1. Assert stop_reason
