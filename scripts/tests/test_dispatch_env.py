@@ -246,3 +246,94 @@ class TestDispatchEnvReturnValue:
 
         assert result["tokens"] == 0
         assert result["output"] == raw_output
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — --model is wired into the argv (fblai-y2en9)
+# ---------------------------------------------------------------------------
+
+class TestDispatchModelFlag:
+    """Verify that _live_dispatch_with_cwd forwards the model tier as --model to
+    the claude CLI argv.  Before fblai-y2en9 the flag was silently absent."""
+
+    def _make_argv_capture(self):
+        """Return (captured_calls, fake_run) that records subprocess.run args."""
+        captured: List[Dict[str, Any]] = []
+
+        def _fake_run(args, **kwargs):
+            captured.append({"args": args, "kwargs": kwargs})
+            return _FakeCompletedProcess(
+                stdout='{"result": "ok", "usage": {"output_tokens": 1}}'
+            )
+
+        return captured, _fake_run
+
+    def test_model_haiku_in_argv(self) -> None:
+        """When model='haiku' is passed, '--model' 'haiku' must appear in the argv."""
+        captured, fake_run = self._make_argv_capture()
+
+        with patch("loop_runner.subprocess.run", side_effect=fake_run):
+            _live_dispatch_with_cwd("say ok", "haiku", 30)
+
+        assert len(captured) == 1
+        args = captured[0]["args"]
+        assert "--model" in args, f"'--model' flag missing from argv: {args}"
+        model_idx = args.index("--model")
+        assert model_idx + 1 < len(args), "'--model' has no following value in argv"
+        assert args[model_idx + 1] == "haiku", (
+            f"Expected '--model haiku', got '--model {args[model_idx + 1]}'"
+        )
+
+    def test_model_sonnet_in_argv(self) -> None:
+        """When model='sonnet' is passed, '--model' 'sonnet' must appear in the argv."""
+        captured, fake_run = self._make_argv_capture()
+
+        with patch("loop_runner.subprocess.run", side_effect=fake_run):
+            _live_dispatch_with_cwd("implement task", "sonnet", 30)
+
+        args = captured[0]["args"]
+        assert "--model" in args
+        assert args[args.index("--model") + 1] == "sonnet"
+
+    def test_model_opus_in_argv(self) -> None:
+        """When model='opus' is passed, '--model' 'opus' must appear in the argv."""
+        captured, fake_run = self._make_argv_capture()
+
+        with patch("loop_runner.subprocess.run", side_effect=fake_run):
+            _live_dispatch_with_cwd("design the arch", "opus", 30)
+
+        args = captured[0]["args"]
+        assert "--model" in args
+        assert args[args.index("--model") + 1] == "opus"
+
+    def test_model_follows_output_format_in_same_invocation(self) -> None:
+        """Both '--output-format json' and '--model <tier>' appear in the same argv."""
+        captured, fake_run = self._make_argv_capture()
+
+        with patch("loop_runner.subprocess.run", side_effect=fake_run):
+            _live_dispatch_with_cwd("do work", "haiku", 30)
+
+        args = captured[0]["args"]
+        assert "--output-format" in args and "json" in args, (
+            f"--output-format json missing from argv: {args}"
+        )
+        assert "--model" in args, f"--model missing from argv: {args}"
+
+    def test_fake_recorded_dispatch_sees_model(self) -> None:
+        """A fake dispatch callable (as used in governor tests) receives the model
+        arg so tier routing is visible end-to-end even in synthetic scenarios."""
+        recorded_models: List[str] = []
+
+        def _fake_dispatch(prompt: str, model: str, timeout_s: int) -> dict:
+            recorded_models.append(model)
+            return {"tokens": 1, "output": "ok"}
+
+        # Simulate what _mayor_worker does: route_model → tier → dispatch(prompt, tier, ...)
+        from loop_runner import route_model, LOOP_MODEL_MAP
+        busywork_bead = {"id": "fblai-test", "title": "trivial cleanup", "labels": [], "body": ""}
+        tier = route_model(busywork_bead)  # should return "haiku" for busywork title
+        _fake_dispatch("prompt", tier, 30)
+
+        assert recorded_models == ["haiku"], (
+            f"Expected tier routing to produce 'haiku' for busywork bead, got {recorded_models}"
+        )

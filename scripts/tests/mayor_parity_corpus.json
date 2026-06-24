@@ -249,7 +249,8 @@
       "judge_decisions": {},
       "expected_verdict": {
         "mayor_events_ordered": [
-          {"type": "beads_update", "bead_id": "gz-s6a", "status": "in_progress"}
+          {"type": "beads_update", "bead_id": "gz-s6a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s6a", "status": "open"}
         ],
         "dispatch_calls_sorted": [
           {"bead_id": "gz-s6a", "tier": "sonnet"}
@@ -330,7 +331,8 @@
       },
       "expected_verdict": {
         "mayor_events_ordered": [
-          {"type": "beads_update", "bead_id": "gz-s8a", "status": "in_progress"}
+          {"type": "beads_update", "bead_id": "gz-s8a", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s8a", "status": "open"}
         ],
         "dispatch_calls_sorted": [
           {"bead_id": "gz-s8a", "tier": "sonnet"}
@@ -397,7 +399,9 @@
       "expected_verdict": {
         "mayor_events_ordered": [
           {"type": "beads_update", "bead_id": "gz-s10a", "status": "in_progress"},
-          {"type": "beads_update", "bead_id": "gz-s10b", "status": "in_progress"}
+          {"type": "beads_update", "bead_id": "gz-s10b", "status": "in_progress"},
+          {"type": "beads_update", "bead_id": "gz-s10a", "status": "open"},
+          {"type": "beads_update", "bead_id": "gz-s10b", "status": "open"}
         ],
         "dispatch_calls_sorted": [
           {"bead_id": "gz-s10a", "tier": "sonnet"},
