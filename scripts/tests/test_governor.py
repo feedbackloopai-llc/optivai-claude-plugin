@@ -294,12 +294,15 @@ class TestFillsFreedSlots:
 # ---------------------------------------------------------------------------
 
 class TestCrashedWorkerSlotStaysOccupied:
-    """A worker that raises/times-out moves to recovery_blocked; its bead stays
-    in_progress; the slot is NOT freed (capacity does not silently reclaim it)."""
+    """A worker that raises/times-out moves to recovery_blocked; during the run
+    its slot is NOT freed (capacity does not silently reclaim it). After the loop
+    exits, the abandonment cleanup (fblai-ngb0p) resets it to 'open' so the next
+    session can retry — it must NOT be left stuck in_progress forever."""
 
     def test_crashed_worker_slot_stays_occupied(self, tmp_path: Path) -> None:
-        """A crashing worker → bead stays in_progress, recovery_blocked has it,
-        no re-dispatch of that bead, and the stop reason is capacity-exhausted."""
+        """A crashing worker → recovery_blocked during run; bead reset to 'open'
+        on loop exit (fblai-ngb0p: never left stuck in_progress); NOT closed;
+        stop reason is capacity-exhausted or queue-stuck."""
         crash_bead = _make_bead("fblai-crash", priority=1)
         tracker = _StatusTracker()
         tracker.set_open(crash_bead["id"])
@@ -325,10 +328,7 @@ class TestCrashedWorkerSlotStaysOccupied:
 
         summary = run_mayor_loop(cfg, runners)
 
-        # Bead was dispatched (marked in_progress by Mayor) but NOT closed
-        assert tracker.get_status("fblai-crash") == "in_progress", (
-            f"Expected bead to stay in_progress, got: {tracker.get_status('fblai-crash')}"
-        )
+        # Bead was NOT closed (crash does not count as success)
         assert summary.closed == 0
         assert summary.failed >= 1
         # Should have stopped due to capacity exhaustion or queue being stuck
@@ -341,6 +341,13 @@ class TestCrashedWorkerSlotStaysOccupied:
         # Dispatch was called exactly once (no re-dispatch of the crashed bead)
         assert dispatch_call_count[0] == 1, (
             f"Crashed bead was re-dispatched {dispatch_call_count[0]} times, expected 1"
+        )
+        # fblai-ngb0p: abandonment cleanup must reset the bead to 'open' on loop
+        # exit so the next session can retry it — never left stuck in_progress.
+        final_status = tracker.get_status("fblai-crash")
+        assert final_status == "open", (
+            f"Crashed bead should be 'open' after loop exit (fblai-ngb0p abandonment cleanup), "
+            f"got '{final_status}'. Bead was left stuck in_progress."
         )
 
 

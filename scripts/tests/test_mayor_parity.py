@@ -64,7 +64,7 @@ _CORPUS_PATH = Path(__file__).parent / "mayor_parity_corpus.json"
 # Byte-identity pin — same value pinned in test/mayor-parity.test.ts.
 # Both tests assert their local corpus file's sha256 equals this constant.
 # Value is set after the corpus is finalised and byte-identical in both repos.
-CORPUS_SHA256 = "c4adb68d2eca780e7435e95ec5d44decf68b2fff02a4d445901520f51c492045"
+CORPUS_SHA256 = "888dc81fe836fab828576f6c06f09301ae863d58191026d9cb44f2701577480f"
 
 
 def _corpus_sha256() -> str:

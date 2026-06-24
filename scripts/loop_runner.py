@@ -33,6 +33,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set
@@ -493,7 +494,7 @@ def _live_dispatch_with_cwd(
     dispatch_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json"],
+            ["claude", "-p", prompt, "--output-format", "json", "--model", model],
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -1931,7 +1932,45 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
     # the V-pass path stays on the VA0b inline merge (full backward compat).
     refinery_on = cfg.batch_max > 1 and runners.merge_batch is not None
 
-    def _safe_teardown(worktree_path: Optional[str], branch_name: Optional[str], ctx: str) -> None:
+    # Abandonment registry: tracks (worktree_path, branch_name) for each bead
+    # whose worktree was created but whose WorkerResult has not yet been processed
+    # (i.e., worker is still in-flight).  Written from worker threads via a
+    # thread-safe tracking wrapper around runners.worktree_create; read by the
+    # Mayor's finally-block abandonment cleanup so it can teardown in-flight
+    # worktrees without waiting for the workers to return.
+    _worktree_registry: Dict[str, tuple] = {}
+    _worktree_registry_lock = threading.Lock()
+
+    # Build a tracking-wrapped worktree_create that records (path, branch) for
+    # every worktree the workers create, keyed by bead_id.
+    _original_worktree_create = runners.worktree_create
+    if _original_worktree_create is not None:
+        def _tracking_worktree_create(bead_id: str) -> Optional[tuple]:
+            result = _original_worktree_create(bead_id)
+            if result is not None:
+                with _worktree_registry_lock:
+                    _worktree_registry[bead_id] = result
+            return result
+        # Rebuild Runners using only declared dataclass fields so that any
+        # extra attributes injected by tests (e.g. runners._merge_calls) are
+        # not forwarded to the constructor — they would cause a TypeError.
+        _runner_fields = {f.name for f in dataclasses.fields(runners)}
+        runners = runners.__class__(**{
+            **{k: v for k, v in runners.__dict__.items() if k in _runner_fields},
+            "worktree_create": _tracking_worktree_create,
+        })
+
+    def _safe_teardown(
+        worktree_path: Optional[str],
+        branch_name: Optional[str],
+        ctx: str,
+        bead_id: Optional[str] = None,
+    ) -> None:
+        # Remove from the abandonment registry so a still-running bead_id that
+        # completes normally does not get double-torn-down in the finally block.
+        if bead_id is not None:
+            with _worktree_registry_lock:
+                _worktree_registry.pop(bead_id, None)
         if worktree_path is not None and runners.worktree_teardown is not None:
             try:
                 runners.worktree_teardown(worktree_path, branch_name or "")
@@ -2176,16 +2215,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                         tier=handle.model,
                     )
                     # Discard partial worktree code (VA0b lifecycle).
-                    if res.worktree_path is not None and runners.worktree_teardown is not None:
-                        try:
-                            runners.worktree_teardown(
-                                res.worktree_path, res.branch_name or ""
-                            )
-                        except Exception as td_exc:
-                            logger.warning(
-                                "Mayor: worktree teardown (rate-limited) for %s: %s",
-                                bead_id, td_exc,
-                            )
+                    _safe_teardown(res.worktree_path, res.branch_name, "rate-limited", bead_id=bead_id)
                 elif res.timed_out or res.error is not None:
                     # Worker crashed or timed out — slot stays occupied
                     recovery_blocked.add(bead_id)
@@ -2207,16 +2237,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                         extra=f"timed_out={res.timed_out} error={res.error}",
                     )
                     # VA0b: tear down worktree even on crash (discard the code)
-                    if res.worktree_path is not None and runners.worktree_teardown is not None:
-                        try:
-                            runners.worktree_teardown(
-                                res.worktree_path, res.branch_name or ""
-                            )
-                        except Exception as td_exc:
-                            logger.warning(
-                                "Mayor: worktree teardown (crash) for %s failed: %s",
-                                bead_id, td_exc,
-                            )
+                    _safe_teardown(res.worktree_path, res.branch_name, "crash", bead_id=bead_id)
                 elif res.verify_exit == 0:
                     # V passed.
                     if refinery_on and res.branch_name is not None:
@@ -2263,16 +2284,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                                 extra=f"branch={res.branch_name} merge_exit={merge_exit}",
                             )
                             # Teardown without close
-                            if res.worktree_path is not None and runners.worktree_teardown is not None:
-                                try:
-                                    runners.worktree_teardown(
-                                        res.worktree_path, res.branch_name
-                                    )
-                                except Exception as td_exc:
-                                    logger.warning(
-                                        "Mayor: worktree teardown (merge-fail) for %s: %s",
-                                        bead_id, td_exc,
-                                    )
+                            _safe_teardown(res.worktree_path, res.branch_name, "merge-fail", bead_id=bead_id)
                             # Skip close — continue to next bead
                         else:
                             # Merge succeeded — now close and teardown
@@ -2301,16 +2313,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                                 tier=handle.model,
                             )
                             # Teardown AFTER close (Mayor is single-writer)
-                            if res.worktree_path is not None and runners.worktree_teardown is not None:
-                                try:
-                                    runners.worktree_teardown(
-                                        res.worktree_path, res.branch_name
-                                    )
-                                except Exception as td_exc:
-                                    logger.warning(
-                                        "Mayor: worktree teardown (post-close) for %s: %s",
-                                        bead_id, td_exc,
-                                    )
+                            _safe_teardown(res.worktree_path, res.branch_name, "post-close", bead_id=bead_id)
                     else:
                         # No VA0b branch — plain V-passed path (backward compat)
                         runners.beads_close(bead_id)
@@ -2357,16 +2360,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                         extra=f"verify_exit={res.verify_exit}",
                     )
                     # VA0b: tear down worktree on V-fail (discard code, bead stays open)
-                    if res.worktree_path is not None and runners.worktree_teardown is not None:
-                        try:
-                            runners.worktree_teardown(
-                                res.worktree_path, res.branch_name or ""
-                            )
-                        except Exception as td_exc:
-                            logger.warning(
-                                "Mayor: worktree teardown (V-fail) for %s: %s",
-                                bead_id, td_exc,
-                            )
+                    _safe_teardown(res.worktree_path, res.branch_name, "V-fail", bead_id=bead_id)
 
             # ---- 5b. VB2 Refinery — drain the merge queue under the merge slot ----
             # Fully drain each tick so no V-passed branch is ever left unmerged
@@ -2393,7 +2387,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                             runners, action="close", bead_id=c.bead_id,
                             molecule=cfg.molecule, tier=c.model,
                         )
-                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-merged")
+                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-merged", bead_id=c.bead_id)
                     elif outcome.kind == "reimplement":
                         # Typed conflict → relabel + return to ready (re-implement
                         # against the now-advanced HEAD), bounded by the attempts cap.
@@ -2417,7 +2411,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                             molecule=cfg.molecule, tier=c.model,
                             extra=f"branch={c.branch_name} attempt={refinery_attempts[c.bead_id]}",
                         )
-                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-reimplement")
+                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-reimplement", bead_id=c.bead_id)
                     else:  # "exhausted" — escalate (do NOT respawn; surface to operator)
                         summary.failed += 1
                         _mayor_capture(
@@ -2431,7 +2425,7 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                             molecule=cfg.molecule, tier=c.model,
                             extra=f"branch={c.branch_name} attempts={c.attempts}",
                         )
-                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-exhausted")
+                        _safe_teardown(c.worktree_path, c.branch_name, "refinery-exhausted", bead_id=c.bead_id)
 
             summary.iterations += 1
             if not any_closed:
@@ -2445,6 +2439,74 @@ def run_mayor_loop(cfg: RunConfig, runners: Runners) -> MayorSummary:
                 break
 
     finally:
+        # Abandonment cleanup: for every bead still in-flight (active dict) or
+        # recovery_blocked, reset the bead to "open" so it resumes cleanly on the
+        # next run (never left stuck in_progress), then teardown its worktree.
+        # The Mayor is the single-writer — do this here, before pool.shutdown,
+        # so the status writes happen before orphaned claude -p threads finish.
+        for abandon_bead_id in list(active.keys()):
+            handle = active.get(abandon_bead_id)
+            if handle is not None:
+                # Cancel the future if not already done (best-effort; thread may be running)
+                handle.future.cancel()
+            if runners.beads_update is not None:
+                try:
+                    runners.beads_update(abandon_bead_id, "open")
+                except Exception as ab_exc:
+                    logger.warning(
+                        "Mayor: abandonment reset for %s failed: %s", abandon_bead_id, ab_exc
+                    )
+            logger.info("Mayor: abandoned in-flight bead %s reset to open", abandon_bead_id)
+            _mayor_capture(
+                runners,
+                f"Mayor: bead {abandon_bead_id} abandoned on loop exit — reset to open.",
+                "pattern",
+            )
+            # Teardown the worktree for this in-flight worker if one was created.
+            # The worktree_path/branch are read from the tracking registry (populated
+            # by _tracking_worktree_create from the worker thread at creation time).
+            with _worktree_registry_lock:
+                wt_info = _worktree_registry.pop(abandon_bead_id, None)
+            if wt_info is not None:
+                _safe_teardown(wt_info[0], wt_info[1], "abandonment")
+
+        for abandon_bead_id in sorted(recovery_blocked):
+            if runners.beads_update is not None:
+                try:
+                    runners.beads_update(abandon_bead_id, "open")
+                except Exception as rb_exc:
+                    logger.warning(
+                        "Mayor: recovery_blocked reset for %s failed: %s", abandon_bead_id, rb_exc
+                    )
+            logger.info(
+                "Mayor: recovery_blocked bead %s reset to open on loop exit", abandon_bead_id
+            )
+            _mayor_capture(
+                runners,
+                f"Mayor: recovery_blocked bead {abandon_bead_id} reset to open on loop exit.",
+                "pattern",
+            )
+            # Teardown any worktree that was registered for this bead
+            with _worktree_registry_lock:
+                wt_info = _worktree_registry.pop(abandon_bead_id, None)
+            if wt_info is not None:
+                _safe_teardown(wt_info[0], wt_info[1], "abandonment-recovery-blocked")
+
+        # Drain any un-merged VB2 refinery queue entries: beads that passed V
+        # but whose branch was not yet merged before the loop broke.  Reset them
+        # to "open" so they re-run on the next session, and teardown worktrees.
+        for mc in merge_queue:
+            if runners.beads_update is not None:
+                try:
+                    runners.beads_update(mc.bead_id, "open")
+                except Exception as mq_exc:
+                    logger.warning(
+                        "Mayor: merge_queue abandonment reset for %s failed: %s",
+                        mc.bead_id, mq_exc,
+                    )
+            _safe_teardown(mc.worktree_path, mc.branch_name, "abandonment-merge-queue", bead_id=mc.bead_id)
+        merge_queue.clear()
+
         pool.shutdown(wait=False)
 
     if not summary.stop_reason:
