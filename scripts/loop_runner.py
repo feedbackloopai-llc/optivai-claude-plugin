@@ -120,6 +120,28 @@ _WORKTREE_LOCK: threading.Lock = threading.Lock()
 _MERGE_LOCK: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# MINOR 1 — bead_id validation
+# Canonical bead IDs follow the pattern <namespace>-<hex> (e.g. "fblai-abc1").
+# A bead_id starting with "-" is git arg-injection; one containing "..", spaces,
+# "~", "^", or ":" makes an invalid git ref.  Validate before constructing any
+# git branch name or worktree path from the raw id.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_BEAD_ID_RE = _re.compile(r'^(gz|fblai|optivai)-[a-z0-9]+$')
+
+
+def _validate_bead_id(bead_id: str) -> bool:
+    """Return True iff bead_id is safe to use in a git ref and a filesystem path.
+
+    Accepted: ``<namespace>-<alphanum>`` where namespace is one of gz/fblai/optivai.
+    Rejected: anything starting with '-', containing '..', whitespace, '~', '^', ':',
+    or not matching the canonical ``^(gz|fblai|optivai)-[a-z0-9]+$`` pattern.
+    """
+    return bool(_BEAD_ID_RE.match(bead_id))
+
+
+# ---------------------------------------------------------------------------
 # §2 Iteration state object
 # ---------------------------------------------------------------------------
 
@@ -627,11 +649,22 @@ def _live_worktree_manager(bead_id: str) -> Iterator[Optional[str]]:
     parallel while isolation is maintained.
 
     Yields None if:
+    - bead_id does not match the canonical pattern (MINOR 1 guard)
     - not inside a git repository (git rev-parse fails)
     - git worktree add fails for any reason
 
     On either normal or exceptional exit, the worktree is removed (serialized).
     """
+    # MINOR 1: reject bead_ids that would produce invalid git refs or paths.
+    if not _validate_bead_id(bead_id):
+        logger.warning(
+            "Worktree creation skipped: bead_id %r does not match canonical pattern "
+            r"^(gz|fblai|optivai)-[a-z0-9]+$ — refusing to pass to git",
+            bead_id,
+        )
+        yield None
+        return
+
     worktree_path: Optional[str] = None
     try:
         # Discover the repo root (needed for `git worktree add`)
@@ -717,6 +750,17 @@ def _live_worktree_create(bead_id: str) -> Optional[tuple]:
 
     Serialized through _WORKTREE_LOCK — safe for concurrent workers.
     """
+    # MINOR 1: reject bead_ids that would produce invalid git refs or paths.
+    # A bead_id starting with '-' is git arg-injection; "..", spaces, "~", "^", ":"
+    # make invalid refs.  Only the canonical pattern is safe.
+    if not _validate_bead_id(bead_id):
+        logger.warning(
+            "Worktree creation skipped: bead_id %r does not match canonical pattern "
+            r"^(gz|fblai|optivai)-[a-z0-9]+$ — refusing to pass to git",
+            bead_id,
+        )
+        return None
+
     repo_root = _discover_repo_root()
     if repo_root is None:
         return None
