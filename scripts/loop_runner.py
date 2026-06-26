@@ -137,8 +137,10 @@ LOOP_REFINERY_W_PRIO: float = float(
 # Override via Runners.loop_state_path for testing.
 LOOP_STATE_PATH: Path = Path.home() / ".claude" / "loop-state.json"
 
-# Default verify command for this repo when none is specified
-_REPO_DEFAULT_VERIFY_CMD = "cd /Users/erato949/dev/optivai-claude-plugin/scripts && python3 -m pytest -q"
+# Default verify command when none is specified (last resort, after --verify-cmd
+# and the bead's verify:<cmd> label). Relative to the invocation cwd / worktree
+# root so it carries no machine-specific path.
+_REPO_DEFAULT_VERIFY_CMD = "cd scripts && python3 -m pytest -q"
 
 # ---------------------------------------------------------------------------
 # Worktree serialization lock (P1.2)
@@ -2870,6 +2872,27 @@ def _print_dry_run_plan(bead: dict, tier: str, verify_cmd: Optional[str], prompt
 # CLI entry point (§6)
 # ---------------------------------------------------------------------------
 
+def _default_repo() -> str:
+    """Default --repo: the cwd the runner is invoked from.
+
+    The runner is always launched from inside the target repo
+    (``cd <repo> && python3 ... loop_runner.py``), so the working directory is
+    the correct, machine-independent default. Replaces the former hardcoded
+    developer path. Mirrors the Pi engine (``cfg.repo ?? process.cwd()``).
+    """
+    return os.getcwd()
+
+
+def _default_branch() -> str:
+    """Default --branch: ``main``.
+
+    The working/integration branch the Mayor merges passing worktree branches
+    into. Replaces the former hardcoded WIP-branch default. Mirrors the Pi
+    engine (``cfg.branch ?? "main"``).
+    """
+    return "main"
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="loop_runner.py",
@@ -2909,13 +2932,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repo",
-        default="/Users/erato949/dev/optivai-claude-plugin",
-        help="Repo path passed into the dispatch prompt.",
+        default=_default_repo(),
+        help=(
+            "Repo path passed into the dispatch prompt and used as the worktree "
+            "source (default: the current working directory)."
+        ),
     )
     parser.add_argument(
         "--branch",
-        default="perf/windows-optimization",
-        help="Branch passed into the dispatch prompt.",
+        default=_default_branch(),
+        help=(
+            "Working/integration branch the Mayor merges passing worktree "
+            "branches into (default: main)."
+        ),
     )
     parser.add_argument(
         "--max-workers",
