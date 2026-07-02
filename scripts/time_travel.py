@@ -54,8 +54,13 @@ class InspectResult:
     prov_activity: str                  # 'snapshot' | 'rollback' | 'update' | ...
     parent_version: Optional[int]
     created_at: Optional[str]           # ISO timestamp
-    query_kind: str                     # 'at-timestamp' | 'at-revision' | 'latest'
+    query_kind: str                     # 'at-timestamp' | 'at-revision' | 'latest' | 'live'
     query_value: Optional[str] = None   # the queried timestamp or revision number
+    # T3 (fblai-bfyjr, R1 CCR-reversibility gap, §4.3): "version" for every
+    # thought_versions-backed result (the default — every existing caller of
+    # _row_to_result gets this for free); "live" only for the inspect_live()
+    # fallback below, which reads brain.thoughts directly instead.
+    source: str = "version"
 
 
 def _parse_iso_timestamp(s: str) -> datetime:
@@ -226,6 +231,89 @@ def inspect_latest(
         return None
     return _row_to_result(
         thought_id, row, query_kind="latest", query_value=None
+    )
+
+
+def inspect_live(
+    conn,
+    thought_id: str,
+    user_id: str,
+) -> Optional[InspectResult]:
+    """CCR-reversibility live-row fallback (T3 / fblai-bfyjr, T1 design §4.3).
+
+    Closes the verified R1 gap: ``inspect_latest`` returns ``None`` for a
+    thought that was captured but never snapshotted/updated (the common
+    case — no ``brain.thought_versions`` row exists at all), even though
+    the thought is fully alive in ``brain.thoughts``. Callers use this as
+    a fallback ONLY on the no-time-qualifier ``--inspect`` path, and ONLY
+    when ``inspect_latest`` already returned ``None``.
+
+    SECURITY (non-negotiable — this is the crux of the fix): this function
+    reuses ``_assert_in_scope`` — the IDENTICAL ``WHERE thought_id=%s AND
+    user_id=%s`` user-scoping predicate used by every other inspect_*
+    entry point in this module. There is no new scoping logic here, no
+    widened read, no cross-principal path. A wrong-principal call raises
+    ``RuntimeError`` exactly as ``inspect_latest``/``inspect_at_*`` do, and
+    that exception is NOT swallowed here — it propagates to the caller.
+    The live-row SELECT itself carries the same ``user_id`` predicate a
+    second time (belt-and-suspenders: this function is safe to call on
+    its own, independent of whatever scope-check a caller may already
+    have performed).
+
+    Returns ``None`` (not a leak) if there is no live row either — e.g.
+    the atom was VF_epsilon-forgotten between the scope check and this
+    read, or in the (currently unreachable, since _assert_in_scope would
+    already have raised) case where scope passed but the row vanished
+    concurrently. No row is ever fabricated.
+    """
+    _assert_in_scope(conn, thought_id, user_id, "inspect_live")
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT raw_text, summary, thought_type, topics, people,
+                   action_items, prov_agent, prov_activity, created_at
+            FROM brain.thoughts
+            WHERE thought_id=%s AND user_id=%s
+            """,
+            (thought_id, user_id),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+
+    if row is None:
+        return None
+
+    (
+        raw_text,
+        summary,
+        thought_type,
+        topics,
+        people,
+        action_items,
+        prov_agent,
+        prov_activity,
+        created_at,
+    ) = row
+
+    return InspectResult(
+        thought_id=thought_id,
+        revision=0,  # sentinel: no thought_versions row exists (live state)
+        raw_text=raw_text,
+        summary=summary,
+        thought_type=thought_type,
+        topics=topics,
+        people=people,
+        action_items=action_items,
+        prov_agent=prov_agent,
+        prov_activity=prov_activity,
+        parent_version=None,
+        created_at=created_at.isoformat() if created_at else None,
+        query_kind="live",
+        query_value=None,
+        source="live",
     )
 
 
