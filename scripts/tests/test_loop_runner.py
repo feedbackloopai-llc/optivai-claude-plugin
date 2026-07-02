@@ -406,6 +406,86 @@ class TestRouteModel:
         assert route_model(bead) == "sonnet"
 
 
+class TestRouteModelFableGate:
+    """FABLE-CORE (fblai-3hf0c): the fail-closed Fable gate + the tier:<model-name> normalization fix.
+
+    CONSUMER tests - drive the REAL route_model, not a reimplementation. The never-Fable-on-security invariant
+    (criterion 2) is the whole point: NO label combo routes a security-marked bead to fable.
+    """
+
+    # --- the fail-closed Fable gate (criterion 1) ---
+    def test_fable_with_ready_routes_to_fable(self) -> None:
+        assert route_model(_make_bead(labels=["tier:fable", "fable-ready"])) == "fable"
+
+    def test_fable_without_ready_downgrades_to_opus(self) -> None:
+        # fail-closed: tier:fable but NO fable-ready -> opus (we downgrade; never let Fable refuse-and-fallback)
+        assert route_model(_make_bead(labels=["tier:fable"])) == "opus"
+
+    # --- NEVER Fable on security (criterion 2 - defense-in-depth, the whole point) ---
+    def test_fable_ready_plus_security_label_forced_to_opus(self) -> None:
+        assert route_model(_make_bead(labels=["tier:fable", "fable-ready", "security"])) == "opus"
+
+    def test_fable_ready_plus_security_epic_forced_to_opus(self) -> None:
+        for epic in ("epic:harness-hardening", "epic:multi-tenant-isolation", "epic:per-user-isolation"):
+            bead = _make_bead(labels=["tier:fable", "fable-ready", epic])
+            assert route_model(bead) == "opus", epic
+
+    def test_fable_ready_plus_auth_token_forced_to_opus(self) -> None:
+        # substring token match: authz / oauth / crypto-x all block (over-block by design = safe)
+        for lbl in ("auth", "authz", "oauth", "cyber", "crypto", "access-control", "exploit"):
+            bead = _make_bead(labels=["tier:fable", "fable-ready", lbl])
+            assert route_model(bead) == "opus", lbl
+
+    def test_no_combo_reaches_fable_when_security_marked(self) -> None:
+        # tier:fable + fable-ready + BOTH a security label AND a security epic -> still opus (security always wins)
+        bead = _make_bead(labels=["tier:fable", "fable-ready", "security", "epic:harness-hardening"])
+        assert route_model(bead) == "opus"
+
+    # --- the tier:<model-name> normalization fix (criterion 3) ---
+    def test_tier_opus_routes_to_opus(self) -> None:
+        # previously fell through to title inference (LOOP_MODEL_MAP keys are effort classes, not model names)
+        assert route_model(_make_bead(labels=["tier:opus"])) == "opus"
+
+    def test_tier_sonnet_routes_to_sonnet(self) -> None:
+        assert route_model(_make_bead(labels=["tier:sonnet"])) == "sonnet"
+
+    def test_tier_haiku_routes_to_haiku(self) -> None:
+        assert route_model(_make_bead(labels=["tier:haiku"])) == "haiku"
+
+    def test_tier_model_name_authoritative_over_title(self) -> None:
+        # tier:opus wins over a busywork-keyword title - the normalization is authoritative, not inferred
+        assert route_model(_make_bead(labels=["tier:opus"], title="trivial rename cleanup")) == "opus"
+
+    # --- Gate-2 B1/I1: the BROAD security vocabulary a narrow token set slipped to Fable (the false negatives) ---
+    def test_security_nouns_never_reach_fable(self) -> None:
+        for lbl in (
+            "credential", "secret", "rbac", "permission", "encryption", "decrypt", "cipher",
+            "sandbox", "vuln", "vulnerability", "cve", "pentest", "xss", "csrf", "ssrf", "injection",
+            "escalation", "privilege", "sso", "saml", "oidc", "jwt", "mfa", "password", "session",
+            "token", "tls", "ssl", "pki", "hsm", "key", "isolation", "tenant", "sovereign", "egress",
+            "deas", "pii", "gdpr", "firewall", "malware",
+            # epic variants (I1): the isolation/hardening/tenant tokens catch these, not the exact epic set
+            "epic:tenant-isolation", "epic:harness-hardening-v2", "epic:per-tenant-isolation",
+        ):
+            assert route_model(_make_bead(labels=["tier:fable", "fable-ready", lbl])) == "opus", lbl
+
+    def test_security_in_free_text_forces_opus(self) -> None:
+        # The second net (B1): a bead with NO security LABEL but a security-titled/bodied task never reaches fable.
+        assert route_model(
+            _make_bead(labels=["tier:fable", "fable-ready"], title="Rewrite the credential store cache")
+        ) == "opus"
+        assert route_model({
+            "id": "x", "title": "Design the caching layer",
+            "description": "touches the oauth token refresh path", "labels": ["tier:fable", "fable-ready"],
+        }) == "opus"
+
+    def test_benign_bright_bead_still_reaches_fable(self) -> None:
+        # The over-block must NOT swallow a genuinely non-security bright bead - else fable is never usable.
+        assert route_model(
+            _make_bead(labels=["tier:fable", "fable-ready"], title="Design a novel document-layout algorithm")
+        ) == "fable"
+
+
 # ---------------------------------------------------------------------------
 # resolve_verify_cmd
 # ---------------------------------------------------------------------------
