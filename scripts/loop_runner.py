@@ -68,10 +68,36 @@ ROUTABLE_MODEL_NAMES: frozenset = frozenset({"opus", "sonnet", "haiku"})
 FABLE_TIER: str = "fable"
 FABLE_READY_LABEL: str = "fable-ready"
 # Security markers - a bead carrying ANY of these NEVER reaches fable, even if mis-certified fable-ready
-# (defense-in-depth). Conservative by design: over-block (cost smarts) is safe; under-block (leak security to
-# Fable, which refuses/wastes it) is not. Token match is substring-on-label so e.g. "authz", "oauth", "crypto-x"
-# all block; the 3 named epics are matched exactly (their names carry no security keyword).
-FABLE_BLOCK_TOKENS: tuple = ("security", "auth", "cyber", "crypto", "access-control", "exploit")
+# (defense-in-depth). Conservative by design: over-block (cost smarts=opus) is SAFE; under-block (leak security
+# to Fable, which refuses/wastes it) is NOT. Substring match, so "authz"/"oauth"/"encryption"/"key-rotation" all
+# block. This is a CONSERVATIVE SUPERSET of the security vocabulary (Gate-2 B1: a narrow set slipped 83% of it -
+# `encryption`/`sandbox`/`rbac`/`credential` all reached Fable). It over-blocks some benign OptivAI beads
+# (token-budget/agent-session/worktree-isolation) to OPUS - the spec's mandated safe direction. The isolation/
+# hardening/tenant/sovereign tokens also catch the security EPICS + every future variant (Gate-2 I1). The label
+# denylist can never be complete, so route_model ALSO scans the title/description (a NARROWER high-confidence
+# set) - a second net. The PRIMARY control remains Harvey's deliberate `fable-ready` security-surface assessment.
+FABLE_BLOCK_TOKENS: tuple = (
+    # auth / access-control
+    "security", "auth", "access-control", "access", "rbac", "permission", "privilege", "escalation",
+    "credential", "secret", "token", "password", "session", "login", "sso", "saml", "oidc", "jwt", "mfa",
+    # cryptography (the most-missed surface - "crypto" alone does NOT substring "encryption")
+    "crypto", "encrypt", "decrypt", "cipher", "tls", "ssl", "pki", "hsm", "key",
+    # cyber / vulnerability / offensive
+    "cyber", "exploit", "vuln", "cve", "pentest", "malware", "xss", "csrf", "ssrf", "injection", "firewall",
+    # isolation / sovereignty (the OptivAI security epics + FR2 no-egress)
+    "sandbox", "isolation", "tenant", "hardening", "sovereign", "egress", "deas",
+    # data protection / compliance
+    "pii", "gdpr", "hipaa", "compliance",
+)
+# High-confidence tokens scanned in FREE-TEXT title/description (the second net). Narrower than the label set -
+# only words unlikely to appear benignly in a title - so we do not over-block every bead whose title mentions a
+# common word ("caching key", "user session"). Multi-char distinctive stems keep benign false-positives low.
+FABLE_BLOCK_TEXT_TOKENS: tuple = (
+    "security", "cyber", "exploit", "vulnerab", "vuln", "cve", "pentest", "malware",
+    "xss", "csrf", "ssrf", "sql-injection", "rbac", "authenticat", "authoriz", "oauth", "saml", "oidc",
+    "credential", "password", "encrypt", "decrypt", "cipher", "firewall", "access-control",
+    "privilege", "sandbox-escape", "sovereign", "no-egress",
+)
 FABLE_BLOCK_EPICS: frozenset = frozenset(
     {"epic:harness-hardening", "epic:multi-tenant-isolation", "epic:per-user-isolation"}
 )
@@ -1157,13 +1183,16 @@ def select_next(ready: List[dict]) -> Optional[dict]:
 # route_model — §1 (pure)
 # ---------------------------------------------------------------------------
 
-def _bead_is_security_marked(labels: list) -> bool:
-    """True if the bead carries ANY security surface marker (FABLE-CORE defense-in-depth).
+def _bead_is_security_marked(bead: dict) -> bool:
+    """True if the bead carries ANY security surface (FABLE-CORE defense-in-depth; never Fable on security).
 
-    Conservative: a substring token match on any label (so `authz`/`oauth`/`crypto-x` all trip) PLUS the 3 named
-    security epics matched exactly. Over-blocking is intentional - it costs smarts (Opus), never safety.
+    Two nets (Gate-2 B1/I1): (1) a broad substring token match on every LABEL (so `authz`/`oauth`/`encryption`/
+    `key-rotation` all trip) PLUS the 3 named security epics; the isolation/hardening/tenant/sovereign tokens
+    also catch epic variants. (2) a NARROWER high-confidence scan of the free-text title+description - because a
+    label denylist can never be complete (a `perf-refactor`-labelled bead that rewrites the auth cache slips the
+    labels). Over-blocking is intentional: it costs smarts (Opus), never safety.
     """
-    for raw in labels:
+    for raw in bead.get("labels", []):
         if not isinstance(raw, str):
             continue
         label = raw.strip().lower()
@@ -1171,6 +1200,10 @@ def _bead_is_security_marked(labels: list) -> bool:
             return True
         if any(tok in label for tok in FABLE_BLOCK_TOKENS):
             return True
+    # Second net: high-confidence tokens in the free text (title + description).
+    text = f"{bead.get('title', '')} {bead.get('description', '')} {bead.get('body', '')}".lower()
+    if any(tok in text for tok in FABLE_BLOCK_TEXT_TOKENS):
+        return True
     return False
 
 
@@ -1195,7 +1228,7 @@ def route_model(bead: dict) -> str:
 
     # 1. FABLE fail-closed gate (the crux) - a security-marked or non-certified bead NEVER reaches fable.
     if tier == FABLE_TIER:
-        if _bead_is_security_marked(labels):
+        if _bead_is_security_marked(bead):
             logger.info(
                 "[route_model] tier:fable -> opus (security-marked; never Fable on security) bead=%s",
                 bead.get("id", "?"),

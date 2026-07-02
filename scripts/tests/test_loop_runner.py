@@ -456,6 +456,35 @@ class TestRouteModelFableGate:
         # tier:opus wins over a busywork-keyword title - the normalization is authoritative, not inferred
         assert route_model(_make_bead(labels=["tier:opus"], title="trivial rename cleanup")) == "opus"
 
+    # --- Gate-2 B1/I1: the BROAD security vocabulary a narrow token set slipped to Fable (the false negatives) ---
+    def test_security_nouns_never_reach_fable(self) -> None:
+        for lbl in (
+            "credential", "secret", "rbac", "permission", "encryption", "decrypt", "cipher",
+            "sandbox", "vuln", "vulnerability", "cve", "pentest", "xss", "csrf", "ssrf", "injection",
+            "escalation", "privilege", "sso", "saml", "oidc", "jwt", "mfa", "password", "session",
+            "token", "tls", "ssl", "pki", "hsm", "key", "isolation", "tenant", "sovereign", "egress",
+            "deas", "pii", "gdpr", "firewall", "malware",
+            # epic variants (I1): the isolation/hardening/tenant tokens catch these, not the exact epic set
+            "epic:tenant-isolation", "epic:harness-hardening-v2", "epic:per-tenant-isolation",
+        ):
+            assert route_model(_make_bead(labels=["tier:fable", "fable-ready", lbl])) == "opus", lbl
+
+    def test_security_in_free_text_forces_opus(self) -> None:
+        # The second net (B1): a bead with NO security LABEL but a security-titled/bodied task never reaches fable.
+        assert route_model(
+            _make_bead(labels=["tier:fable", "fable-ready"], title="Rewrite the credential store cache")
+        ) == "opus"
+        assert route_model({
+            "id": "x", "title": "Design the caching layer",
+            "description": "touches the oauth token refresh path", "labels": ["tier:fable", "fable-ready"],
+        }) == "opus"
+
+    def test_benign_bright_bead_still_reaches_fable(self) -> None:
+        # The over-block must NOT swallow a genuinely non-security bright bead - else fable is never usable.
+        assert route_model(
+            _make_bead(labels=["tier:fable", "fable-ready"], title="Design a novel document-layout algorithm")
+        ) == "fable"
+
 
 # ---------------------------------------------------------------------------
 # resolve_verify_cmd
