@@ -61,6 +61,20 @@ LOOP_MAX_ITERATIONS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_ITERATIONS", "25
 LOOP_BUDGET_TOKENS: int = int(os.environ.get("OPTIVAI_LOOP_BUDGET_TOKENS", "2000000"))
 LOOP_NOPROGRESS_K: int = int(os.environ.get("OPTIVAI_LOOP_NOPROGRESS_K", "2"))
 LOOP_MODEL_MAP: dict = {"design": "opus", "implement": "sonnet", "busywork": "haiku"}
+# FABLE-CORE (fblai-3hf0c): tier:<model-name> routes directly to that model (the normalization fix - the live
+# beads use tier:opus/sonnet/haiku, model names, which previously fell through to title inference). `fable` is
+# the brightest tier but is NEVER routed directly - it is fail-closed gated below (needs fable-ready + no security).
+ROUTABLE_MODEL_NAMES: frozenset = frozenset({"opus", "sonnet", "haiku"})
+FABLE_TIER: str = "fable"
+FABLE_READY_LABEL: str = "fable-ready"
+# Security markers - a bead carrying ANY of these NEVER reaches fable, even if mis-certified fable-ready
+# (defense-in-depth). Conservative by design: over-block (cost smarts) is safe; under-block (leak security to
+# Fable, which refuses/wastes it) is not. Token match is substring-on-label so e.g. "authz", "oauth", "crypto-x"
+# all block; the 3 named epics are matched exactly (their names carry no security keyword).
+FABLE_BLOCK_TOKENS: tuple = ("security", "auth", "cyber", "crypto", "access-control", "exploit")
+FABLE_BLOCK_EPICS: frozenset = frozenset(
+    {"epic:harness-hardening", "epic:multi-tenant-isolation", "epic:per-user-isolation"}
+)
 LOOP_VERIFY_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_VERIFY_TIMEOUT_S", "900"))
 LOOP_ITER_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_ITER_TIMEOUT_S", "1800"))
 LOOP_MAX_WORKERS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_WORKERS", "4"))
@@ -1143,25 +1157,72 @@ def select_next(ready: List[dict]) -> Optional[dict]:
 # route_model — §1 (pure)
 # ---------------------------------------------------------------------------
 
-def route_model(bead: dict) -> str:
-    """Route bead to a model tier based on its effort class label.
+def _bead_is_security_marked(labels: list) -> bool:
+    """True if the bead carries ANY security surface marker (FABLE-CORE defense-in-depth).
 
-    Labels are checked for tier:<effort>. Falls back to 'sonnet' if unclear.
-    Effort classes: design → opus, implement → sonnet, busywork → haiku.
+    Conservative: a substring token match on any label (so `authz`/`oauth`/`crypto-x` all trip) PLUS the 3 named
+    security epics matched exactly. Over-blocking is intentional - it costs smarts (Opus), never safety.
     """
-    labels = bead.get("labels", [])
-    for label in labels:
-        if isinstance(label, str):
-            if label.startswith("tier:"):
-                effort = label[len("tier:"):].strip().lower()
-                if effort in LOOP_MODEL_MAP:
-                    return LOOP_MODEL_MAP[effort]
-            # Also accept direct effort labels
-            for effort_class, model in LOOP_MODEL_MAP.items():
-                if label.lower() == effort_class:
-                    return model
+    for raw in labels:
+        if not isinstance(raw, str):
+            continue
+        label = raw.strip().lower()
+        if label in FABLE_BLOCK_EPICS:
+            return True
+        if any(tok in label for tok in FABLE_BLOCK_TOKENS):
+            return True
+    return False
 
-    # Infer from title keywords
+
+def route_model(bead: dict) -> str:
+    """Route a bead to a model by its tier: label. FABLE-CORE (fblai-3hf0c) fail-closed routing.
+
+    Precedence:
+      1. tier:fable -> FABLE only if `fable-ready` present AND no security marker; else DOWNGRADE to opus
+         (deterministic + logged - we never let Fable refuse-and-fallback). Fail-closed: no fable-ready => opus.
+      2. tier:opus|sonnet|haiku -> that model directly (the normalization fix; these are the live beads).
+      3. tier:design|implement|busywork -> LOOP_MODEL_MAP (effort classes).
+      4. bare effort-class label (design/implement/busywork) -> LOOP_MODEL_MAP.
+      5. else -> title-keyword inference (unchanged), defaulting to implement (sonnet).
+    """
+    labels = [l for l in bead.get("labels", []) if isinstance(l, str)]
+    tier = None
+    for raw in labels:
+        s = raw.strip().lower()
+        if s.startswith("tier:"):
+            tier = s[len("tier:"):].strip()
+            break
+
+    # 1. FABLE fail-closed gate (the crux) - a security-marked or non-certified bead NEVER reaches fable.
+    if tier == FABLE_TIER:
+        if _bead_is_security_marked(labels):
+            logger.info(
+                "[route_model] tier:fable -> opus (security-marked; never Fable on security) bead=%s",
+                bead.get("id", "?"),
+            )
+            return "opus"
+        if FABLE_READY_LABEL in [l.strip().lower() for l in labels]:
+            return "fable"
+        logger.info(
+            "[route_model] tier:fable -> opus (no fable-ready certification; fail-closed) bead=%s",
+            bead.get("id", "?"),
+        )
+        return "opus"
+
+    # 2. tier:<model-name> routes directly (opus/sonnet/haiku) - the normalization fix.
+    if tier in ROUTABLE_MODEL_NAMES:
+        return tier
+
+    # 3. tier:<effort-class> via LOOP_MODEL_MAP.
+    if tier in LOOP_MODEL_MAP:
+        return LOOP_MODEL_MAP[tier]
+
+    # 4. bare effort-class labels (design/implement/busywork).
+    for raw in labels:
+        if raw.strip().lower() in LOOP_MODEL_MAP:
+            return LOOP_MODEL_MAP[raw.strip().lower()]
+
+    # 5. Infer from title keywords (unchanged).
     title = bead.get("title", "").lower()
     if any(k in title for k in ("design", "architect", "plan", "spec")):
         return LOOP_MODEL_MAP["design"]
