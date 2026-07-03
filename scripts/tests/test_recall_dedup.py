@@ -10,15 +10,21 @@ T3 gate).
 Two halves:
 
   (a) DEDUP — pure unit tests on ``open_brain._semantic_dedup`` (no DB):
-      D1-D9 (§3.8), R3 (§4.4), F5 (§5). Plus two mocked-connection tests
-      (no DB) proving D7 byte-stability and the dedup=True over-fetch/
-      embedding-select behavior at the SQL level.
+      D1-D9 (§3.8), R3 (§4.4), F5 (§5). Plus mocked-connection tests (no
+      DB) proving D7 byte-stability and the dedup=True over-fetch/
+      embedding-select behavior at the SQL level, including a real
+      byte-identical golden-SQL comparison (fblai-6zu4p,
+      TestD7GoldenSqlByteStability).
 
   (b) INSPECT LIVE-ROW FALLBACK (security-sensitive) — unit tests on
       ``time_travel.inspect_live`` with a MOCKED connection (no DB) that
       prove it reuses ``_assert_in_scope`` (the identical user-scoping
       predicate) and that a wrong-principal RuntimeError propagates
-      (the fallback refuses, never reads cross-scope).
+      (the fallback refuses, never reads cross-scope). Also covers the
+      mirrored fallback in the Pi ``op:inspect`` dispatch
+      (``open_brain._run_from_pi``, fblai-egxj9) via
+      ``TestOpInspectPiFallback``, driving the real dispatch function
+      end to end with mocked stdin/_connect/_get_user_id.
 
 Integration tests (R1 round-trip, D9 reinforcement-touch-scope) require a
 live Postgres (DATABASE_URL) and are SKIPPED cleanly when absent, mirroring
@@ -31,6 +37,8 @@ Run:
 from __future__ import annotations
 
 import copy
+import io
+import json
 import os
 import re
 import sys
@@ -268,6 +276,84 @@ class TestD7SqlByteStability:
         assert params[-1] == expected_limit
 
 
+class TestD7GoldenSqlByteStability:
+    """D7 golden-SQL byte-stability (fblai-6zu4p): a REAL ``==`` byte
+    comparison of the dedup=False ``search_sql`` string against a
+    hardcoded golden constant - not a substring/whitespace-loose match
+    like ``TestD7SqlByteStability`` above. This is the pre-T3 baseline:
+    if anyone drifts the dedup=False SQL template (adds a column, changes
+    whitespace, reorders a clause), this test REDS. That is the point -
+    it is the durable backstop for the D7 "degrade-to-today" invariant.
+
+    Query is deliberately all-stopword ("is a to" - every token is in
+    STOP_WORDS) so ``_extract_keywords`` returns ``[]`` and
+    ``keyword_boost_expr`` collapses to the constant ``"0.0"`` branch -
+    this keeps the golden SQL free of query-dependent CASE clauses and
+    fully deterministic. ``_generate_embedding`` is patched to a fixed
+    768-dim vector for the same reason (the embedding value flows into
+    ``params``, not into ``search_sql`` itself, but pinning it removes
+    any doubt).
+    """
+
+    _QUERY = "is a to"  # all-stopword: _extract_keywords(...) == []
+
+    # Captured verbatim (via repr()) from the current dedup=False
+    # search_sql f-string output in open_brain.search() - see docstring.
+    _GOLDEN_DEDUP_FALSE_SQL = '\n        WITH scored AS (\n            SELECT\n                thought_id,\n                raw_text,\n                summary,\n                thought_type,\n                topics,\n                people,\n                action_items,\n                source,\n                project,\n                created_at,\n                stv_frequency,\n                stv_confidence,\n                1 - (embedding <=> %s::vector) AS vec_similarity,\n                0.0 AS keyword_boost,\n                GREATEST(0, 1.0 - EXTRACT(EPOCH FROM (NOW() - GREATEST(created_at, COALESCE(updated_at, created_at)))) / (90 * 86400.0)) AS time_decay\n            FROM brain.thoughts\n            WHERE user_id = %s AND embedding IS NOT NULL AND (embed_model = %s OR embed_model IS NULL)\n        )\n        SELECT *,\n            (vec_similarity * 0.85) + (keyword_boost * 0.10) + (time_decay * 0.05) AS hybrid_score\n        FROM scored\n        ORDER BY hybrid_score DESC\n        LIMIT %s\n    '
+
+    @staticmethod
+    def _make_mock_conn():
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.description = []
+        mock_cur.fetchall.return_value = []
+        return mock_conn, mock_cur
+
+    def test_dedup_false_sql_is_byte_identical_to_golden(self):
+        mock_conn, mock_cur = self._make_mock_conn()
+        with patch.object(open_brain, "_generate_embedding", return_value=[0.1] * 768), \
+             patch.object(open_brain, "emit_replay_log", return_value=1):
+            open_brain.search(
+                mock_conn, query=self._QUERY, user_id="user-x",
+                limit=5, dedup=False,
+            )
+
+        assert mock_cur.execute.call_count == 1
+        sql_text, params = mock_cur.execute.call_args_list[0][0]
+        # Real byte-identical comparison: NOT normalized, NOT a substring
+        # or whitespace-loose match. Any drift in the dedup=False SQL
+        # template reds this assertion - mutate a single space in
+        # search_sql's f-string in open_brain.search() and watch this go
+        # red, which is the whole point of a golden-SQL test.
+        assert sql_text == self._GOLDEN_DEDUP_FALSE_SQL, (
+            "dedup=False search_sql drifted from the D7 pre-T3 golden "
+            "baseline - see TestD7GoldenSqlByteStability docstring"
+        )
+        assert params[-1] == 5, "LIMIT must be the caller's limit, unmodified"
+
+    def test_dedup_true_sql_differs_from_golden_and_overfetches(self):
+        mock_conn, mock_cur = self._make_mock_conn()
+        with patch.object(open_brain, "_generate_embedding", return_value=[0.1] * 768), \
+             patch.object(open_brain, "emit_replay_log", return_value=1):
+            open_brain.search(
+                mock_conn, query=self._QUERY, user_id="user-x",
+                limit=5, dedup=True,
+            )
+
+        sql_text, params = mock_cur.execute.call_args_list[0][0]
+        # Proves the golden isn't vacuously matching both paths: dedup=True
+        # must produce a genuinely DIFFERENT SQL string from the dedup=False
+        # golden, so this suite actually distinguishes the two code paths.
+        assert sql_text != self._GOLDEN_DEDUP_FALSE_SQL
+        assert "_embedding_text" in sql_text
+        assert "embedding::text" in sql_text
+        expected_limit = min(5 * open_brain.DEDUP_OVERFETCH_FACTOR, open_brain.DEDUP_OVERFETCH_CAP)
+        assert params[-1] == expected_limit, (
+            "dedup=True must over-fetch, not use the caller's raw limit"
+        )
+
+
 # ─── (b) --inspect live-row fallback: SECURITY tests (mocked conn, no DB) ────
 
 
@@ -359,6 +445,110 @@ class TestInspectLiveFallbackSecurity:
             mock_conn, thought_id="brain-1-gone0000", user_id="user-a",
         )
         assert result is None
+
+
+class TestOpInspectPiFallback:
+    """Pi ``op:inspect`` dispatch (fblai-egxj9) - mirrors the CLI --inspect
+    §4.3 R1 fallback inside ``open_brain._run_from_pi()``'s ``elif op ==
+    "inspect":`` branch: when ``time_travel.inspect_latest`` returns None
+    (captured, never snapshotted), fall back to ``time_travel.inspect_live``.
+    Both tests drive the REAL ``_run_from_pi()`` dispatch end to end with
+    mocked stdin / ``_connect`` / ``_get_user_id`` (no DB, no real stdin) so
+    they exercise the actual production code path rather than a
+    reimplementation of it. This mirrors how the (b) section above tests
+    ``inspect_live`` directly; here we additionally prove the Pi dispatch
+    wiring around it.
+    """
+
+    @staticmethod
+    def _dispatch(monkeypatch, thought_id: str, user_id: str, mock_conn) -> None:
+        payload = json.dumps({"op": "inspect", "thought_id": thought_id})
+        monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+        monkeypatch.setattr(open_brain, "_get_user_id", lambda: user_id)
+        monkeypatch.setattr(open_brain, "_connect", lambda: mock_conn)
+        open_brain._run_from_pi()
+
+    def test_scoping_wall_cross_principal_call_never_leaks_other_users_thought(
+        self, monkeypatch, capsys,
+    ):
+        """THE CRUX (Harvey gate #1): user A calls op:inspect for a thought
+        id that ``inspect_latest`` has no version for (never snapshotted),
+        so the T3 fallback fires -> ``inspect_live`` -> inspect_live's OWN
+        ``_assert_in_scope`` call (belt-and-suspenders, independent of
+        inspect_latest's own scope check, which is bypassed here so this
+        test isolates coverage to inspect_live's redundant check) raises
+        RuntimeError for the cross-principal call. There is no local
+        try/except around ``elif op == "inspect":`` in ``_run_from_pi()``
+        (only the outer ``finally: conn.close()``), so the RuntimeError
+        propagates out uncaught - A's op:inspect call NEVER prints B's (or
+        anyone's) raw_text/summary; it errors out instead.
+
+        PROBE: remove the ``_assert_in_scope`` call inside
+        ``time_travel.inspect_live`` and this test REDS - the RuntimeError
+        would no longer fire and the live-row SELECT would proceed (this
+        is exactly the scoping hole the fallback must never open).
+        """
+        mock_conn = MagicMock()
+        with patch.object(time_travel, "inspect_latest", return_value=None), \
+             patch.object(
+                 time_travel,
+                 "_assert_in_scope",
+                 side_effect=RuntimeError(
+                     "inspect_live: thought brain-1-b not in user scope (user=user-a)"
+                 ),
+             ):
+            with pytest.raises(RuntimeError, match="not in user scope"):
+                self._dispatch(monkeypatch, "brain-1-b", "user-a", mock_conn)
+
+        out = capsys.readouterr().out
+        assert out == "", (
+            "no JSON payload of any kind may be printed on the walled path "
+            f"(got: {out!r})"
+        )
+        # inspect_live's live-row SELECT is never reached: _assert_in_scope
+        # raised before any cursor was ever opened.
+        mock_conn.cursor.assert_not_called()
+        # The outer `finally: conn.close()` still runs even though the
+        # exception propagates.
+        mock_conn.close.assert_called_once()
+
+    def test_fallback_fires_for_owner_never_snapshotted_returns_live_row(
+        self, monkeypatch, capsys,
+    ):
+        """Owner path (mirrors the CLI test's setup): user A captured a
+        thought that was never snapshotted (no thought_versions row, so
+        inspect_latest returns None). op:inspect with no --at/--at_revision
+        qualifier must fall back to inspect_live() and return A's own live
+        row - result is not None and carries A's raw_text."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        live_row = (
+            "A's own live raw text, never snapshotted",
+            "a live summary",
+            "insight",
+            [],
+            [],
+            [],
+            "agent-a",
+            "capture",
+            datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        # _assert_in_scope's "SELECT 1" (A is in scope), then the live-row SELECT.
+        mock_cur.fetchone.side_effect = [(1,), live_row]
+
+        with patch.object(time_travel, "inspect_latest", return_value=None):
+            self._dispatch(monkeypatch, "brain-1-a", "user-a", mock_conn)
+
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload.get("thought_id") == "brain-1-a"
+        assert payload.get("raw_text") == "A's own live raw text, never snapshotted"
+        assert payload.get("source") == "live", (
+            "the fallback result must be tagged source='live', not a "
+            "fabricated thought_versions row"
+        )
+        mock_conn.close.assert_called_once()
 
 
 # ─── Integration tests (DATABASE_URL-gated; skip cleanly without it) ─────────

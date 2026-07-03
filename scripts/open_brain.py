@@ -5887,6 +5887,33 @@ def _run_from_pi():
                 result = time_travel.inspect_latest(
                     conn, args.get("thought_id", ""), user_id,
                 )
+                if result is None:
+                    # T3 (fblai-bfyjr) §4.3 R1 CCR-reversibility fallback,
+                    # mirrored from the CLI --inspect path (main(),
+                    # ~open_brain.py:6684-6698): the common case (captured,
+                    # never snapshotted) has no thought_versions row. Fall
+                    # back to the live brain.thoughts row via
+                    # time_travel.inspect_live(), which reuses
+                    # _assert_in_scope (time_travel.py:93) - the IDENTICAL
+                    # WHERE thought_id=%s AND user_id=%s principal wall
+                    # used by every other inspect_* entry point. No new
+                    # scoping logic is introduced here. A wrong-principal
+                    # call raises RuntimeError (NOT swallowed here) - same
+                    # as the pre-existing inspect_latest() call two lines
+                    # above, this op=="inspect" branch has no local
+                    # try/except, so the RuntimeError propagates uncaught
+                    # out of _run_from_pi() (the outer try at the top of
+                    # this function only has a `finally: conn.close()`,
+                    # no `except`). That is a hard failure (non-zero exit,
+                    # traceback on stderr), never a swallowed exception and
+                    # never a printed JSON payload containing another
+                    # user's thought - a cross-principal op:inspect call
+                    # errors out, it never leaks. --at / --at-revision are
+                    # UNCHANGED: this fallback applies ONLY to the
+                    # no-qualifier path.
+                    result = time_travel.inspect_live(
+                        conn, args.get("thought_id", ""), user_id,
+                    )
             if result is None:
                 print(json.dumps({"thought_id": args.get("thought_id", ""), "result": None}))
             else:
