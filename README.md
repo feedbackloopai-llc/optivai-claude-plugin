@@ -506,7 +506,9 @@ Use `/mol-pour` to instantiate a molecule.
 
 ## Running an OptivAI Loop
 
-A scheduled, self-kicking, verification-gated runner that drains a Beads molecule autonomously — think → plan → beads → drain → verify → close, on infrastructure time. State lives in Beads + Brain + git (never conversation history), so iterations stay token-stable. See the design (`docs/plans/2026-06-19-loop-runner-design.md`) and the master doc (`~/Downloads/OptivAI-Loop-Engineering-Master-Doc-2026-06-19.md`).
+A verification-gated runner that drains a Beads molecule autonomously -- think -> plan -> beads -> drain -> verify -> close. State lives in Beads + Brain + git (never conversation history), so iterations stay token-stable. Design docs: `docs/plans/2026-06-21-mayor-orchestration.md`, `docs/plans/2026-06-22-mayor-v2.md`. Master doc: `~/Downloads/OptivAI-Loop-Engineering-Master-Doc-2026-06-19.md`.
+
+**Runner version:** Mayor v2.2 (merged 2026-06-24). `--max-workers 1` (the default) is the original sequential single-stream loop, backward-compatible. `--max-workers N>1` activates the bounded-concurrent Mayor: a single-writer coordinator dispatches workers in isolated git worktrees, runs verify-at-source in each worktree, and merges passing branches via the Refinery (batch-then-bisect merge slot). There is no OS-level sandbox -- git worktrees are the isolation. There is no conversational "Mayor" persona and no Foreman tier. The runner does not auto-fire on a schedule; the launchd installer stays `--dry-run` until you pass `--live`.
 
 **Runbook:**
 
@@ -514,21 +516,44 @@ A scheduled, self-kicking, verification-gated runner that drains a Beads molecul
 2. **Pick a verification command (`V`)** — a real test/build whose exit 0 is the *only* thing that closes a bead (e.g. `cd scripts && python3 -m pytest -q`). A bead may carry its own `verify:<cmd>` label.
 3. **Dry-run first (no spend, no mutations):**
    ```bash
-   python3 scripts/loop_runner.py --molecule epic:my-work --verify-cmd "<V>" --dry-run
+   cd <repo> && python3 scripts/loop_runner.py --molecule epic:my-work --verify-cmd "<V>" --dry-run
    ```
-   Prints the plan (selected beads, tier routing, gate-compliance) and changes nothing.
+   Run from within the target repo so worktree paths resolve. Prints the plan (selected beads, tier routing, gate-compliance) and changes nothing.
 4. **One real iteration:** swap `--dry-run` for `--once` (spends tokens; closes the bead only if `V` exits 0).
-5. **Schedule it (launchd, dry-run by default):**
+5. **Multi-worker (Mayor mode):** add `--max-workers N` (e.g. `--max-workers 3`). Workers run concurrently in git worktrees; only the Mayor main thread writes bead status (single-writer invariant).
+6. **Schedule it (launchd, dry-run by default):**
    ```bash
    bash scripts/install-loop-schedule.sh --label my-work --molecule epic:my-work --verify-cmd "<V>" --cadence 3600
    ```
    Writes a `--dry-run` LaunchAgent that **does not fire** until you pass `--live`. Uninstall: `--uninstall my-work`.
 
-**Bounds & safety:** `--max-iterations` (default 25), `--budget-tokens` (default 2,000,000), and a no-progress stop after 2 consecutive zero-close iterations. Overridable via `OPTIVAI_LOOP_*` env vars. Logs: `~/.claude/logs/loop-<label>.log`.
+**Bounds & safety:** `--max-iterations` (default 25), `--budget-tokens` (default 2,000,000), and a no-progress stop after 2 consecutive zero-close rounds. Overridable via `OPTIVAI_LOOP_*` env vars.
 
-> **Trust note:** `V` runs through the shell — keep verification commands trusted (they come from `--verify-cmd`, a bead's `verify:` label, or the repo default; never from recalled content). The repo-default `V` is machine-specific; pass `--verify-cmd` explicitly elsewhere. A bead is **never** closed on a self-reported "done" — only on a real `V` exit 0.
+**All CLI flags (Mayor v2.2):**
 
-The Pi dev harness has parity (`/loop` + `src/loop-runner.ts`); the OptivAI Builder product implements this natively (handoff spec in the master doc §6).
+| Flag | Default | Purpose |
+|---|---|---|
+| `--molecule` | (required) | Molecule label to filter ready beads |
+| `--verify-cmd` | `""` | Verification command V (falls back to bead `verify:` label then repo default) |
+| `--max-iterations` | 25 | Hard iteration/completion-round cap |
+| `--budget-tokens` | 2,000,000 | Hard output-token ceiling |
+| `--dry-run` | off | Plan only; no dispatch, no beads closed |
+| `--once` | off | Run exactly one real iteration then exit |
+| `--max-workers` | 1 | Concurrent workers; 1 = sequential, >1 = Mayor mode |
+| `--stuck-threshold` | 1800 | Seconds before a hung worker is considered stuck |
+| `--spawning-window` | 300 | Grace period (seconds) before new workers can be stuck-detected |
+| `--max-respawns` | 1 | Per-bead respawn cap (reconciler); 0 disables respawning |
+| `--batch-max` | 1 | Refinery: max V-passed branches per merge batch; 1 = VA0b serial path |
+| `--refinery-attempts` | 2 | Refinery: max conflict-re-implement attempts before escalation |
+| `--repo` | (path) | Repo path passed to dispatch prompt |
+| `--branch` | (branch) | Branch passed to dispatch prompt |
+| `--verbose` / `-v` | off | Enable debug logging |
+
+Env var overrides follow the pattern `OPTIVAI_LOOP_<UPPERCASED_FLAG>` (e.g. `OPTIVAI_LOOP_MAX_WORKERS`, `OPTIVAI_LOOP_BATCH_MAX`).
+
+> **Trust note:** `V` runs through the shell -- keep verification commands trusted (they come from `--verify-cmd`, a bead's `verify:` label, or the repo default; never from recalled content). The repo-default `V` is machine-specific; pass `--verify-cmd` explicitly elsewhere. A bead is **never** closed on a self-reported "done" -- only on a real `V` exit 0.
+
+The Pi dev harness has parity (`/loop` + `src/loop-runner.ts`, `src/mayor-reconciler.ts`); the parity corpus (`scripts/hooks/tests/mayor_parity_corpus.json`) asserts byte-identical verdicts.
 
 ---
 

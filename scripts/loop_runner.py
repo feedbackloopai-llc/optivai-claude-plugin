@@ -61,6 +61,46 @@ LOOP_MAX_ITERATIONS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_ITERATIONS", "25
 LOOP_BUDGET_TOKENS: int = int(os.environ.get("OPTIVAI_LOOP_BUDGET_TOKENS", "2000000"))
 LOOP_NOPROGRESS_K: int = int(os.environ.get("OPTIVAI_LOOP_NOPROGRESS_K", "2"))
 LOOP_MODEL_MAP: dict = {"design": "opus", "implement": "sonnet", "busywork": "haiku"}
+# FABLE-CORE (fblai-3hf0c): tier:<model-name> routes directly to that model (the normalization fix - the live
+# beads use tier:opus/sonnet/haiku, model names, which previously fell through to title inference). `fable` is
+# the brightest tier but is NEVER routed directly - it is fail-closed gated below (needs fable-ready + no security).
+ROUTABLE_MODEL_NAMES: frozenset = frozenset({"opus", "sonnet", "haiku"})
+FABLE_TIER: str = "fable"
+FABLE_READY_LABEL: str = "fable-ready"
+# Security markers - a bead carrying ANY of these NEVER reaches fable, even if mis-certified fable-ready
+# (defense-in-depth). Conservative by design: over-block (cost smarts=opus) is SAFE; under-block (leak security
+# to Fable, which refuses/wastes it) is NOT. Substring match, so "authz"/"oauth"/"encryption"/"key-rotation" all
+# block. This is a CONSERVATIVE SUPERSET of the security vocabulary (Gate-2 B1: a narrow set slipped 83% of it -
+# `encryption`/`sandbox`/`rbac`/`credential` all reached Fable). It over-blocks some benign OptivAI beads
+# (token-budget/agent-session/worktree-isolation) to OPUS - the spec's mandated safe direction. The isolation/
+# hardening/tenant/sovereign tokens also catch the security EPICS + every future variant (Gate-2 I1). The label
+# denylist can never be complete, so route_model ALSO scans the title/description (a NARROWER high-confidence
+# set) - a second net. The PRIMARY control remains Harvey's deliberate `fable-ready` security-surface assessment.
+FABLE_BLOCK_TOKENS: tuple = (
+    # auth / access-control
+    "security", "auth", "access-control", "access", "rbac", "permission", "privilege", "escalation",
+    "credential", "secret", "token", "password", "session", "login", "sso", "saml", "oidc", "jwt", "mfa",
+    # cryptography (the most-missed surface - "crypto" alone does NOT substring "encryption")
+    "crypto", "encrypt", "decrypt", "cipher", "tls", "ssl", "pki", "hsm", "key",
+    # cyber / vulnerability / offensive
+    "cyber", "exploit", "vuln", "cve", "pentest", "malware", "xss", "csrf", "ssrf", "injection", "firewall",
+    # isolation / sovereignty (the OptivAI security epics + FR2 no-egress)
+    "sandbox", "isolation", "tenant", "hardening", "sovereign", "egress", "deas",
+    # data protection / compliance
+    "pii", "gdpr", "hipaa", "compliance",
+)
+# High-confidence tokens scanned in FREE-TEXT title/description (the second net). Narrower than the label set -
+# only words unlikely to appear benignly in a title - so we do not over-block every bead whose title mentions a
+# common word ("caching key", "user session"). Multi-char distinctive stems keep benign false-positives low.
+FABLE_BLOCK_TEXT_TOKENS: tuple = (
+    "security", "cyber", "exploit", "vulnerab", "vuln", "cve", "pentest", "malware",
+    "xss", "csrf", "ssrf", "sql-injection", "rbac", "authenticat", "authoriz", "oauth", "saml", "oidc",
+    "credential", "password", "encrypt", "decrypt", "cipher", "firewall", "access-control",
+    "privilege", "sandbox-escape", "sovereign", "no-egress",
+)
+FABLE_BLOCK_EPICS: frozenset = frozenset(
+    {"epic:harness-hardening", "epic:multi-tenant-isolation", "epic:per-user-isolation"}
+)
 LOOP_VERIFY_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_VERIFY_TIMEOUT_S", "900"))
 LOOP_ITER_TIMEOUT_S: int = int(os.environ.get("OPTIVAI_LOOP_ITER_TIMEOUT_S", "1800"))
 LOOP_MAX_WORKERS: int = int(os.environ.get("OPTIVAI_LOOP_MAX_WORKERS", "4"))
@@ -97,8 +137,10 @@ LOOP_REFINERY_W_PRIO: float = float(
 # Override via Runners.loop_state_path for testing.
 LOOP_STATE_PATH: Path = Path.home() / ".claude" / "loop-state.json"
 
-# Default verify command for this repo when none is specified
-_REPO_DEFAULT_VERIFY_CMD = "cd /Users/erato949/dev/optivai-claude-plugin/scripts && python3 -m pytest -q"
+# Default verify command when none is specified (last resort, after --verify-cmd
+# and the bead's verify:<cmd> label). Relative to the invocation cwd / worktree
+# root so it carries no machine-specific path.
+_REPO_DEFAULT_VERIFY_CMD = "cd scripts && python3 -m pytest -q"
 
 # ---------------------------------------------------------------------------
 # Worktree serialization lock (P1.2)
@@ -1143,25 +1185,79 @@ def select_next(ready: List[dict]) -> Optional[dict]:
 # route_model — §1 (pure)
 # ---------------------------------------------------------------------------
 
-def route_model(bead: dict) -> str:
-    """Route bead to a model tier based on its effort class label.
+def _bead_is_security_marked(bead: dict) -> bool:
+    """True if the bead carries ANY security surface (FABLE-CORE defense-in-depth; never Fable on security).
 
-    Labels are checked for tier:<effort>. Falls back to 'sonnet' if unclear.
-    Effort classes: design → opus, implement → sonnet, busywork → haiku.
+    Two nets (Gate-2 B1/I1): (1) a broad substring token match on every LABEL (so `authz`/`oauth`/`encryption`/
+    `key-rotation` all trip) PLUS the 3 named security epics; the isolation/hardening/tenant/sovereign tokens
+    also catch epic variants. (2) a NARROWER high-confidence scan of the free-text title+description - because a
+    label denylist can never be complete (a `perf-refactor`-labelled bead that rewrites the auth cache slips the
+    labels). Over-blocking is intentional: it costs smarts (Opus), never safety.
     """
-    labels = bead.get("labels", [])
-    for label in labels:
-        if isinstance(label, str):
-            if label.startswith("tier:"):
-                effort = label[len("tier:"):].strip().lower()
-                if effort in LOOP_MODEL_MAP:
-                    return LOOP_MODEL_MAP[effort]
-            # Also accept direct effort labels
-            for effort_class, model in LOOP_MODEL_MAP.items():
-                if label.lower() == effort_class:
-                    return model
+    for raw in bead.get("labels", []):
+        if not isinstance(raw, str):
+            continue
+        label = raw.strip().lower()
+        if label in FABLE_BLOCK_EPICS:
+            return True
+        if any(tok in label for tok in FABLE_BLOCK_TOKENS):
+            return True
+    # Second net: high-confidence tokens in the free text (title + description).
+    text = f"{bead.get('title', '')} {bead.get('description', '')} {bead.get('body', '')}".lower()
+    if any(tok in text for tok in FABLE_BLOCK_TEXT_TOKENS):
+        return True
+    return False
 
-    # Infer from title keywords
+
+def route_model(bead: dict) -> str:
+    """Route a bead to a model by its tier: label. FABLE-CORE (fblai-3hf0c) fail-closed routing.
+
+    Precedence:
+      1. tier:fable -> FABLE only if `fable-ready` present AND no security marker; else DOWNGRADE to opus
+         (deterministic + logged - we never let Fable refuse-and-fallback). Fail-closed: no fable-ready => opus.
+      2. tier:opus|sonnet|haiku -> that model directly (the normalization fix; these are the live beads).
+      3. tier:design|implement|busywork -> LOOP_MODEL_MAP (effort classes).
+      4. bare effort-class label (design/implement/busywork) -> LOOP_MODEL_MAP.
+      5. else -> title-keyword inference (unchanged), defaulting to implement (sonnet).
+    """
+    labels = [l for l in bead.get("labels", []) if isinstance(l, str)]
+    tier = None
+    for raw in labels:
+        s = raw.strip().lower()
+        if s.startswith("tier:"):
+            tier = s[len("tier:"):].strip()
+            break
+
+    # 1. FABLE fail-closed gate (the crux) - a security-marked or non-certified bead NEVER reaches fable.
+    if tier == FABLE_TIER:
+        if _bead_is_security_marked(bead):
+            logger.info(
+                "[route_model] tier:fable -> opus (security-marked; never Fable on security) bead=%s",
+                bead.get("id", "?"),
+            )
+            return "opus"
+        if FABLE_READY_LABEL in [l.strip().lower() for l in labels]:
+            return "fable"
+        logger.info(
+            "[route_model] tier:fable -> opus (no fable-ready certification; fail-closed) bead=%s",
+            bead.get("id", "?"),
+        )
+        return "opus"
+
+    # 2. tier:<model-name> routes directly (opus/sonnet/haiku) - the normalization fix.
+    if tier in ROUTABLE_MODEL_NAMES:
+        return tier
+
+    # 3. tier:<effort-class> via LOOP_MODEL_MAP.
+    if tier in LOOP_MODEL_MAP:
+        return LOOP_MODEL_MAP[tier]
+
+    # 4. bare effort-class labels (design/implement/busywork).
+    for raw in labels:
+        if raw.strip().lower() in LOOP_MODEL_MAP:
+            return LOOP_MODEL_MAP[raw.strip().lower()]
+
+    # 5. Infer from title keywords (unchanged).
     title = bead.get("title", "").lower()
     if any(k in title for k in ("design", "architect", "plan", "spec")):
         return LOOP_MODEL_MAP["design"]
@@ -2776,6 +2872,27 @@ def _print_dry_run_plan(bead: dict, tier: str, verify_cmd: Optional[str], prompt
 # CLI entry point (§6)
 # ---------------------------------------------------------------------------
 
+def _default_repo() -> str:
+    """Default --repo: the cwd the runner is invoked from.
+
+    The runner is always launched from inside the target repo
+    (``cd <repo> && python3 ... loop_runner.py``), so the working directory is
+    the correct, machine-independent default. Replaces the former hardcoded
+    developer path. Mirrors the Pi engine (``cfg.repo ?? process.cwd()``).
+    """
+    return os.getcwd()
+
+
+def _default_branch() -> str:
+    """Default --branch: ``main``.
+
+    The working/integration branch the Mayor merges passing worktree branches
+    into. Replaces the former hardcoded WIP-branch default. Mirrors the Pi
+    engine (``cfg.branch ?? "main"``).
+    """
+    return "main"
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="loop_runner.py",
@@ -2815,13 +2932,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repo",
-        default="/Users/erato949/dev/optivai-claude-plugin",
-        help="Repo path passed into the dispatch prompt.",
+        default=_default_repo(),
+        help=(
+            "Repo path passed into the dispatch prompt and used as the worktree "
+            "source (default: the current working directory)."
+        ),
     )
     parser.add_argument(
         "--branch",
-        default="perf/windows-optimization",
-        help="Branch passed into the dispatch prompt.",
+        default=_default_branch(),
+        help=(
+            "Working/integration branch the Mayor merges passing worktree "
+            "branches into (default: main)."
+        ),
     )
     parser.add_argument(
         "--max-workers",

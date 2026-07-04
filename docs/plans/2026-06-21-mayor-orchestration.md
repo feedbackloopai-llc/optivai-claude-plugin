@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Per-bead: superpowers:test-driven-development. Parallel waves: superpowers:dispatching-parallel-agents + superpowers:using-git-worktrees.
 
-> **STATUS: DRAFT — pending Chris's validation of (a) v1 scope and (b) parity-sequencing (see "Open Forks").**
+> **STATUS: SUPERSEDED (v1 delivered as Mayor v1; v2 delivered as Mayor v2 / v2.1 / v2.2, merged 2026-06-24).** This document is the original v1 draft. Read it for architectural background. For the current state, see `2026-06-22-mayor-v2.md` (v2 plan) and `2026-06-22-mayor-vb1-refinery.md` (Refinery design). Key divergence from this draft: OS-sandbox was explicitly CUT in v2 (it was a product-context bleed; git-worktrees are the GT-faithful isolation). The "Be better: OS-level worker isolation is the default" bullet in this doc was the original aspiration; it was rejected before v2 landed. The Foreman (crew-boss) tier listed in the Gas Town role table was NOT ported -- scale mismatch and single-writer invariant. Tier routing (route_model) is LIVE and functional in v2.2, not cosmetic or ledger-only.
 
 **Goal:** Add the multi-agent **orchestration superstructure** (a Mayor coordinator that dispatches a bounded set of role-typed workers over a beads molecule, tracks capacity, recovers crashed workers, and serializes merges) to both dev harnesses — built on our existing substrate (beads + Brain + the loop runner), taking Gas Town's MIT design as the blueprint, adding **no new storage** and **no Dolt**.
 
-**Architecture:** The Mayor is the **single writer** to task state: N workers run concurrently but only *return results*; the Mayor commits status/assignment changes to beads. This is exactly the design Gas Town converged on after abandoning branch-per-worker, so there is **no merge engine** to build. Coordination state lives in the two stores we already run — **beads** (the live task graph) and the **Brain** (the versioned ledger / provenance / Hebbian promotion) — extending `loop_runner.py` (Claude) and `loop-runner.ts` (Pi) into the coordinator. The one place we go deliberately *better* than Gas Town: **OS-level worker isolation is the default, not opt-in.**
+**Architecture:** The Mayor is the **single writer** to task state: N workers run concurrently but only *return results*; the Mayor commits status/assignment changes to beads. This is exactly the design Gas Town converged on after abandoning branch-per-worker, so there is **no merge engine** to build. Coordination state lives in the two stores we already run — **beads** (the live task graph) and the **Brain** (the versioned ledger / provenance / Hebbian promotion) — extending `loop_runner.py` (Claude) and `loop-runner.ts` (Pi) into the coordinator. (Note: the original draft said "the one place we go deliberately better than Gas Town: OS-level worker isolation is the default, not opt-in." This was cut in v2. Git-worktree isolation is what shipped.)
 
 **Tech Stack:** Python 3.12 (`optivai-claude-plugin`), TypeScript/vitest (`optivai-pi-plugin`), beads CLI, Open Brain (`open_brain.py` / brain HTTP), the existing dispatch-gate + loop runner, git worktrees, `pytest`.
 
@@ -32,7 +32,7 @@ Two recons (sourced, in this session's brain under project `gastown-mayor-rebuil
 ## Optimization Attractors (Chris's words)
 
 - **Token efficiency** — Opus only for orchestration/design/hard-coding; Sonnet for implementation; Haiku for mechanical busy-work. The Mayor sizes the town to *our* token budget (no 20–30-agent "cash guzzler").
-- **Security** — copy Gas Town's genuinely-good primitives; never copy its soft-convention defaults; sandbox-by-default.
+- **Security** — copy Gas Town's genuinely-good primitives; never copy its soft-convention defaults. (Note: "sandbox-by-default" was an original attractor here; it was cut in v2. Git-worktree isolation is the security boundary that shipped.)
 - **Accuracy / review** — every code bead gates on a real V (test/build exit 0) before close; spec-reviewer → quality-reviewer on each wave.
 - **Parity** — Claude and Pi stay in lockstep.
 
@@ -55,7 +55,7 @@ Two recons (sourced, in this session's brain under project `gastown-mayor-rebuil
 
 ## Phased Plan
 
-**Recommended v1 = the working Mayor (the heart).** Refinery-merge and sandbox-default are v2. Rationale: ship + validate the bounded concurrent coordinator first (mirrors how we built the loop runner — core first, extend later); keeps Opus-token spend bounded; gives Chris something runnable to dry-run.
+**Recommended v1 = the working Mayor (the heart).** Refinery-merge was v2 (SHIPPED as VB2 in Mayor v2.2). OS-sandbox-default was proposed as v2 but was CUT (git-worktrees are the isolation that shipped). Rationale: ship + validate the bounded concurrent coordinator first (mirrors how we built the loop runner — core first, extend later); keeps Opus-token spend bounded; gives Chris something runnable to dry-run.
 
 ### v1 — Coordinator Core (this plan's primary deliverable)
 
@@ -67,11 +67,11 @@ Two recons (sourced, in this session's brain under project `gastown-mayor-rebuil
 | **P3 — State + observability** | Extend `~/.claude/loop-state.json` schema to multi-worker (active workers, per-worker bead, capacity). Statusline (Claude) + widget (Pi) show the town. Ledger: Mayor records dispatch/verify/close transitions to the Brain with provenance. | Visibility (extends the obs layer we already shipped) |
 | **P4 — Parity + hardening** | Port the Python engine to TS (Pi); parity test corpus identical verdicts; governor bounds (`--max-workers`, `--budget-tokens`); dry-run gate. | Chris's parity rule |
 
-### v2 — Refinery + Sandbox (separate plan, after v1 validates)
+### v2 — Refinery + Sandbox (original plan; see actual outcomes below)
 
-- **Refinery-merge**: batch-then-bisect, anti-starvation scoring (port the formula), push-lock, typed-conflict→relabel-respawn.
-- **OS-sandbox-by-default**: per-worker sandbox + CN-scoped push proxy (the "be better than Gas Town" upgrade).
-- **Full Witness/Deacon** split if v1's folded reconciler proves insufficient.
+- **Refinery-merge**: batch-then-bisect, anti-starvation scoring (port the formula), push-lock, typed-conflict→relabel-respawn. **SHIPPED** as VB2 in Mayor v2.2 (see `2026-06-22-mayor-vb1-refinery.md`).
+- **OS-sandbox-by-default**: per-worker sandbox + CN-scoped push proxy. **CUT** in v2 -- this was a product-context bleed. Git-worktree isolation is what shipped instead (per `2026-06-22-mayor-v2.md`).
+- **Full Witness/Deacon** split if v1's folded reconciler proves insufficient. **NOT SHIPPED** -- the P2 reconciler (detector/guard-ladder/AI-judge) proved sufficient; no separate Witness/Deacon split was needed.
 
 ---
 
@@ -135,20 +135,20 @@ Each bead carries: exact files, acceptance criteria, and a **resolvable V** (a r
 
 **NEVER COPY (their soft-convention defaults):**
 - No-auth root Dolt server (we have no Dolt — N/A, but the lesson: never bind a store unauthenticated).
-- Shared-filesystem default-trust → **we sandbox by default** (v2).
+- Shared-filesystem default-trust. (Note: this draft proposed "we sandbox by default" as a v2 item. OS-sandbox was cut. Git-worktree isolation shipped instead.)
 - Default shell-exec of config strings.
 - Unauthenticated admin/cert API.
 - "Trust levels" that don't actually gate.
 
-**Be better:** OS-level worker isolation is the **default** (v2 P-sandbox), the one place Gas Town deferred and we lead.
+**Be better (draft intent, not shipped):** OS-level worker isolation as the default was the original aspiration. It was cut in v2 as a product-context bleed; git-worktrees are the Gas-Town-faithful isolation and are what actually shipped.
 
 ## The genuinely hard parts (named honestly)
 
-1. Crash-aware slot accounting — a dead worker's slot stays occupied until resolved (no silent capacity leak), without Gas Town's tmux-scan.
-2. Convergent "discover, don't track" reconciliation with the guard-ladder to avoid false-kills.
-3. Detector-vs-judge separation without the judge becoming a token sink.
-4. (v2) Refinery batch-then-bisect + push-lock + conflict recovery.
-5. (v2) OS sandbox-by-default + CN-scoped push proxy.
+1. Crash-aware slot accounting — a dead worker's slot stays occupied until resolved (no silent capacity leak), without Gas Town's tmux-scan. (SHIPPED in v1 / v2)
+2. Convergent "discover, don't track" reconciliation with the guard-ladder to avoid false-kills. (SHIPPED in v2)
+3. Detector-vs-judge separation without the judge becoming a token sink. (SHIPPED in v2)
+4. (v2) Refinery batch-then-bisect + push-lock + conflict recovery. (SHIPPED as VB2 in v2.2)
+5. OS sandbox-by-default + CN-scoped push proxy. (CUT -- not shipped; out of scope per v2 plan)
 
 ## CI / Regression Guards
 
@@ -183,18 +183,18 @@ to the beads store** or allow automated PR-driven bead-label mutations.
 
 Pure-additive on both plugins; `git revert` any phase. No production system, no Builder, no data migration. The Mayor reads beads/Brain we already run; reverting leaves the existing single-stream loop runner intact.
 
-## Out of Scope
+## Out of Scope (as originally drafted; actuals in parentheses)
 
-- `optivai-builder` (off-limits).
-- Dolt / any new storage.
-- Task-state merge engine.
-- The 20–30-agent default colony / Wasteland federation / PR-provider abstraction.
-- v2 items (refinery, sandbox-default, full Witness/Deacon) — separate plan after v1 validates.
+- `optivai-builder` (off-limits). (STILL off-limits)
+- Dolt / any new storage. (STILL excluded)
+- Task-state merge engine. (STILL excluded -- single-writer Mayor makes it moot)
+- The 20-30-agent default colony / Wasteland federation / PR-provider abstraction. (STILL excluded)
+- v2 items: Refinery (SHIPPED as VB2); OS-sandbox-default (CUT); full Witness/Deacon split (NOT NEEDED -- P2 reconciler was sufficient).
 
-## Open Forks (need Chris's validation before `beads create`)
+## Open Forks (RESOLVED -- kept for historical record)
 
-1. **v1 scope** — ship the coordinator core (P0–P4) now, refinery+sandbox as v2? (recommended) — or fold v2 into one epic?
-2. **Parity sequencing** — Claude-first per subsystem then Pi port (P4, recommended, de-risks the design once) — or build both in lockstep per bead?
+1. **v1 scope** -- shipped coordinator core (P0-P4); Refinery also shipped as VB2 in v2.2; OS-sandbox cut.
+2. **Parity sequencing** -- Claude-first per subsystem then Pi port, as recommended.
 
 ## Execution Handoff
 

@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-06-24
+
+### Added - Mayor v2 / v2.1 / v2.2 (bounded-concurrent loop runner)
+
+All three workstreams were merged 2026-06-24. `--max-workers 1` (the default) preserves the original sequential single-stream loop, backward-compatible with all existing tests and runbooks.
+
+> Versioning note: "Mayor vX.Y" is the internal feature codename for the loop runner, distinct from this plugin's semver. The plugin manifest (`.claude-plugin/plugin.json`) is bumped 2.0.0 -> 2.2.0 to align the release version with that pervasive "v2.2" identity and the live deploy; there is no separate 2.1.0 plugin release. (`setup.py` versions the vendored `beads` package, not this plugin, so it stays at its own version.)
+
+**VA0a — Max-plan auth (v2.0)**
+- Dispatch subprocess env strips `ANTHROPIC_API_KEY` so `claude -p` workers authenticate via Max-plan OAuth, not the API key.
+
+**VA0b — Worktree-preserving code integration (v2.0)**
+- Workers commit on a named branch `mayor/<bead_id>` (not detached HEAD) so commits are reachable.
+- Verify command (`V`) runs with `cwd = worktree` so it sees the worker's committed changes.
+- On V exit 0: Mayor (single-writer main thread) takes the merge lock, merges `mayor/<bead_id>` into the working branch, closes the bead, then tears down the worktree.
+- On V != 0: worktree torn down without merge; code discarded; bead stays open for retry.
+
+**VA1 — Rate-limit backpressure (v2.0)**
+- `RATE_LIMITED` is classified distinctly from `FAILED`. A rate-limited bead is returned to the ready set; the governor pause-stops for a clean resume. No bead is ever burned by a provider rate-limit.
+
+**VB1 + VB2 — Refinery: batch-then-bisect (v2.2)**
+- Refinery replaces the VA0b serial merge with a single merge-slot covering a batch of V-passed branches.
+- `order_by_score` anti-starvation scoring ensures long-waiting or already-retried branches merge first.
+- Bisect isolates the conflicting branch in O(log K) verify calls; innocent branches in the same batch still land.
+- On textual or semantic conflict: bead is relabeled `conflict:re-implement`, returned to the ready set, and re-dispatched against the advanced HEAD. Bounded by `--refinery-attempts` (default 2); on cap exhaustion the bead is escalated (left open, never respawned infinitely).
+- `--batch-max 1` (the default) reproduces the VA0b serial path exactly.
+
+**VD1 + VD2 — Pi parity**
+- TypeScript twin at `src/loop-runner.ts` and `src/mayor-reconciler.ts` in `optivai-pi-plugin`.
+- Parity corpus (`scripts/hooks/tests/mayor_parity_corpus.json`) asserts byte-identical verdicts across Python and TypeScript implementations.
+
+### Architecture
+
+- **Single-writer invariant:** only the Mayor main thread writes bead status. Workers return `WorkerResult` structs and never call `beads_close` or `beads_update`.
+- **Verify-at-source close gate:** a bead closes only on V exit 0, never on a worker self-report.
+- **Isolation:** git-worktree isolation. There is NO OS-level sandbox -- that was explicitly cut as a product-context bleed (git-worktrees are the Gas-Town-faithful isolation).
+- **Reconciler (P2):** mechanical detector emits stuck-candidate events (never acts); a guard-ladder (terminal-state / stale-hook / spawning-window / TOCTOU) suppresses false positives; a cheap-tier AI judge decides kill/respawn/wait; fails safe to "wait" on any judge error.
+- **Tier routing:** `route_model()` is LIVE -- it inspects bead labels and title keywords and passes `--model opus/sonnet/haiku` to each worker dispatch. This is functional behavior, not ledger-only decoration.
+- **No conversational "Mayor" persona.** The Mayor is a CLI runner invoked as `cd <repo> && python3 scripts/loop_runner.py --molecule epic:<name> --max-workers N`. It does not auto-fire on a schedule (the launchd installer stays `--dry-run` until `--live`).
+- **No Foreman tier.** The Foreman (Gas Town mid-tier crew boss) was deliberately not ported -- scale mismatch and it would break the single-writer invariant.
+
+### New CLI flags (added to `_build_arg_parser`)
+
+`--max-workers`, `--stuck-threshold`, `--spawning-window`, `--max-respawns`, `--batch-max`, `--refinery-attempts`
+
+### New env vars
+
+`OPTIVAI_LOOP_MAX_WORKERS`, `OPTIVAI_LOOP_STUCK_THRESHOLD_S`, `OPTIVAI_LOOP_SPAWNING_WINDOW_S`, `OPTIVAI_LOOP_MAX_RESPAWNS`, `OPTIVAI_LOOP_BATCH_MAX`, `OPTIVAI_LOOP_REFINERY_ATTEMPTS_MAX`
+
+### New data structures (loop_runner.py)
+
+`WorkerHandle`, `WorkerResult`, `MayorSummary`, `MergeCandidate`, `RefineOutcome` — plus `reconciler.py` (`StuckCandidate`, `ReconcileAction`) as a standalone module.
+
+---
+
 ## [2.0.0] - 2026-04-18
 
 ### Changed — OptivAI Rebrand & Consolidation

@@ -481,6 +481,50 @@ When enabled, a PreToolUse hook **blocks** tool execution unless:
 
 ---
 
+## OptivAI Loop Runner (Mayor v2.2)
+
+The loop runner is a verification-gated molecule drain. It lives at `scripts/loop_runner.py` and `scripts/reconciler.py`. The deployed version (Mayor v2.2, merged 2026-06-24) is a multi-worker concurrent coordinator.
+
+### Key invariants
+
+- **Single-writer:** only the Mayor main thread writes bead status. Workers return `WorkerResult` structs and never call `beads_close` or `beads_update`.
+- **Verify-at-source close gate:** a bead closes only on V (verify command) exit 0, never on a worker self-report.
+- **Isolation:** git-worktree isolation only. There is no OS-level sandbox.
+- **No conversational Mayor persona.** It is a CLI runner.
+- **No Foreman tier.** Two tiers only: Mayor (coordinator) and workers (dispatched subagents).
+- **Tier routing is live:** `route_model()` picks opus/sonnet/haiku per bead and passes `--model` to the worker. This is functional, not decorative.
+
+### How to invoke
+
+```bash
+# Sequential (max-workers=1, the default -- identical to the original single-stream loop)
+cd <repo> && python3 scripts/loop_runner.py --molecule epic:<name> --verify-cmd "<V>" --dry-run
+
+# Multi-worker Mayor mode
+cd <repo> && python3 scripts/loop_runner.py --molecule epic:<name> --verify-cmd "<V>" --max-workers 3
+
+# The runner does NOT auto-fire on a schedule -- launchd installer stays --dry-run until --live
+```
+
+### Key CLI flags
+
+`--max-workers N` (1=sequential, N>1=Mayor), `--batch-max N` (Refinery batch size; 1=serial), `--refinery-attempts N`, `--stuck-threshold S`, `--spawning-window S`, `--max-respawns N`.
+
+All flags are overridable via `OPTIVAI_LOOP_*` env vars.
+
+### Design docs
+
+| Topic | File |
+|-------|------|
+| Mayor v1 orchestration (background / architecture) | `docs/plans/2026-06-21-mayor-orchestration.md` |
+| P0 capacity governor design | `docs/plans/2026-06-21-mayor-p0-capacity-governor.md` |
+| P2 reconciler design | `docs/plans/2026-06-21-mayor-p2-reconciler.md` |
+| Mayor v2 implementation plan | `docs/plans/2026-06-22-mayor-v2.md` |
+| VB1 Refinery design note | `docs/plans/2026-06-22-mayor-vb1-refinery.md` |
+| Dispatch contract (gate enforcement) | `docs/dispatch-contract.md` |
+
+---
+
 ## Reference Docs
 
 | Topic | File |

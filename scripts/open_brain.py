@@ -25,6 +25,7 @@ import re
 import sys
 import json
 import time
+import math
 import hashlib
 import argparse
 import logging
@@ -2523,6 +2524,12 @@ HEBBIAN_DECAY_EXPONENT = -0.7  # time-decay exponent: weight * (1+days_since)^(-
 HEBBIAN_MIN_RELEVANCE_FLOOR = 0.30  # cosine sim floor below which promotion gives no boost
 HEBBIAN_BOOST_COEFFICIENT = 0.1  # search-side multiplier for effective_weight (S13)
 
+# T3 (fblai-bfyjr): semantic dedup in search(). See
+# docs/plans/2026-07-02-recall-assembly-t1-design.md §3 for the full contract.
+DEDUP_COSINE = 0.92          # pairwise cosine >= this collapses r into survivor s
+DEDUP_OVERFETCH_FACTOR = 3   # SQL LIMIT multiplier when dedup=True (frees slots)
+DEDUP_OVERFETCH_CAP = 50     # hard ceiling on the over-fetched row count
+
 
 def promote_thought(
     conn,
@@ -3193,6 +3200,118 @@ def _extract_keywords(query: str, max_keywords: int = 5) -> List[str]:
     return keywords
 
 
+def _parse_pgvector_text(text_val: Optional[str]) -> Optional[List[float]]:
+    """Parse a pgvector ``::text`` cast (``"[f1,f2,...]"``) into a float list.
+
+    Fail-open (D2): returns ``None`` on ANY parse failure — missing/empty
+    input, malformed brackets, non-numeric tokens — rather than raising.
+    ``_semantic_dedup`` treats a row with no parseable embedding as a
+    permanent survivor that can never absorb or be absorbed (§3.4).
+    """
+    if not text_val or not isinstance(text_val, str):
+        return None
+    s = text_val.strip()
+    if len(s) < 2 or s[0] != "[" or s[-1] != "]":
+        return None
+    try:
+        return [float(x) for x in s[1:-1].split(",") if x.strip() != ""]
+    except (ValueError, TypeError):
+        return None
+
+
+def _cosine_similarity(a: Optional[List[float]], b: Optional[List[float]]) -> float:
+    """Pure cosine similarity over two equal-length float vectors.
+
+    Returns 0.0 (never raises) for empty/mismatched/zero-norm inputs —
+    dedup's fail-open contract (D2) depends on this never blowing up on a
+    malformed embedding.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _semantic_dedup(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pure semantic-dedup collapse pass (T1 design §3.4; T3 gate, fblai-bfyjr).
+
+    Walks ``results`` in their GIVEN rank order — NEVER re-sorts (D3) — and
+    collapses near-duplicate clusters (pairwise cosine >= ``DEDUP_COSINE``)
+    into their highest-ranked (first-in-rank) survivor (§3.5: rank order
+    already fuses relevance + Hebbian + supersede-penalty, so "first
+    encountered" IS "highest final HYBRID_SCORE" for a sorted input).
+
+    Fail-open (D2): a result with no parseable ``_EMBEDDING`` is always a
+    survivor and can never absorb another result (nothing to compare).
+
+    Pure: no I/O, no DB, no randomness. Does NOT truncate to any `limit`
+    (the caller truncates survivors[:limit] separately — T1 §3.1 pipeline
+    position). Mutates survivor dicts in place to attach the two new
+    annotation fields (matching the existing in-place style of the other
+    search() scoring passes); every id in the input is either returned
+    directly (survivor) or referenced via a survivor's NEAR_DUPLICATE_IDS
+    (D4: no id is ever dropped silently, no id is ever fabricated).
+
+    D6: ``_EMBEDDING`` is a transient scoring-input field only — it is
+    stripped from every survivor before this function returns (search()
+    additionally re-strips defensively, so it truly never egresses).
+    """
+    survivors: List[Dict[str, Any]] = []
+    for r in results:
+        r_embedding = r.get("_EMBEDDING")
+        if not r_embedding:
+            survivors.append(r)  # D2 fail-open: never absorbs, never absorbed
+            continue
+        absorbed = False
+        for s in survivors:
+            s_embedding = s.get("_EMBEDDING")
+            if not s_embedding:
+                continue
+            if _cosine_similarity(r_embedding, s_embedding) >= DEDUP_COSINE:
+                s.setdefault("NEAR_DUPLICATE_IDS", [])
+                s["NEAR_DUPLICATE_IDS"].append(r.get("THOUGHT_ID"))
+                s["NEAR_DUPLICATE_COUNT"] = s.get("NEAR_DUPLICATE_COUNT", 0) + 1
+                absorbed = True
+                break
+        if not absorbed:
+            survivors.append(r)
+    for _s in survivors:
+        _s.pop("_EMBEDDING", None)
+    return survivors
+
+
+def _dedup_composite_sort(results: List[Dict[str, Any]]) -> None:
+    """Deterministic composite ordering for dedup survivor selection (T1 §3.5;
+    fblai-bfyjr review fold I-1/M-1). In-place; dedup-ONLY (the dedup=False path
+    is byte-unchanged — D7). §3.5 selects a cluster's survivor as the highest
+    final HYBRID_SCORE, breaking ties by higher STV.c, then newer CREATED_AT,
+    then smallest THOUGHT_ID. `_semantic_dedup` keeps the FIRST-encountered atom,
+    so this makes "first" == "composite-best": without it, tied-HYBRID_SCORE
+    atoms retained arbitrary SQL/physical order (which survivor reinforced could
+    flip run-to-run, I-1), and under sort_by='time' the oldest — not the
+    top-scored — survived (M-1). Stable sorts applied least-significant-first
+    (Python's sort is stable) compose the full key. NOTE: this reorders the
+    dedup output to relevance order even under --sort time; dedup is a relevance
+    operation (the survivor is a cluster's most-relevant atom), so its output is
+    relevance-ranked by design.
+    """
+    def _cval(a: Dict[str, Any]) -> float:
+        stv = a.get("STV")
+        try:
+            return float(stv["c"]) if isinstance(stv, dict) else 0.0
+        except (TypeError, ValueError, KeyError):
+            return 0.0
+
+    results.sort(key=lambda a: str(a.get("THOUGHT_ID", "")))                       # id ASC
+    results.sort(key=lambda a: str(a.get("CREATED_AT", "")), reverse=True)          # created DESC
+    results.sort(key=_cval, reverse=True)                                           # STV.c DESC
+    results.sort(key=lambda a: float(a.get("HYBRID_SCORE", 0.0) or 0.0), reverse=True)  # score DESC
+
+
 def _annotate_provenance(
     conn,
     results: List[Dict[str, Any]],
@@ -3311,6 +3430,7 @@ def search(
     people: Optional[List[str]] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    dedup: bool = False,
 ) -> List[Dict[str, Any]]:
     """Hybrid search across user's thoughts using vector similarity, keyword boost, and time decay.
 
@@ -3321,6 +3441,14 @@ def search(
 
     Supports metadata filters: thought_type, topics (OR), people (OR), date_from, date_to.
     All new parameters are Optional with None defaults for backward compatibility.
+
+    dedup (T3, fblai-bfyjr, default False): when True, over-fetches
+    (min(limit*DEDUP_OVERFETCH_FACTOR, DEDUP_OVERFETCH_CAP)) and collapses
+    near-duplicate results (pairwise cosine >= DEDUP_COSINE) via
+    _semantic_dedup() AFTER all scoring passes and BEFORE the reinforcement
+    touch, then truncates survivors to `limit`. When False (default), the
+    SQL and returned rows are BYTE-IDENTICAL to pre-T3 behavior (D7) — no
+    embedding column is selected, no over-fetch, no new fields.
     """
     cur = conn.cursor()
 
@@ -3385,6 +3513,19 @@ def search(
 
     order_clause = "hybrid_score DESC" if sort_by != "time" else "created_at ASC"
 
+    # T3 (fblai-bfyjr, D7 byte-stability): dedup=True over-fetches (so the
+    # collapse pass has slack to free up) and additionally selects the
+    # embedding as text so _semantic_dedup() has vectors to compare.
+    # dedup=False produces the EXACT SAME SQL string as pre-T3 — no
+    # embedding column, no over-fetch — `embedding_select` is "" so the
+    # f-string below is byte-identical to before this change.
+    if dedup:
+        sql_limit = min(limit * DEDUP_OVERFETCH_FACTOR, DEDUP_OVERFETCH_CAP)
+        embedding_select = ",\n                embedding::text AS _embedding_text"
+    else:
+        sql_limit = limit
+        embedding_select = ""
+
     search_sql = f"""
         WITH scored AS (
             SELECT
@@ -3402,7 +3543,7 @@ def search(
                 stv_confidence,
                 1 - (embedding <=> %s::vector) AS vec_similarity,
                 {keyword_boost_expr} AS keyword_boost,
-                GREATEST(0, 1.0 - EXTRACT(EPOCH FROM (NOW() - GREATEST(created_at, COALESCE(updated_at, created_at)))) / (90 * 86400.0)) AS time_decay
+                GREATEST(0, 1.0 - EXTRACT(EPOCH FROM (NOW() - GREATEST(created_at, COALESCE(updated_at, created_at)))) / (90 * 86400.0)) AS time_decay{embedding_select}
             FROM {TABLE}
             WHERE {where_sql}
         )
@@ -3417,7 +3558,7 @@ def search(
     params: list = [str(query_embedding)]
     params.extend(keyword_params)
     params.extend(where_params)
-    params.append(limit)
+    params.append(sql_limit)
 
     cur.execute(search_sql, params)
     columns = [desc[0] for desc in cur.description]
@@ -3450,6 +3591,16 @@ def search(
             d["low_confidence"] = _stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
             # Remove intermediate columns not needed in output
             d.pop("vec_similarity", None)
+            # T3 (fblai-bfyjr): only present when dedup=True (embedding_select
+            # above). Parse into a transient _EMBEDDING key BEFORE the
+            # uppercase pass below — the leading-underscore-uppercase key is
+            # left untouched by .upper() so it survives the transform, and
+            # it is popped again before results leave search() (D6).
+            if dedup:
+                _emb_text = d.pop("_embedding_text", None)
+                _parsed_embedding = _parse_pgvector_text(_emb_text)
+                if _parsed_embedding is not None:
+                    d["_EMBEDDING"] = _parsed_embedding
             # Normalize to uppercase keys for compatibility with formatters/Pi bridge
             d = {k.upper(): v for k, v in d.items()}
             results.append(d)
@@ -3516,6 +3667,24 @@ def search(
     # (HIGH-4 review fix).
     _annotate_provenance(conn, results, user_id, sort_by)
 
+    # ── T3 semantic dedup (fblai-bfyjr) ───────────────────────────────────────
+    # Runs AFTER all scoring passes (Hebbian boost + supersede penalty) so
+    # survivor selection sees the FINAL HYBRID_SCORE, and BEFORE the
+    # reinforcement touch below so collapsed atoms do NOT get their
+    # updated_at reset (D9 — only surfaced survivors reinforce). Truncation
+    # to `limit` happens here too, so the reinforcement touch and the
+    # replay-log result_count both see only the final returned set.
+    _dedup_collapsed = 0
+    if dedup:
+        # I-1/M-1: deterministic composite order so the first-encountered survivor
+        # in _semantic_dedup is the §3.5 composite-best (dedup-only; D7 preserved).
+        _dedup_composite_sort(results)
+        results = _semantic_dedup(results)
+        for _r in results:
+            _r.pop("_EMBEDDING", None)  # D6: never egresses from search()
+        results = results[:limit]
+        _dedup_collapsed = sum(r.get("NEAR_DUPLICATE_COUNT", 0) for r in results)
+
     # ── Memory reinforcement: touch updated_at on accessed thoughts ──
     # This resets the time_decay clock, making frequently-accessed memories
     # stay "fresh" longer. The more you recall a memory, the more it persists.
@@ -3564,6 +3733,8 @@ def search(
             "threshold": threshold,
             "sort_by": sort_by,
             "has_filters": any([thought_type, topics, people, date_from, date_to]),
+            "dedup": dedup,
+            "dedup_collapsed": _dedup_collapsed,
         },
     )
 
@@ -5231,10 +5402,21 @@ def _format_search_results(results: List[Dict], sort_by: str = "similarity") -> 
         if sort_by == "time":
             date = r.get("CREATED_AT", "")[:19]
             lines.append(f"{i}. [{date}] {summary}")
-            lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  hybrid={hybrid:.0%}  vec={sim:.0%}")
+            detail_line = f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  hybrid={hybrid:.0%}  vec={sim:.0%}"
         else:
             lines.append(f"{i}. [{hybrid:.0%} hybrid] {summary}")
-            lines.append(f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  vec={sim:.0%}  |  {r.get('CREATED_AT', '')[:19]}")
+            detail_line = f"   Type: {r.get('THOUGHT_TYPE', '?')}  |  vec={sim:.0%}  |  {r.get('CREATED_AT', '')[:19]}"
+        # T3 (fblai-bfyjr): near-duplicate annotation on the survivor's
+        # detail line (absent when NEAR_DUPLICATE_COUNT is absent/0 — i.e.
+        # always absent when dedup wasn't requested; D7-preserving).
+        near_dup_count = r.get("NEAR_DUPLICATE_COUNT", 0)
+        if near_dup_count:
+            near_dup_ids = r.get("NEAR_DUPLICATE_IDS") or []
+            # 8-char short-id, mirroring auto_recall_hook.py's SHORT_ID_CHARS
+            # (display-only; NEAR_DUPLICATE_IDS itself always carries full ids).
+            short_ids = ", ".join(str(x)[-8:] for x in near_dup_ids)
+            detail_line += f" (+{near_dup_count} similar: {short_ids})"
+        lines.append(detail_line)
         # NAL stv surfacing (T2.6 / fblai-eovhe)
         stv = r.get("STV") or r.get("stv")
         if stv:
@@ -5571,6 +5753,7 @@ def _run_from_pi():
                 people=args.get("people"),
                 date_from=args.get("date_from"),
                 date_to=args.get("date_to"),
+                dedup=args.get("dedup", False),
             )
             print(json.dumps(results, default=str))
         elif op == "graph_search":
@@ -5704,6 +5887,33 @@ def _run_from_pi():
                 result = time_travel.inspect_latest(
                     conn, args.get("thought_id", ""), user_id,
                 )
+                if result is None:
+                    # T3 (fblai-bfyjr) §4.3 R1 CCR-reversibility fallback,
+                    # mirrored from the CLI --inspect path (main(),
+                    # ~open_brain.py:6684-6698): the common case (captured,
+                    # never snapshotted) has no thought_versions row. Fall
+                    # back to the live brain.thoughts row via
+                    # time_travel.inspect_live(), which reuses
+                    # _assert_in_scope (time_travel.py:93) - the IDENTICAL
+                    # WHERE thought_id=%s AND user_id=%s principal wall
+                    # used by every other inspect_* entry point. No new
+                    # scoping logic is introduced here. A wrong-principal
+                    # call raises RuntimeError (NOT swallowed here) - same
+                    # as the pre-existing inspect_latest() call two lines
+                    # above, this op=="inspect" branch has no local
+                    # try/except, so the RuntimeError propagates uncaught
+                    # out of _run_from_pi() (the outer try at the top of
+                    # this function only has a `finally: conn.close()`,
+                    # no `except`). That is a hard failure (non-zero exit,
+                    # traceback on stderr), never a swallowed exception and
+                    # never a printed JSON payload containing another
+                    # user's thought - a cross-principal op:inspect call
+                    # errors out, it never leaks. --at / --at-revision are
+                    # UNCHANGED: this fallback applies ONLY to the
+                    # no-qualifier path.
+                    result = time_travel.inspect_live(
+                        conn, args.get("thought_id", ""), user_id,
+                    )
             if result is None:
                 print(json.dumps({"thought_id": args.get("thought_id", ""), "result": None}))
             else:
@@ -6055,6 +6265,11 @@ def main():
 
     parser.add_argument("--sort", type=str, choices=["similarity", "time"], default="similarity",
                         help="Sort search results: similarity (default) or time (oldest first)")
+    parser.add_argument("--dedup", action=argparse.BooleanOptionalAction, default=False,
+                        help="Semantic dedup on --search results: collapses near-duplicate "
+                             "atoms (pairwise cosine >= DEDUP_COSINE) into their "
+                             "highest-ranked survivor. --no-dedup is the (default) "
+                             "byte-stable pre-T3 behavior.")
     parser.add_argument("--days", type=int, default=DEFAULT_RECENT_DAYS)
     parser.add_argument("--limit", type=int, default=DEFAULT_RECENT_LIMIT)
     parser.add_argument("--type", type=str, dest="thought_type",
@@ -6209,7 +6424,7 @@ def main():
         elif args.search:
             results = search(
                 conn, query=args.search, user_id=user_id, limit=args.limit,
-                sort_by=args.sort,
+                sort_by=args.sort, dedup=args.dedup,
             )
             if args.json:
                 print(json.dumps(results, default=str))
@@ -6493,6 +6708,21 @@ def main():
                         thought_id=args.inspect,
                         user_id=user_id,
                     )
+                    if result is None:
+                        # T3 (fblai-bfyjr) §4.3 R1 CCR-reversibility fallback:
+                        # the common case (captured, never snapshotted) has no
+                        # thought_versions row. Fall back to the live
+                        # brain.thoughts row — SAME try/except as above, so a
+                        # wrong-principal RuntimeError from inspect_live's
+                        # _assert_in_scope call is handled identically (not
+                        # swallowed) by the existing handler below. --at /
+                        # --at-revision are UNCHANGED: this fallback applies
+                        # ONLY to the no-qualifier path.
+                        result = time_travel.inspect_live(
+                            conn,
+                            thought_id=args.inspect,
+                            user_id=user_id,
+                        )
             except RuntimeError as e:
                 if args.json:
                     print(json.dumps({"error": str(e)}))
@@ -6519,6 +6749,7 @@ def main():
                     text_preview = (result.raw_text or "")[:200]
                     print(
                         f"● {result.thought_id} revision={result.revision} "
+                        f"source={result.source} "
                         f"({result.prov_activity}, {result.created_at})"
                     )
                     print(f"  text: {text_preview}")
