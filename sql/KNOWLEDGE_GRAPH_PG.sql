@@ -24,7 +24,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE SCHEMA IF NOT EXISTS brain;
 
-SET search_path TO brain;
+-- Include public so the pgvector `vector` type resolves (see BRAIN_SCHEMA_PG.sql).
+SET search_path TO brain, public;
 
 -- =============================================================================
 -- KNOWLEDGE_GRAPH_NODES

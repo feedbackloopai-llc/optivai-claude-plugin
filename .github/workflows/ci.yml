@@ -54,7 +54,7 @@ jobs:
 
       - name: Install Python dependencies
         working-directory: scripts
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
 
       - name: Run pure-logic unit tests (explicit file list, 0-skip gate)
         working-directory: scripts
@@ -164,7 +164,7 @@ jobs:
 
       - name: Install Python dependencies
         working-directory: scripts
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
 
       - name: Bootstrap brain schema (BRAIN_SCHEMA_PG.sql)
         working-directory: scripts

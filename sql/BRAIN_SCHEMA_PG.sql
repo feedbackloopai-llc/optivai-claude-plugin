@@ -5,7 +5,11 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE SCHEMA IF NOT EXISTS brain;
 
-SET search_path TO brain;
+-- Include public so the pgvector `vector` type (installed in public by
+-- CREATE EXTENSION above) resolves when creating vector-typed columns below.
+-- Tables are still created in `brain` (first on the path). Without public,
+-- a fresh DB fails with `type "vector" does not exist` (CI pgvector container).
+SET search_path TO brain, public;
 
 CREATE TABLE IF NOT EXISTS thoughts (
     thought_id      VARCHAR(64)       NOT NULL PRIMARY KEY,
