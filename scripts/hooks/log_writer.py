@@ -191,8 +191,9 @@ class AgentActivityLogger:
                     for line in f:
                         if self.session_id in line:
                             return  # Already logged
-            except:
-                pass
+            except Exception as e:
+                self._log_error(f"Failed to read sessions.jsonl: {e}")
+                return  # Don't risk appending a duplicate if we couldn't verify
 
         metadata = {
             "session_id": self.session_id,
@@ -222,7 +223,7 @@ class AgentActivityLogger:
             with open(error_file, 'a', encoding='utf-8') as f:
                 timestamp = datetime.now(timezone.utc).isoformat()
                 f.write(f"{timestamp} ERROR: {error_msg}\n")
-        except:
+        except Exception:
             pass
 
     def log_activity(self, activity_data: Dict[str, Any]):
