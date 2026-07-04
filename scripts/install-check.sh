@@ -309,8 +309,8 @@ run_pull_live() {
         [ "$repo_sha" = "$live_sha" ] && continue
 
         local repo_mtime live_mtime
-        repo_mtime=$(stat -f "%m" "$repo_abs" 2>/dev/null || stat -c "%Y" "$repo_abs" 2>/dev/null)
-        live_mtime=$(stat -f "%m" "$live_abs" 2>/dev/null || stat -c "%Y" "$live_abs" 2>/dev/null)
+        repo_mtime=$(_mtime "$repo_abs")
+        live_mtime=$(_mtime "$live_abs")
         [ "$live_mtime" -le "$repo_mtime" ] && continue
 
         # Live is newer and content differs — copy into repo
