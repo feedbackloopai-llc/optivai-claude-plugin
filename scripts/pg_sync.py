@@ -351,23 +351,6 @@ class PostgresWriter:
             logger.info("Disconnected from PostgreSQL")
 
 
-def _get_database_url() -> str:
-    """Get PostgreSQL connection string from env or config."""
-    url = os.environ.get("DATABASE_URL")
-    if url:
-        return url
-    config_path = Path.home() / ".claude" / "hooks" / "auto-logger-config.json"
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        pg = config.get("destinations", {}).get("postgresql", {})
-        if pg.get("connection_string"):
-            return pg["connection_string"]
-    raise RuntimeError(
-        "No DATABASE_URL env var and no postgresql.connection_string in auto-logger-config.json"
-    )
-
-
 class SyncService:
     """Main orchestrator for multi-project log sync"""
 
@@ -409,6 +392,10 @@ class SyncService:
         pg_config = self.config.get("destinations", {}).get("postgresql", {})
         if not pg_config.get("enabled", False):
             logger.info("PostgreSQL sync is disabled in configuration")
+            return 0
+
+        if self.writer is None:
+            logger.error("postgresql enabled but no connection string resolvable")
             return 0
 
         projects = self.scanner.find_projects_with_logs()
