@@ -149,6 +149,19 @@ FILE_MAP=(
 # ---------------------------------------------------------------------------
 _sha256() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
 
+# Portable mtime in epoch seconds. GNU coreutils uses `stat -c %Y`; BSD/macOS
+# uses `stat -f %m`. Detect once. The old inline `stat -f %m || stat -c %Y`
+# chain was broken on Linux: there `-f` means --file-system, so stat printed the
+# filesystem block for the valid file to stdout AND exited non-zero, the `||`
+# then appended the fallback integer, and $() captured multi-line garbage. The
+# numeric compare failed and every differing file fell through to REPO-NEWER —
+# silently disabling LIVE-NEWER detection on Linux (CI).
+if stat -c "%Y" . >/dev/null 2>&1; then
+    _mtime() { stat -c "%Y" "$1"; }   # GNU / Linux
+else
+    _mtime() { stat -f "%m" "$1"; }   # BSD / macOS
+fi
+
 # ANSI colors (disabled when not a tty to avoid junk in CI logs)
 if [ -t 1 ]; then
     C_RED="\033[0;31m"
@@ -210,8 +223,8 @@ run_check() {
                 ok_count=$((ok_count + 1))
             else
                 local repo_mtime live_mtime
-                repo_mtime=$(stat -f "%m" "$repo_abs" 2>/dev/null || stat -c "%Y" "$repo_abs" 2>/dev/null)
-                live_mtime=$(stat -f "%m" "$live_abs" 2>/dev/null || stat -c "%Y" "$live_abs" 2>/dev/null)
+                repo_mtime=$(_mtime "$repo_abs")
+                live_mtime=$(_mtime "$live_abs")
                 if [ "$live_mtime" -gt "$repo_mtime" ]; then
                     status="LIVE-NEWER"
                     live_newer_count=$((live_newer_count + 1))
