@@ -29,8 +29,10 @@ from types import SimpleNamespace
 
 import pytest
 
-# Add scripts dir to path so we can import log_writer (the scripts/ copy).
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Import log_writer from its canonical home, scripts/hooks/ — the copy the runtime
+# hooks (pre-tool-use.py / user-prompt-submit.py) import and that install.sh /
+# upgrade.sh deploy to ~/.claude/hooks/. There is no separate scripts/log_writer.py.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
 import log_writer  # noqa: E402
 
 
