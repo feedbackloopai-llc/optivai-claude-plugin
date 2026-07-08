@@ -836,6 +836,16 @@ LINK_TYPES = {
 #
 NAL_CONFIDENCE_MAP = {"high": 0.9, "medium": 0.7, "low": 0.5}
 NAL_LOW_CONFIDENCE_THRESHOLD = 0.35
+# Veracity layer (V1): an atom captured from text carrying persuasion-bombing tells
+# (detector score >= this) enters memory with a DISCOUNTED confidence, so a pushback-
+# produced assessment lands as low-veracity, not high rhetorical certainty.
+CONDITION_DISCOUNT_THRESHOLD = 0.5
+CONDITION_DISCOUNT_MAX = 0.6  # max fraction of evidential weight removed (at score 1.0)
+# C_MAX ceiling: the weight-discount alone is insufficient against a confident
+# self-stamp (high c = high weight), so a strongly-conditioned atom is also capped -
+# ceiling falls with the condition. (Fable's finding.) At score 0.5 -> 0.675; 1.0 -> 0.50.
+CONDITION_CEILING_BASE = 0.85
+CONDITION_CEILING_SLOPE = 0.35
 
 
 def nal_revise(
@@ -963,6 +973,40 @@ def _stv_from_confidence(confidence_label: Optional[str]) -> tuple:
     """Map a metadata confidence label ('high'/'medium'/'low'/None) to (f, c)."""
     c = NAL_CONFIDENCE_MAP.get(confidence_label or "", 0.5)
     return (1.0, c)
+
+
+def _persuasion_condition_score(text: str) -> float:
+    """The persuasion-bombing condition-score of the text being captured (0..1).
+
+    Uses the L0 detector (persuasion_detector.py). Fail-open: if the detector is
+    not importable (e.g. a bridge deployment without it), returns 0.0 so capture is
+    unchanged - a missing detector must never discount a legitimate atom.
+    """
+    try:
+        import persuasion_detector
+
+        return float(persuasion_detector.score_turn(text or "").get("score", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _discount_confidence(c: float, condition: float) -> float:
+    """Scale a confidence's evidential weight down by the condition-score.
+
+    w = c/(1-c); w' = w * (1 - min(CONDITION_DISCOUNT_MAX, condition)); c' = w'/(w'+1).
+    Working in evidential-weight space means the discount COMPOSES with nal_revise
+    (scaling w by r scales the atom's influence in every future fusion by r) - so a
+    conditioned atom stays quiet in the memory, not just at write time. Only ever
+    LOWERS confidence.
+    """
+    c = max(0.01, min(0.99, float(c)))
+    cond = min(1.0, max(0.0, float(condition)))
+    r = 1.0 - min(CONDITION_DISCOUNT_MAX, cond)
+    w = (c / (1.0 - c)) * r
+    discounted = w / (w + 1.0)
+    # C_MAX ceiling - a confident self-stamp cannot exempt a strongly-conditioned atom.
+    ceiling = CONDITION_CEILING_BASE - cond * CONDITION_CEILING_SLOPE
+    return max(0.0, min(0.9999, min(discounted, ceiling)))
 
 
 # Standalone DDL for the connected-provenance-graph table. Kept here as a
@@ -3012,6 +3056,19 @@ def capture(
             confidence_label = metadata.get("confidence")
             _, final_stv_c = _stv_from_confidence(confidence_label)
             final_stv_f = 1.0  # default: positive evidence
+
+        # Step 3a-bis (Veracity layer V1): if the captured TEXT carries persuasion-
+        # bombing tells, DISCOUNT its confidence so a pushback-produced assessment
+        # enters memory at low veracity. Applies even to an explicit --stv-c (a
+        # confident self-stamp cannot exempt a suspect assessment); only ever LOWERS.
+        _condition = _persuasion_condition_score(text)
+        if _condition >= CONDITION_DISCOUNT_THRESHOLD:
+            _discounted = _discount_confidence(final_stv_c, _condition)
+            if _discounted < final_stv_c:
+                final_stv_c = _discounted
+                if isinstance(metadata, dict):
+                    metadata["condition_score"] = round(_condition, 3)
+                    metadata["condition_discounted"] = True
 
         # Step 3b: INSERT with PROV-DM fields + stv columns.
         # source_uri stays NULL for internal captures (deferred to a later bead
