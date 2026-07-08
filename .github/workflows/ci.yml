@@ -67,6 +67,7 @@ jobs:
           # We pass -x (stop on first failure) and -v for readability in CI.
           pytest \
             tests/test_nal_stv.py::TestNalRevise \
+            tests/test_nal_independence.py \
             tests/test_capture_redaction.py \
             tests/test_redact_ipv6.py \
             tests/test_db_url_resolution.py \
