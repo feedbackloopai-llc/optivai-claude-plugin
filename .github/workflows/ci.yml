@@ -69,6 +69,7 @@ jobs:
             tests/test_nal_stv.py::TestNalRevise \
             tests/test_nal_independence.py \
             tests/test_persuasion_detector.py \
+            tests/test_veracity_capture_discount.py \
             tests/test_capture_redaction.py \
             tests/test_redact_ipv6.py \
             tests/test_db_url_resolution.py \
