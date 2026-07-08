@@ -76,6 +76,7 @@ jobs:
             tests/test_embed_server.py \
             tests/test_bridge_auth.py \
             tests/test_log_writer_email.py \
+            tests/test_refute.py \
             tests/test_session_summary_email.py \
             "tests/test_vfe_residue.py::TestParaphraseDegradedHonesty" \
             tests/test_install_check.py \
