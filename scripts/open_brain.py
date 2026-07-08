@@ -1009,6 +1009,22 @@ def _discount_confidence(c: float, condition: float) -> float:
     return max(0.0, min(0.9999, min(discounted, ceiling)))
 
 
+def _is_condition_discounted(metadata_val) -> bool:
+    """True if an atom's metadata records a V1 persuasion-bombing condition discount.
+
+    Accepts a dict or a JSON string (SELECT * may return JSONB either way).
+    Used at recall to surface the veracity label so downstream reasoning and the
+    human see when a cited assessment was produced under a suspect condition.
+    """
+    m = metadata_val
+    if isinstance(m, str):
+        try:
+            m = json.loads(m)
+        except Exception:
+            return False
+    return bool(isinstance(m, dict) and m.get("condition_discounted"))
+
+
 # Standalone DDL for the connected-provenance-graph table. Kept here as a
 # fallback so a fresh install without the sql/ tree (or with a stale tree)
 # can still get the table created at --init time. The same DDL also lives
@@ -3716,6 +3732,9 @@ def search(
             _stv_c = float(_raw_stv_c if _raw_stv_c is not None else 0.5)
             d["stv"] = {"f": round(_stv_f, 4), "c": round(_stv_c, 4)}
             d["low_confidence"] = _stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
+            # Veracity recall label (V1): flag atoms discounted for a persuasion-
+            # bombing production condition so downstream reasoning sees it.
+            d["condition_discounted"] = _is_condition_discounted(d.get("metadata"))
             # Remove intermediate columns not needed in output
             d.pop("vec_similarity", None)
             # T3 (fblai-bfyjr): only present when dedup=True (embedding_select
@@ -4139,6 +4158,7 @@ def graph_search(
                 _g_stv_c = float(_raw_g_stv_c if _raw_g_stv_c is not None else 0.5)
                 d["stv"] = {"f": round(_g_stv_f, 4), "c": round(_g_stv_c, 4)}
                 d["low_confidence"] = _g_stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
+                d["condition_discounted"] = _is_condition_discounted(d.get("metadata"))
 
                 d = {k.upper(): v for k, v in d.items()}
                 graph_results.append(d)
@@ -5573,6 +5593,8 @@ def _format_search_results(results: List[Dict], sort_by: str = "similarity") -> 
             low_conf = r.get("LOW_CONFIDENCE") or r.get("low_confidence")
             if low_conf:
                 stv_tag += " [LOW-CONFIDENCE]"
+            if r.get("CONDITION_DISCOUNTED") or r.get("condition_discounted"):
+                stv_tag += " [LOW-VERACITY: produced under pushback]"
             lines.append(f"   {stv_tag}")
         topics = r.get("TOPICS", [])
         if topics:
