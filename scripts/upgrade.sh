@@ -104,6 +104,8 @@ if [ -d "$REPO_HOOKS_DIR" ] && [ -d "$HOOKS_DIR" ]; then
     cp "$REPO_HOOKS_DIR/redact_secrets.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/subagent_context.py" "$HOOKS_DIR/"
     cp "$REPO_HOOKS_DIR/context_primer.py" "$HOOKS_DIR/"
+    cp "$REPO_HOOKS_DIR/persuasion_detector_hook.py" "$HOOKS_DIR/"   # Stop hook: persuasion-bombing detector (warn mode)
+    cp "$REPO_DIR/scripts/persuasion_detector.py" "$HOOKS_DIR/"      # the L0 scorer the hook imports
     cp "$REPO_DIR/scripts/pg_sync.py" "$HOOKS_DIR/"   # pg_sync.py lives in scripts/, not scripts/hooks/
     cp "$REPO_HOOKS_DIR/stop-hook.sh" "$HOOKS_DIR/"
     chmod +x "$HOOKS_DIR/stop-hook.sh"
@@ -134,6 +136,24 @@ if [ -f "$SETTINGS_FILE" ]; then
         print_status "Fixed hook filenames in settings.json (underscore -> hyphen)"
     else
         print_status "settings.json hook paths already correct"
+    fi
+
+    # Register the persuasion-bombing detector Stop hook (idempotent, warn mode).
+    if python3 - "$SETTINGS_FILE" <<'PYWIRE' 2>/dev/null
+import json, sys
+p = sys.argv[1]
+s = json.load(open(p))
+stop = s.setdefault("hooks", {}).setdefault("Stop", [])
+if not stop:
+    stop.append({"matcher": "", "hooks": []})
+hooks = stop[0].setdefault("hooks", [])
+cmd = "python3 ~/.claude/hooks/persuasion_detector_hook.py"
+if not any(h.get("command") == cmd for h in hooks):
+    hooks.append({"type": "command", "command": cmd})
+    json.dump(s, open(p, "w"), indent=2)
+PYWIRE
+    then
+        print_status "persuasion-detector Stop hook registered (warn mode)"
     fi
 else
     print_warning "No settings.json found - run full install.sh to create"
