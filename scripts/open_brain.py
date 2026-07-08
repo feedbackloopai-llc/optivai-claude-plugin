@@ -889,6 +889,76 @@ def nal_revise(
     return (f, c)
 
 
+def nal_revise_dependent(f1: float, c1: float, f2: float, c2: float) -> tuple:
+    """Revision of NON-independent observations - the evidence-independence guard.
+
+    ``nal_revise`` pools evidential WEIGHT, so confidence rises with each fold.
+    That is correct ONLY for DISJOINT evidence (Wang 1995 §5.1). When two atoms
+    are the SAME evidence restated (same capture episode, or a direct derivation),
+    pooling them MANUFACTURES confidence from repetition - which is the
+    persuasion-bombing signature (a double-down is a restatement). For dependent
+    atoms we therefore do NOT accumulate: the result is the more-confident belief
+    UNCHANGED, so N restatements can never raise confidence above one observation.
+    """
+    f1 = max(0.0, min(1.0, float(f1)))
+    c1 = max(0.0, min(0.9999, float(c1)))
+    f2 = max(0.0, min(1.0, float(f2)))
+    c2 = max(0.0, min(0.9999, float(c2)))
+    return (f1, c1) if c1 >= c2 else (f2, c2)
+
+
+def _dependency_from_signals(
+    session_a: Optional[str], session_b: Optional[str], directly_derived: bool
+) -> bool:
+    """Pure decision: are two atoms DEPENDENT evidence (NOT independent)?
+
+    Dependent (revision must NOT accumulate confidence) if EITHER:
+      * one is a direct derivation parent/child of the other (shared ancestry), or
+      * both were captured in the SAME session (the challenge-episode proxy - the
+        persuasion-bombing case is doubling-down within one session).
+
+    Conservative by design: same-session may over-collapse two genuinely
+    independent same-session corroborations to one observation. That deliberate
+    trade favors "never manufacture confidence from repetition" over "capture
+    every independent-corroboration gain" - the safe direction for this failure
+    mode. Transitive derives_from ancestry across sessions is a documented
+    follow-up; session + direct-parent catch the live attack.
+    """
+    if directly_derived:
+        return True
+    if session_a and session_b and session_a == session_b:
+        return True
+    return False
+
+
+def _atoms_dependent(conn, id_a: str, id_b: str, user_id: str) -> bool:
+    """DB-backed dependency check (same ``session_id`` or a direct
+    ``was_derived_from`` parent/child). Fail-safe: on ANY error, returns True
+    (treat as dependent -> do NOT accumulate) so a provenance-lookup failure can
+    never manufacture confidence."""
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT thought_id, session_id, was_derived_from "
+                "FROM brain.thoughts WHERE thought_id = ANY(%s) AND user_id = %s",
+                ([id_a, id_b], user_id),
+            )
+            rows = {r[0]: r for r in cur.fetchall()}
+        finally:
+            cur.close()
+    except Exception:
+        return True  # fail-safe: unknown provenance -> dependent (no accumulation)
+    ra = rows.get(id_a)
+    rb = rows.get(id_b)
+    sa = ra[1] if ra else None
+    sb = rb[1] if rb else None
+    wa = ra[2] if ra else None
+    wb = rb[2] if rb else None
+    directly = (wa is not None and wa == id_b) or (wb is not None and wb == id_a)
+    return _dependency_from_signals(sa, sb, directly)
+
+
 def _stv_from_confidence(confidence_label: Optional[str]) -> tuple:
     """Map a metadata confidence label ('high'/'medium'/'low'/None) to (f, c)."""
     c = NAL_CONFIDENCE_MAP.get(confidence_label or "", 0.5)
@@ -4572,7 +4642,18 @@ def add_link(
                 _snap_version_id = _snap_result["version_id"]
 
                 # Revise target stv with the attenuated evidence.
-                new_f, new_c = nal_revise(_tgt_f, _tgt_c, _ev_f, _ev_c)
+                # Evidence-independence guard: a `verifies` source that shares a
+                # derivation root with the target (same session, or a direct
+                # parent/child) is the SAME evidence restated, not independent
+                # corroboration - pooling it would manufacture confidence from
+                # repetition (the persuasion-bombing signature). Accumulate only
+                # for an INDEPENDENT `verifies`; `refutes` still lowers belief.
+                if link_type == "verifies" and _atoms_dependent(
+                    conn, source_id, target_id, user_id
+                ):
+                    new_f, new_c = nal_revise_dependent(_tgt_f, _tgt_c, _ev_f, _ev_c)
+                else:
+                    new_f, new_c = nal_revise(_tgt_f, _tgt_c, _ev_f, _ev_c)
 
                 _upd_cur = conn.cursor()
                 try:
@@ -4761,7 +4842,8 @@ def revise_thoughts(
     try:
         # PS scoping: both premises must belong to the caller's user_id.
         cur.execute(
-            "SELECT thought_id, stv_frequency, stv_confidence, raw_text "
+            "SELECT thought_id, stv_frequency, stv_confidence, raw_text, "
+            "session_id, was_derived_from "
             "FROM brain.thoughts "
             "WHERE thought_id = ANY(%s) AND user_id = %s",
             ([id_a, id_b], user_id),
@@ -4788,8 +4870,18 @@ def revise_thoughts(
     f_b = float(row_b[1] if row_b[1] is not None else 1.0)
     c_b = float(row_b[2] if row_b[2] is not None else 0.5)
 
-    # Revised stv
-    rev_f, rev_c = nal_revise(f_a, c_a, f_b, c_b)
+    # Revised stv - with the evidence-independence guard: if the two premises are
+    # the same evidence restated (same session, or one directly derives from the
+    # other), do NOT accumulate confidence (repetition must not manufacture it).
+    _rev_dependent = _dependency_from_signals(
+        row_a[4] if len(row_a) > 4 else None,
+        row_b[4] if len(row_b) > 4 else None,
+        (len(row_a) > 5 and row_a[5] == id_b) or (len(row_b) > 5 and row_b[5] == id_a),
+    )
+    if _rev_dependent:
+        rev_f, rev_c = nal_revise_dependent(f_a, c_a, f_b, c_b)
+    else:
+        rev_f, rev_c = nal_revise(f_a, c_a, f_b, c_b)
 
     # Choose text: explicit override, else the higher-confidence premise's text.
     if text is not None:
