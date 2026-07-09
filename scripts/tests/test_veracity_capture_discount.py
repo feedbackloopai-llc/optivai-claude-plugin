@@ -66,6 +66,23 @@ def test_condition_score_clean_grounded_text_low():
     assert ob._persuasion_condition_score(clean) < ob.CONDITION_DISCOUNT_THRESHOLD
 
 
+def test_resolve_turn_condition_explicit_wins_and_clamps():
+    assert ob._resolve_turn_condition(0.9, "sess-1") == 0.9
+    assert ob._resolve_turn_condition(1.5, "sess-1") == 1.0
+    assert ob._resolve_turn_condition(-0.2, "sess-1") == 0.0
+
+
+def test_turn_condition_discounts_clean_text():
+    """The whole point of threading: a clean-reading summary captured during a
+    persuasion-bombing TURN still gets discounted."""
+    clean = "The figure is forty percent, checked against page 5 of the deck."
+    text_cond = ob._persuasion_condition_score(clean)
+    effective = max(text_cond, ob._resolve_turn_condition(0.9, "sess-1"))
+    assert text_cond < ob.CONDITION_DISCOUNT_THRESHOLD  # text alone would NOT discount
+    assert effective >= ob.CONDITION_DISCOUNT_THRESHOLD  # the turn-condition does
+    assert ob._discount_confidence(0.9, effective) < 0.9
+
+
 def test_end_to_end_bomb_text_would_be_discounted_below_clean():
     """A persuasion-bomb assessment captured at nominal high confidence lands below
     a clean assessment captured at the same nominal confidence."""

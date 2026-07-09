@@ -13,7 +13,10 @@ Adapted from optivai-builder's persuasion-bombing-detector.ts (read-only inspira
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
 from typing import Dict, List, Optional
 
 # The clause<->signal bijection: every signal scores exactly one contract clause,
@@ -217,3 +220,43 @@ def flag_line(result: dict) -> Optional[str]:
         f"[persuasion-check] {extra}score {result['score']:.2f} - top tell: "
         f"{top['signal']} (violates: {top['clause']}). Re-examine, do not defend."
     )
+
+
+# ── Turn-condition state bridge ───────────────────────────────────────────────
+# The Stop hook scores the just-finished assistant TURN and records it here; the
+# brain's V1 discount reads it so a persuasion-bombing turn discounts same-session
+# captures even when the captured TEXT reads clean. Decoupled producer/consumer;
+# both sides fail-open so this can never disrupt a turn or a capture.
+TURN_CONDITION_STATE = os.environ.get(
+    "OPTIVAI_TURN_CONDITION_STATE", os.path.expanduser("~/.claude/last-turn-condition.json")
+)
+TURN_CONDITION_TTL_SECONDS = 1800  # 30 min - ignore a staler recorded condition
+
+
+def write_turn_condition(session_id: Optional[str], score: float, path: Optional[str] = None) -> None:
+    """Persist the current turn's condition-score (Stop-hook producer). Fail-open."""
+    try:
+        with open(path or TURN_CONDITION_STATE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"session_id": session_id or "", "score": float(score), "ts": time.time()}, f
+            )
+    except Exception:
+        pass
+
+
+def read_turn_condition(
+    session_id: Optional[str], path: Optional[str] = None, ttl: float = TURN_CONDITION_TTL_SECONDS
+) -> float:
+    """Recent same-session turn condition-score, else 0.0. A recorded condition from
+    a DIFFERENT session, or older than ``ttl``, is ignored. Fail-open (0.0)."""
+    try:
+        with open(path or TURN_CONDITION_STATE, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        recorded_session = st.get("session_id") or ""
+        if session_id and recorded_session and recorded_session != session_id:
+            return 0.0
+        if time.time() - float(st.get("ts", 0)) > ttl:
+            return 0.0
+        return max(0.0, min(1.0, float(st.get("score", 0.0))))
+    except Exception:
+        return 0.0

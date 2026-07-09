@@ -931,8 +931,9 @@ def _dependency_from_signals(
     independent same-session corroborations to one observation. That deliberate
     trade favors "never manufacture confidence from repetition" over "capture
     every independent-corroboration gain" - the safe direction for this failure
-    mode. Transitive derives_from ancestry across sessions is a documented
-    follow-up; session + direct-parent catch the live attack.
+    mode. This pure helper covers session + direct-parent only; transitive
+    derivation ancestry (multi-hop chains, shared roots) is layered on top in the
+    DB-backed ``_atoms_dependent``.
     """
     if directly_derived:
         return True
@@ -941,11 +942,42 @@ def _dependency_from_signals(
     return False
 
 
+def _derivation_ancestors(conn, atom_id: str, user_id: str, max_depth: int = 12) -> set:
+    """Transitive ``was_derived_from`` ancestors of an atom - a single-parent chain
+    walk, depth-capped and cycle-guarded. Raises on DB error (the caller's
+    fail-safe then treats the pair as dependent). Empty set = no recorded lineage."""
+    ancestors: set = set()
+    seen = {atom_id}
+    current = atom_id
+    cur = conn.cursor()
+    try:
+        for _ in range(max_depth):
+            cur.execute(
+                "SELECT was_derived_from FROM brain.thoughts "
+                "WHERE thought_id = %s AND user_id = %s",
+                (current, user_id),
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                break
+            parent = row[0]
+            if parent in seen:  # cycle guard
+                break
+            ancestors.add(parent)
+            seen.add(parent)
+            current = parent
+    finally:
+        cur.close()
+    return ancestors
+
+
 def _atoms_dependent(conn, id_a: str, id_b: str, user_id: str) -> bool:
-    """DB-backed dependency check (same ``session_id`` or a direct
-    ``was_derived_from`` parent/child). Fail-safe: on ANY error, returns True
-    (treat as dependent -> do NOT accumulate) so a provenance-lookup failure can
-    never manufacture confidence."""
+    """DB-backed dependency check: same ``session_id``, a direct
+    ``was_derived_from`` parent/child, OR shared TRANSITIVE derivation ancestry
+    (one derives from the other across a chain, or both descend from a common
+    root - the same evidence reached by different paths). Fail-safe: on ANY error,
+    returns True (dependent -> do NOT accumulate) so a provenance-lookup failure
+    can never manufacture confidence."""
     try:
         cur = conn.cursor()
         try:
@@ -957,16 +989,23 @@ def _atoms_dependent(conn, id_a: str, id_b: str, user_id: str) -> bool:
             rows = {r[0]: r for r in cur.fetchall()}
         finally:
             cur.close()
+        ra = rows.get(id_a)
+        rb = rows.get(id_b)
+        sa = ra[1] if ra else None
+        sb = rb[1] if rb else None
+        wa = ra[2] if ra else None
+        wb = rb[2] if rb else None
+        directly = (wa is not None and wa == id_b) or (wb is not None and wb == id_a)
+        if _dependency_from_signals(sa, sb, directly):
+            return True
+        # Transitive ancestry: the same evidence can be reached across a derivation
+        # chain or via a shared root - fuse those as dependent too, not just the
+        # direct parent/child case.
+        anc_a = _derivation_ancestors(conn, id_a, user_id)
+        anc_b = _derivation_ancestors(conn, id_b, user_id)
+        return bool(id_b in anc_a or id_a in anc_b or (anc_a & anc_b))
     except Exception:
         return True  # fail-safe: unknown provenance -> dependent (no accumulation)
-    ra = rows.get(id_a)
-    rb = rows.get(id_b)
-    sa = ra[1] if ra else None
-    sb = rb[1] if rb else None
-    wa = ra[2] if ra else None
-    wb = rb[2] if rb else None
-    directly = (wa is not None and wa == id_b) or (wb is not None and wb == id_a)
-    return _dependency_from_signals(sa, sb, directly)
 
 
 def _stv_from_confidence(confidence_label: Optional[str]) -> tuple:
@@ -986,6 +1025,24 @@ def _persuasion_condition_score(text: str) -> float:
         import persuasion_detector
 
         return float(persuasion_detector.score_turn(text or "").get("score", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _resolve_turn_condition(explicit: Optional[float], session_id: str) -> float:
+    """The TURN-level persuasion-bombing condition to apply at capture: the explicit
+    caller-supplied score if given, else the recent same-session turn score the Stop
+    hook recorded. Lets a persuasion-bombing turn discount a capture even when the
+    captured TEXT reads clean. Fail-open (0.0 -> no turn contribution)."""
+    if explicit is not None:
+        try:
+            return max(0.0, min(1.0, float(explicit)))
+        except Exception:
+            return 0.0
+    try:
+        import persuasion_detector
+
+        return persuasion_detector.read_turn_condition(session_id)
     except Exception:
         return 0.0
 
@@ -2928,6 +2985,7 @@ def capture(
     was_derived_from: Optional[str] = None,
     stv_f: Optional[float] = None,
     stv_c: Optional[float] = None,
+    condition_score: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Capture a thought with local embedding + Claude metadata extraction.
 
@@ -3074,10 +3132,15 @@ def capture(
             final_stv_f = 1.0  # default: positive evidence
 
         # Step 3a-bis (Veracity layer V1): if the captured TEXT carries persuasion-
-        # bombing tells, DISCOUNT its confidence so a pushback-produced assessment
-        # enters memory at low veracity. Applies even to an explicit --stv-c (a
-        # confident self-stamp cannot exempt a suspect assessment); only ever LOWERS.
-        _condition = _persuasion_condition_score(text)
+        # bombing tells, OR the TURN it was produced in was flagged (turn-condition
+        # threading), DISCOUNT its confidence so a pushback-produced assessment enters
+        # memory at low veracity - even when the summary text itself reads clean.
+        # Applies even to an explicit --stv-c (a confident self-stamp cannot exempt a
+        # suspect assessment); only ever LOWERS.
+        _condition = max(
+            _persuasion_condition_score(text),
+            _resolve_turn_condition(condition_score, session_id),
+        )
         if _condition >= CONDITION_DISCOUNT_THRESHOLD:
             _discounted = _discount_confidence(final_stv_c, _condition)
             if _discounted < final_stv_c:
@@ -4948,13 +5011,11 @@ def revise_thoughts(
     c_b = float(row_b[2] if row_b[2] is not None else 0.5)
 
     # Revised stv - with the evidence-independence guard: if the two premises are
-    # the same evidence restated (same session, or one directly derives from the
-    # other), do NOT accumulate confidence (repetition must not manufacture it).
-    _rev_dependent = _dependency_from_signals(
-        row_a[4] if len(row_a) > 4 else None,
-        row_b[4] if len(row_b) > 4 else None,
-        (len(row_a) > 5 and row_a[5] == id_b) or (len(row_b) > 5 and row_b[5] == id_a),
-    )
+    # the same evidence restated (same session, direct derivation, OR shared
+    # transitive derivation ancestry), do NOT accumulate confidence (repetition
+    # must not manufacture it). Uses the DB-backed check so it catches multi-hop
+    # chains, not just the direct parent/child case.
+    _rev_dependent = _atoms_dependent(conn, id_a, id_b, user_id)
     if _rev_dependent:
         rev_f, rev_c = nal_revise_dependent(f_a, c_a, f_b, c_b)
     else:
@@ -5841,6 +5902,7 @@ def _run_from_pi():
                 was_derived_from=args.get("was_derived_from"),
                 stv_f=_pi_stv_f,
                 stv_c=_pi_stv_c,
+                condition_score=args.get("condition_score"),
             )
             # links passthrough: list of {"target_id": str, "link_type": str}
             # or "target_id:link_type" strings (mirrors --link CLI flag).
@@ -6396,6 +6458,11 @@ def main():
                         metavar="CONF",
                         help="With --capture: override the NAL stv confidence (0.0–1.0). "
                              "Default: derived from metadata confidence (high=0.9, medium=0.7, low/absent=0.5).")
+    parser.add_argument("--condition-score", type=float, default=None, dest="condition_score",
+                        metavar="SCORE",
+                        help="With --capture: the turn's persuasion-bombing condition (0.0–1.0). "
+                             "Discounts the atom's confidence (V1 veracity layer). Default: "
+                             "the recent same-session turn score the Stop hook recorded, else the text score.")
     parser.add_argument("--text", type=str, default=None, dest="revise_text",
                         metavar="TEXT",
                         help="With --revise: override the derived atom's text. "
@@ -6549,6 +6616,7 @@ def main():
                 was_derived_from=args.was_derived_from,
                 stv_f=_cli_stv_f,
                 stv_c=_cli_stv_c,
+                condition_score=args.condition_score,
             )
 
             # Write the validated links AFTER capture commits. Each row

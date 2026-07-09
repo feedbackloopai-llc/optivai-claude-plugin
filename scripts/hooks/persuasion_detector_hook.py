@@ -72,6 +72,9 @@ def main() -> int:
         result = pd.score_turn(
             last_a, prior_assistant=prior_a, was_challenged=pd.is_challenge(last_u)
         )
+        # Record this turn's condition so same-session captures can be discounted
+        # even when their summary text reads clean (turn-condition threading -> V1).
+        pd.write_turn_condition(data.get("session_id"), result.get("score", 0.0))
         flag = pd.flag_line(result)
         if flag:
             print(flag, file=sys.stderr)
