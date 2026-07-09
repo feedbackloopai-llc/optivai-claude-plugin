@@ -110,3 +110,33 @@ def test_score_is_max_over_signals_and_flag_threshold():
     assert r["score"] == max((s["value"] for s in r["signals"]), default=0.0)
     if r["score"] >= 0.5:
         assert pd.flag_line(r) is not None
+
+
+# ── Turn-condition state bridge (Stop-hook producer -> capture consumer) ──────
+def test_turn_condition_roundtrip_same_session(tmp_path):
+    p = str(tmp_path / "state.json")
+    pd.write_turn_condition("sess-1", 0.8, path=p)
+    assert pd.read_turn_condition("sess-1", path=p) == 0.8
+
+
+def test_turn_condition_different_session_ignored(tmp_path):
+    p = str(tmp_path / "state.json")
+    pd.write_turn_condition("sess-1", 0.8, path=p)
+    assert pd.read_turn_condition("sess-2", path=p) == 0.0
+
+
+def test_turn_condition_stale_ignored(tmp_path):
+    p = str(tmp_path / "state.json")
+    pd.write_turn_condition("sess-1", 0.8, path=p)
+    assert pd.read_turn_condition("sess-1", path=p, ttl=0) == 0.0  # ttl=0 -> already stale
+
+
+def test_turn_condition_missing_file_is_zero(tmp_path):
+    assert pd.read_turn_condition("sess-1", path=str(tmp_path / "none.json")) == 0.0
+
+
+def test_read_turn_condition_no_session_filter(tmp_path):
+    # a read with no session_id still returns the recorded score (CLI captures)
+    p = str(tmp_path / "state.json")
+    pd.write_turn_condition("sess-1", 0.7, path=p)
+    assert pd.read_turn_condition(None, path=p) == 0.7

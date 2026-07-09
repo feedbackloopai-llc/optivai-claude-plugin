@@ -73,3 +73,88 @@ def test_atoms_dependent_fails_safe_to_dependent_on_db_error():
             raise RuntimeError("db down")
 
     assert open_brain._atoms_dependent(_BoomConn(), "a", "b", "u") is True
+
+
+# ── Transitive derivation-ancestry guard (multi-hop chains + shared roots) ────
+class _FakeCursor:
+    def __init__(self, atoms):
+        self.atoms = atoms
+        self._result = None
+
+    def execute(self, sql, params):
+        if "ANY(%s)" in sql:  # batch session/parent lookup
+            ids = params[0]
+            self._result = [
+                (i, self.atoms[i]["session"], self.atoms[i]["parent"])
+                for i in ids
+                if i in self.atoms
+            ]
+        else:  # single-parent ancestry walk: WHERE thought_id = %s
+            a = self.atoms.get(params[0])
+            self._result = [(a["parent"],)] if a else []
+
+    def fetchall(self):
+        return self._result
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
+
+    def close(self):
+        pass
+
+
+class _FakeConn:
+    def __init__(self, atoms):
+        self.atoms = atoms
+
+    def cursor(self):
+        return _FakeCursor(self.atoms)
+
+
+def test_derivation_ancestors_walks_the_chain():
+    # A <- B <- C  (C derives from B derives from A)
+    atoms = {
+        "A": {"session": "s1", "parent": None},
+        "B": {"session": "s2", "parent": "A"},
+        "C": {"session": "s3", "parent": "B"},
+    }
+    assert open_brain._derivation_ancestors(_FakeConn(atoms), "C", "u") == {"A", "B"}
+
+
+def test_atoms_dependent_transitive_across_sessions():
+    """C derives (transitively) from A in a different session - still dependent."""
+    atoms = {
+        "A": {"session": "s1", "parent": None},
+        "B": {"session": "s2", "parent": "A"},
+        "C": {"session": "s3", "parent": "B"},
+    }
+    assert open_brain._atoms_dependent(_FakeConn(atoms), "A", "C", "u") is True
+
+
+def test_atoms_dependent_shared_root_is_dependent():
+    """B and C both descend from A (siblings) - same evidence, different paths."""
+    atoms = {
+        "A": {"session": "s1", "parent": None},
+        "B": {"session": "s2", "parent": "A"},
+        "C": {"session": "s3", "parent": "A"},
+    }
+    assert open_brain._atoms_dependent(_FakeConn(atoms), "B", "C", "u") is True
+
+
+def test_atoms_dependent_truly_independent_is_independent():
+    """No shared lineage and different sessions -> independent (may accumulate)."""
+    atoms = {
+        "A": {"session": "s1", "parent": None},
+        "B": {"session": "s2", "parent": None},
+    }
+    assert open_brain._atoms_dependent(_FakeConn(atoms), "A", "B", "u") is False
+
+
+def test_derivation_ancestors_cycle_guard_terminates():
+    # A <-> B cycle must not loop forever
+    atoms = {
+        "A": {"session": "s1", "parent": "B"},
+        "B": {"session": "s2", "parent": "A"},
+    }
+    anc = open_brain._derivation_ancestors(_FakeConn(atoms), "A", "u")
+    assert anc == {"B", "A"} or anc == {"B"}  # terminates; exact set depends on stop point
