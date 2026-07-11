@@ -36,6 +36,7 @@ from loop_runner import (
     Runners,
     WorkerResult,
     _mayor_worker,
+    compose_dispatch,
     route_model,
 )
 
@@ -50,12 +51,16 @@ def _make_bead(
     priority: int = 2,
     labels: Optional[List[str]] = None,
     body: str = "",
+    description: str = "",
 ) -> dict:
     return {
         "id": bead_id,
         "title": title,
         "priority": priority,
         "labels": labels or [],
+        # Real beads JSON carries the task detail in `description`; keep `body` too so
+        # older fixtures still compose (the runner reads description, then body).
+        "description": description,
         "body": body,
     }
 
@@ -181,6 +186,36 @@ class TestRouteModelTierMapping:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Regression — compose_dispatch must carry the bead DESCRIPTION, not just the
+# title. beads JSON emits the task detail under `description`; the runner used to
+# read only `body` (which beads never populates), silently dropping the entire
+# dispatch contract so workers got the bare title. (bug fblai-jeba9)
+# ---------------------------------------------------------------------------
+class TestComposeDispatchIncludesDescription:
+    def test_description_flows_into_prompt(self) -> None:
+        marker = "subtract a MARGINAL veracity penalty in scripts/open_brain.py at line 3855"
+        bead = _make_bead(
+            title="VL6-core: veracity penalty",
+            description=(
+                f"{marker}. Acceptance: python3 -m pytest scripts/tests/x.py -q "
+                "passes with exit 0."
+            ),
+        )
+        prompt = compose_dispatch(
+            bead, "/repo", "main", "python3 -m pytest scripts/tests/x.py -q"
+        )
+        assert marker in prompt, "the bead description must reach the worker prompt"
+
+    def test_falls_back_to_body_when_no_description(self) -> None:
+        marker = "legacy body detail in scripts/foo.py"
+        bead = _make_bead(
+            title="t", description="", body=f"{marker}. Acceptance: run true exits 0."
+        )
+        prompt = compose_dispatch(bead, "/repo", "main", "true")
+        assert marker in prompt
+
+
 # Test 2 — Worker gate-rejection (compose_dispatch raises ValueError)
 # ---------------------------------------------------------------------------
 

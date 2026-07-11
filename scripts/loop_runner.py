@@ -1292,7 +1292,10 @@ def compose_dispatch(
     """
     bead_id = bead.get("id", "unknown")
     title = bead.get("title", "")
-    body = bead.get("body", "").strip()
+    # beads emits the task detail under `description`; other bead sources may use
+    # `body`. Reading only `body` dropped the ENTIRE dispatch contract - workers got
+    # the bare title. route_model already reads `description`; this restores parity.
+    body = (bead.get("description") or bead.get("body") or "").strip()
 
     # Extract acceptance from body if present; inject default if absent
     acceptance_lines = _extract_acceptance(body, verify_cmd)
