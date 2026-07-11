@@ -1082,6 +1082,41 @@ def _is_condition_discounted(metadata_val) -> bool:
     return bool(isinstance(m, dict) and m.get("condition_discounted"))
 
 
+def _condition_score_of(metadata_val) -> float:
+    """The numeric persuasion-bombing condition-score stamped on an atom (V1), in
+    [0,1], or 0.0 if absent/unparseable. VL-6 uses it to demote a low-veracity atom
+    in ranking. Accepts a dict or a JSON string (SELECT * may return JSONB either way)."""
+    m = metadata_val
+    if isinstance(m, str):
+        try:
+            m = json.loads(m)
+        except Exception:
+            return 0.0
+    if not isinstance(m, dict):
+        return 0.0
+    try:
+        return max(0.0, min(1.0, float(m.get("condition_score", 0.0))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_veracity_penalty(hybrid_score: float, condition_score: float) -> float:
+    """VL-6: demote a low-veracity (persuasion-bombing-conditioned) atom in search
+    ranking by subtracting a MARGINAL veracity penalty from its score.
+
+    penalty = VERACITY_PENALTY_COEFFICIENT * condition_score. Sized (0.10 vs the
+    vector-similarity weight 0.85) so it demotes a MARGINAL low-veracity atom but
+    CANNOT suppress a HIGHLY-RELEVANT flawed one - the recall label is that atom's
+    primary defense, not ranking. condition_score 0 (clean or pre-V1 atom) => no
+    change (degrade-to-today). Result clamped >= 0.
+    """
+    try:
+        cs = max(0.0, min(1.0, float(condition_score)))
+    except (TypeError, ValueError):
+        cs = 0.0
+    return max(0.0, float(hybrid_score) - VERACITY_PENALTY_COEFFICIENT * cs)
+
+
 # Standalone DDL for the connected-provenance-graph table. Kept here as a
 # fallback so a fresh install without the sql/ tree (or with a stale tree)
 # can still get the table created at --init time. The same DDL also lives
@@ -2710,6 +2745,10 @@ def _emit_forget_audit(
 HEBBIAN_DECAY_EXPONENT = -0.7  # time-decay exponent: weight * (1+days_since)^(-0.7)
 HEBBIAN_MIN_RELEVANCE_FLOOR = 0.30  # cosine sim floor below which promotion gives no boost
 HEBBIAN_BOOST_COEFFICIENT = 0.1  # search-side multiplier for effective_weight (S13)
+# VL-6: search-side veracity penalty. hybrid_score -= this * condition_score. Marginal
+# by design (0.10 vs vec-similarity weight 0.85): demotes a low-veracity atom but does
+# NOT suppress a highly-relevant flawed one (the recall label is its primary defense).
+VERACITY_PENALTY_COEFFICIENT = 0.10
 
 # T3 (fblai-bfyjr): semantic dedup in search(). See
 # docs/plans/2026-07-02-recall-assembly-t1-design.md §3 for the full contract.
@@ -3798,6 +3837,8 @@ def search(
             # Veracity recall label (V1): flag atoms discounted for a persuasion-
             # bombing production condition so downstream reasoning sees it.
             d["condition_discounted"] = _is_condition_discounted(d.get("metadata"))
+            # VL-6: numeric condition-score for the ranking penalty.
+            d["condition_score"] = _condition_score_of(d.get("metadata"))
             # Remove intermediate columns not needed in output
             d.pop("vec_similarity", None)
             # T3 (fblai-bfyjr): only present when dedup=True (embedding_select
@@ -3858,7 +3899,11 @@ def search(
                 r["EFFECTIVE_WEIGHT"] = round(eff_weight, 4)
                 r["PROMOTION_BOOST"] = round(promotion_boost, 4)
                 base_score = float(r.get("HYBRID_SCORE", 0.0) or 0.0)
-                r["HYBRID_SCORE"] = round(base_score + promotion_boost, 4)
+                # VL-6: marginal veracity penalty demotes a low-veracity atom.
+                boosted = base_score + promotion_boost
+                r["HYBRID_SCORE"] = round(
+                    _apply_veracity_penalty(boosted, r.get("CONDITION_SCORE", 0.0)), 4
+                )
 
             # Re-sort by the now-boosted HYBRID_SCORE — the input order
             # reflects pre-boost ranking. Only re-sort when sort_by leaves
@@ -4222,6 +4267,11 @@ def graph_search(
                 d["stv"] = {"f": round(_g_stv_f, 4), "c": round(_g_stv_c, 4)}
                 d["low_confidence"] = _g_stv_c < NAL_LOW_CONFIDENCE_THRESHOLD
                 d["condition_discounted"] = _is_condition_discounted(d.get("metadata"))
+                # VL-6: numeric condition-score + marginal veracity penalty so a
+                # graph-discovered low-veracity atom also demotes in the merged ranking.
+                _g_cond = _condition_score_of(d.get("metadata"))
+                d["condition_score"] = _g_cond
+                d["hybrid_score"] = round(_apply_veracity_penalty(d["hybrid_score"], _g_cond), 4)
 
                 d = {k.upper(): v for k, v in d.items()}
                 graph_results.append(d)
