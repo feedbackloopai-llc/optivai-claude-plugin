@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-07-12
+
+Headline: the anti-persuasion-bombing **Veracity Layer** - structural enforcement for the
+Truth-Over-Engagement contract, shipped end-to-end in the Open Brain (and mirrored to the pi
+plugin via the bridge). A single model cannot reliably check itself; this release makes that
+check structural rather than aspirational.
+
+### Added - Veracity Layer
+
+- **Truth-Over-Engagement contract** - the 7-clause behavioral floor (show work not persuade,
+  restate plainly, no rhetorical escalation, no effusive apology, no unprompted avalanche,
+  confidence-forward, re-examine-don't-cave-or-double-down).
+- **Persuasion-bombing detector** - pure-code L0 scorer with a clause-to-signal bijection, plus a
+  warn-mode Stop hook that scores each turn.
+- **Evidence-independence guard** on NAL revision - repetition can no longer manufacture
+  confidence; same-session, direct parent/child, or shared transitive-derivation-ancestry premises
+  fuse to the more-confident premise unchanged.
+- **V1 capture discount** - text or a turn carrying persuasion-bombing tells enters memory at a
+  discounted `stv.c`, with a C_MAX ceiling a confident self-stamp cannot buy out; only ever lowers.
+- **Turn-condition threading** - the Stop hook records a flagged turn's condition (30-min TTL) so
+  same-session captures are discounted even when their text reads clean.
+- **Recall veracity label** - `[LOW-VERACITY: produced under pushback]` on flagged atoms in search.
+- **VL-6 veracity ranking** - low-veracity atoms auto-demote in search order (marginal penalty,
+  cannot suppress a highly-relevant flawed atom - the label is that atom's primary defense).
+
+### Added - Skills
+
+- `/refute` - independent adversarial refuter (local Ollama model by default, escalates to a fresh
+  cloud subagent for high-stakes claims; enforces a required strongest-counter-case).
+- `/reexamine` - guided clause-7 re-examination of a challenged claim (fixed CHANGED/HELD verdict,
+  no-apology + anti-avalanche constraints, `/refute` escalation for high-stakes).
+- `/persuasion-score` - score arbitrary text with the L0 detector (the rhetoric axis).
+
+### Fixed
+
+- `loop_runner` `compose_dispatch` read `bead.body` but beads emit the task detail under
+  `description`, so every worker dispatch got a title-only prompt. Now reads `description` with a
+  `body` fallback, plus a regression test.
+
+### Docs
+
+- New "Veracity Layer" section in `CLAUDE.md` documenting how an agent uses the machinery. Corrected
+  two claims the shipped code had falsified (enforcement "is being built"; revision confidence
+  "strictly higher than either premise" - true only for independent evidence). Mirrored to the pi
+  plugin's `AGENTS.md`.
+
+### Versioning note
+
+The plugin manifest (`.claude-plugin/plugin.json`) is bumped 2.2.0 -> 3.0.0 - the veracity layer is
+a headline platform milestone, hence the major bump. (`setup.py` versions the vendored `beads`
+package, not this plugin, so it stays at its own version.)
+
+---
+
 ## [2.2.0] - 2026-06-24
 
 ### Added - Mayor v2 / v2.1 / v2.2 (bounded-concurrent loop runner)

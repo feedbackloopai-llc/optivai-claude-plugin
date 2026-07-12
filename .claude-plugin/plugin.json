@@ -1,6 +1,6 @@
 {
   "name": "optivai-claude-plugin",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "description": "OptivAI Claude Code plugin — 38 agents, 37 commands, persistent brain memory (pgvector), beads task tracking, activity logging, and workflow automation",
   "author": {
     "name": "FeedbackLoopAI LLC",
