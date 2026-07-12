@@ -260,3 +260,49 @@ def read_turn_condition(
         return max(0.0, min(1.0, float(st.get("score", 0.0))))
     except Exception:
         return 0.0
+
+
+# ── CLI shim ───────────────────────────────────────────────────────────────────
+# Import-only module otherwise; this lets `/persuasion-score` and ad-hoc scoring
+# shell out instead of every caller writing its own argparse. Purely additive.
+def _main() -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Score text for persuasion-bombing tells (L0, zero-LLM, warn-mode)."
+    )
+    parser.add_argument("--text", default=None, help="the text to score; reads stdin if omitted")
+    parser.add_argument(
+        "--prior", default=None,
+        help="prior assistant turn, for the escalation-delta / volume-ratio signals",
+    )
+    parser.add_argument(
+        "--challenged", action="store_true",
+        help="the text was written in response to user pushback",
+    )
+    parser.add_argument("--json", action="store_true", help="emit the raw score_turn dict as JSON")
+    args = parser.parse_args()
+
+    text = args.text if args.text is not None else sys.stdin.read()
+    result = score_turn(text, prior_assistant=args.prior, was_challenged=args.challenged)
+
+    if args.json:
+        print(json.dumps(result))
+        return 0
+
+    line = flag_line(result)
+    if line:
+        print(line)
+    print(f"score: {result['score']:.3f}  challenged: {result['challenged']}")
+    if result["signals"]:
+        print("signals:")
+        for s in result["signals"]:
+            print(f"  - {s['signal']} = {s['value']:.3f}  (violates: {s['clause']})")
+    else:
+        print("signals: none")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

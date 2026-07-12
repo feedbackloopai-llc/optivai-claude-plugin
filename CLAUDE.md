@@ -46,8 +46,91 @@ instead of defending a first answer. The seven rules:
 
 Behavioral floor, not a hard guarantee - the same model reading a prompt cannot fully check itself.
 The structural enforcement (an independent adversarial `/refute` pass and a pure-code persuasion
-detector) is being built alongside it. This section mirrors the global `~/.claude/CLAUDE.md` copy;
-keep them in sync.
+detector) is now shipped and enforced - see the Veracity Layer section below. This section mirrors
+the global `~/.claude/CLAUDE.md` copy; keep them in sync.
+
+---
+
+## Veracity Layer (enforcement for the Truth-Over-Engagement contract)
+
+The contract above is a behavioral floor. This layer is the machinery that enforces it - shipped,
+not aspirational. Most of it runs without you lifting a finger; your job is mainly to know it is
+there and to respond correctly when it speaks.
+
+### What runs where
+
+| Mechanism | Surface | Automatic or invoked |
+|-----------|---------|----------------------|
+| Truth-Over-Engagement contract | prose floor (this file) | always-on |
+| persuasion-detector Stop hook | stderr flag after each turn | automatic |
+| `/refute` | independent adversarial refuter | invoked |
+| Capture veracity discount | `stv.c` lowered at write time | automatic |
+| Recall `[LOW-VERACITY]` label | search output | automatic |
+| VL-6 ranking demotion | search result order | automatic |
+| Evidence-independence guard | `--revise` + `verifies` link | automatic |
+
+Five of the seven run automatically and ask nothing of you but awareness. The contract is the
+always-on floor you embody; `/refute` is the one piece you invoke.
+
+### When a turn is flagged
+
+After a turn, the persuasion-detector Stop hook may print to stderr:
+
+`[persuasion-check] score 0.NN - top tell: <signal> (violates: <clause>). Re-examine, do not defend.`
+
+That flag reads the delivery, not the truth of the claim. Next turn, run the clause-7 flow:
+re-derive or hold-with-evidence, no apology, no amplification, and invoke `/reexamine` if the
+challenge is consequential. Note also that the flagged turn's score was recorded as the session
+turn-condition (30-min TTL), so any capture in the next half hour enters discounted even if its text
+reads clean. That is correct behavior, not a bug to route around - a claim produced under a
+persuasion-bombing turn is suspect regardless of how the summary is worded.
+
+### Capture: the veracity discount
+
+At write time the brain takes the max of the captured text's own persuasion-score and the current
+turn-condition, and if it clears the threshold it lowers the atom's `stv.c`. This is automatic, it
+can NOT be exempted by `--stv-c` (a confident self-stamp cannot buy out a suspect assessment), and it
+only ever lowers - never raises. Behavioral rule: do NOT launder confidence. Re-capturing a
+cleaned-up restatement of a discounted claim in the same session is pointless - same-session captures
+inherit the turn-condition, and the independence guard collapses restatements to a single
+observation - and the act itself is a double-down. The honest ways to raise a discounted atom's
+confidence are a `verifies` link from genuinely independent evidence, or a fresh capture in a later
+session after real verification.
+
+### Recall: the LOW-VERACITY label and ranking
+
+`[LOW-VERACITY: produced under pushback]` on a recalled atom means it was captured under a
+persuasion-bombing condition. Trust it the way you trust `[LOW-CONFIDENCE]`, plus a reason:
+corroborate before acting, and carry the caveat when you cite it. VL-6 also demotes such an atom in
+ranking, but the penalty is deliberately marginal (0.10 coefficient against the 0.85
+vector-similarity weight). So a flagged atom that still ranks #1 is telling you it is both
+highly-relevant AND flawed - the label, not omission from the results, is its primary defense.
+
+### Revise: the evidence-independence guard
+
+Correct the mental model here: `--revise` raises confidence strictly ONLY for independent evidence.
+Same-session pairs, a direct parent/child derivation, or shared derivation ancestry all fuse to the
+more-confident premise UNCHANGED - N restatements can never outrank one observation. A
+provenance-lookup failure counts as dependent (fail-safe). Rule: never strengthen a belief by
+capture-then-revise inside a single session; corroboration has to come from a different evidence
+episode.
+
+### /refute and /reexamine: when to invoke
+
+Invoke `/refute` (an independent adversarial pass) before asserting a high-stakes claim (a
+destructive/irreversible action, a customer-facing commitment, a security or money decision); when
+the user challenges a consequential answer and you are inclined to hold; and before citing a
+`[LOW-VERACITY]` or `[LOW-CONFIDENCE]` atom as authoritative in an external artifact. Invoke
+`/reexamine` for the guided clause-7 flow whenever you are challenged or flagged. In both, handle the
+output by clause 7: report a change WITH its re-derivation, or hold WITH the evidence re-shown -
+never a bare reversal, never a louder restatement.
+
+### The loop, veracity-annotated
+
+- **capture** - discounted if produced under a flagged condition.
+- **recall** - labeled `[LOW-VERACITY]` and marginally demoted when it was.
+- **revise** - independence-gated; dependent premises fuse without gaining confidence.
+- **decide** - reach for `/refute` or `/reexamine` when stakes or pushback warrant.
 
 ---
 
@@ -90,6 +173,8 @@ Superpowers provide structured workflows for complex tasks. **Invoke when task c
 | `/jira` | Create/manage JIRA tickets |
 | `/sync-now` | Manual PostgreSQL sync |
 | `/db-connect` | Test database connections |
+| `/reexamine` | Guided clause-7 re-examination of a challenged claim |
+| `/persuasion-score` | Score text with the L0 detector (the rhetoric axis) |
 
 ### Specialized Agents (Task Tool)
 
@@ -139,7 +224,7 @@ What I'm working on, what's blocked, what's done. My to-do list with a dependenc
 
 ### NAL-lite truth values (T2.6)
 
-Every atom carries `stv: {f, c}` — NAL frequency (degree of positive evidence, 0–1) and confidence (weight of evidence, 0–1). Atoms with `c < 0.35` are flagged `[LOW-CONFIDENCE]` in search results. At capture time, seed explicit values with `--stv-f FREQ --stv-c CONF`; the default derives `c` from the LLM-extracted confidence label (high=0.9, medium=0.7, low/absent=0.5). Adding a `verifies` link to an atom raises its confidence; a `refutes` link revises it toward `f=0.0`. Use `--revise ID_A ID_B` to fuse two atoms about the same proposition via NAL evidential-horizon revision — the derived atom's `c` is strictly higher than either premise (evidence accumulation), and `derives_from` links to both premises make the resolution auditable by `/brain-trace`. This is NAL-lite: revision + evidence propagation only — not a general inference engine.
+Every atom carries `stv: {f, c}` — NAL frequency (degree of positive evidence, 0–1) and confidence (weight of evidence, 0–1). Atoms with `c < 0.35` are flagged `[LOW-CONFIDENCE]` in search results. At capture time, seed explicit values with `--stv-f FREQ --stv-c CONF`; the default derives `c` from the LLM-extracted confidence label (high=0.9, medium=0.7, low/absent=0.5). Adding a `verifies` link to an atom raises its confidence; a `refutes` link revises it toward `f=0.0`. Use `--revise ID_A ID_B` to fuse two atoms about the same proposition via NAL evidential-horizon revision — the derived atom's `c` is strictly higher than either premise ONLY when the two are independent evidence; dependent premises (captured in the same session, or sharing derivation ancestry) fuse to the more-confident premise unchanged - repetition cannot manufacture confidence - and `derives_from` links to both premises make the resolution auditable by `/brain-trace`. This is NAL-lite: revision + evidence propagation only — not a general inference engine.
 
 ### Memory Commands (USE THESE — don't wait to be asked)
 
@@ -259,6 +344,7 @@ to memory before the session closes. This bridges the gap between sessions.
 | User corrects me | Commit the preference permanently |
 | Discovering a technical gotcha | Commit as a pattern — these save future sessions |
 | Starting a new session | Recall recent memory + check pending tasks |
+| Recalled atom flagged LOW-VERACITY | Corroborate before acting; cite with the caveat |
 
 ### Advanced Memory Behaviors
 

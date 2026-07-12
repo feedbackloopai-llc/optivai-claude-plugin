@@ -19,7 +19,7 @@ f    = (w1×f1 + w2×f2) / (w1+w2)  # weighted average frequency
 c    = (w1+w2) / (w1+w2+1)        # revised confidence
 ```
 
-The revised confidence `c` is **strictly higher** than either premise — this is the evidence-accumulation property. A high-confidence belief dominates a low-confidence contradicting one (the weight ratio is the confidence odds, not 50/50).
+The revised confidence `c` is **strictly higher** than either premise - the evidence-accumulation property - but ONLY when the two atoms are independent evidence. When they are DEPENDENT (captured in the same session, a direct `was_derived_from` parent/child, or sharing derivation ancestry), the evidence-independence guard does NOT accumulate: the result is the more-confident premise UNCHANGED, so N restatements can never raise confidence above one observation. A provenance-lookup failure counts as dependent (fail-safe). For independent premises, a high-confidence belief dominates a low-confidence contradicting one (the weight ratio is the confidence odds, not 50/50).
 
 The derived atom is created via the normal `--capture` path, so PROV-DM stamping, PII redaction, embedding, and metadata extraction all apply. After capture:
 
@@ -33,7 +33,7 @@ The returned `prov_activity` field will read `nal_revision`.
 
 This is the agent's instrument for **Rule 2 — Conflict-fusion via NAL**. When `/brain-search` or `/brain-trace` surfaces two atoms that partially contradict — one recorded under lower confidence, one under higher, or both recorded independently — the correct move is NOT to pick one and discard the other. The older atom retains its evidentiary weight; the newer atom adjusts the confidence. Running `--revise` creates an auditable derived belief whose `derives_from` links trace back to both premises, so future agents can walk the chain via `/brain-trace` and see the resolution record.
 
-The MS_ε primitive enacted is `WA` (Write Authorization) at capture time + `PV` (Provenance Visibility) via the `derives_from` chain. The fused atom's `c` value is provably higher than either premise — the math is the audit.
+The MS_ε primitive enacted is `WA` (Write Authorization) at capture time + `PV` (Provenance Visibility) via the `derives_from` chain. The fused atom's `c` value is provably higher than either premise for independent evidence - the math is the audit; for dependent premises the guard holds `c` at the more-confident premise, equally auditable.
 
 ## Scope note
 
@@ -56,7 +56,7 @@ This is NAL-**lite**: revision and evidence propagation (via `verifies`/`refutes
 ## How to use the result
 
 - The returned JSON includes `thought_id` (the new derived atom), `stv` `{f, c}` (the revised truth value), `derives_from` (the two premise IDs), and `contradicts_resolved` (boolean — whether existing `contradicts` links were resolved).
-- Confirm `stv.c` is **higher** than both input confidences. If not, inspect the premise `stv` values — it is possible if both premises had high confidence pointing in opposite directions (high-weight conflict compresses the resulting confidence toward the midpoint).
+- Confirm `stv.c`. For independent premises it is **higher** than both input confidences (evidence accumulation). If `stv.c` **equals** the higher premise's confidence, the pair was DEPENDENT (same session, a direct parent/child, or shared derivation ancestry) and the evidence-independence guard fused them to the more-confident premise unchanged - that is the guard working, not an anomaly. (A lower-than-both result is also possible when both premises had high confidence pointing in opposite directions - high-weight conflict compresses the resulting confidence toward the midpoint.)
 - After creating the derived atom, run `/brain-promote` on it if it is load-bearing for the current decision (Rule 4).
 - Run `/brain-trace <derived_id>` to confirm the chain walks back through both premises.
 - Demote the lower-confidence premise afterward if it should rank below the derived fusion in future recalls: `/brain-demote <lower_premise_id> --reason "superseded by nal_revision <derived_id>"`.
