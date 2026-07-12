@@ -36,6 +36,12 @@ python3 ~/.claude/hooks/open_brain.py \
 
 These flags pair with `/brain-revise`: if you later find a contradicting atom, `--revise` will fuse the two stv values via NAL evidential-horizon revision. Seeding accurate `stv-c` values at capture time makes future revisions more meaningful — the weighted average is only as good as the input confidence values.
 
+## Persuasion-bombing condition discount
+
+- `--condition-score SCORE` - the producing turn's persuasion-bombing condition score, 0.0-1.0, from the L0 detector (`/persuasion-score`, `scripts/persuasion_detector.py`). This discounts the atom's `stv.c` automatically at capture time.
+- The discount is not optional and cannot be exempted by `--stv-c`: a turn that scored high on persuasion-bombing tells produces a lower-confidence atom regardless of what confidence value you ask for. A capture made while the Stop-hook's recorded turn condition is above threshold is discounted the same way even without passing `--condition-score` explicitly.
+- **No-laundering rule:** re-capturing a cleaned-up restatement of a discounted claim within the same session does NOT raise its confidence. That re-capture is itself the doubling-down tell the detector flags (`pushback-re-examine` clause), not a legitimate confidence update. If the claim genuinely strengthened - new derivation, verified evidence, an independent source - capture it as a `--derived-from` revision that names what changed, not a bare restatement of the same claim in cleaner prose.
+
 ## Optional PROV-DM fields (v0.2.0+)
 
 For explicit W3C PROV-DM provenance, the following flags are supported. The default capture path stamps these automatically from session context, but you can override when the thought derives from a specific upstream source (e.g. summarising a meeting note, transforming a prior decision):

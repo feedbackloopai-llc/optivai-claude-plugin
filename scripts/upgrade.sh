@@ -75,6 +75,8 @@ if [ -d "$COMMANDS_DIR" ]; then
     cp "$REPO_DIR/.claude/commands/bead-"*.md "$COMMANDS_DIR/" 2>/dev/null || true
     cp "$REPO_DIR/.claude/commands/mol-"*.md "$COMMANDS_DIR/" 2>/dev/null || true
     cp "$REPO_DIR/.claude/commands/refute.md" "$COMMANDS_DIR/" 2>/dev/null || true
+    cp "$REPO_DIR/.claude/commands/reexamine.md" "$COMMANDS_DIR/" 2>/dev/null || true      # veracity: guided clause-7 re-examination
+    cp "$REPO_DIR/.claude/commands/persuasion-score.md" "$COMMANDS_DIR/" 2>/dev/null || true  # veracity: L0 detector on arbitrary text
 
     BEAD_CMD_COUNT=$(ls -1 "$COMMANDS_DIR"/bead-*.md "$COMMANDS_DIR"/mol-*.md 2>/dev/null | wc -l | tr -d ' ')
     print_status "Installed $BEAD_CMD_COUNT bead/molecule commands"
