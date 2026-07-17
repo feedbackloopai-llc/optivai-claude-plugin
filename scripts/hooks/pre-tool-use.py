@@ -365,7 +365,10 @@ def main():
                                 "permissionDecisionReason": _reason_text,
                             }
                         }))
-                        sys.exit(1)
+                        # The deny is carried by the permissionDecision JSON above; exit 0
+                        # so Claude Code honors it. exit 1 is a non-blocking hook error,
+                        # which would let the denied dispatch proceed anyway.
+                        sys.exit(0)
                     else:
                         # Warn mode: emit advisory, allow
                         _items = _missing + _warnings
