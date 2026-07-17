@@ -352,3 +352,68 @@ class TestStrictModeSemantics:
         v = evaluate_dispatch(prompt, mode="strict")
         assert v["block"] is True
         assert any("termination" in m for m in v["missing"])
+
+
+# ---------------------------------------------------------------------------
+# Hook-level regression tests — exercise pre-tool-use.py end-to-end.
+# Guards the strict-mode deny: it MUST exit 0 so Claude Code honors
+# permissionDecision:"deny". exit 1 is a non-blocking hook error that would
+# let the denied dispatch proceed (the bug this test locks out).
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import subprocess  # noqa: E402
+
+HOOK_PATH = HOOKS_DIR / "pre-tool-use.py"
+
+_BAD_TASK = json.dumps({
+    "tool_name": "Task",
+    "tool_input": {
+        "subagent_type": "general-purpose",
+        "description": "regression-fixture",
+        "prompt": "go look at the code and do stuff",
+    },
+})
+_GOOD_TASK = json.dumps({
+    "tool_name": "Task",
+    "tool_input": {
+        "subagent_type": "general-purpose",
+        "description": "regression-fixture",
+        "prompt": "Read scripts/foo.py and return only a one-line summary. Done when you output the summary.",
+    },
+})
+
+
+def _run_hook(payload_json: str, mode: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["DISPATCH_GATE_MODE"] = mode
+    return subprocess.run(
+        [sys.executable, str(HOOK_PATH)],
+        input=payload_json,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
+def test_hook_strict_denies_and_exits_zero() -> None:
+    """Non-compliant dispatch + strict → permissionDecision:deny AND exit 0."""
+    proc = _run_hook(_BAD_TASK, "strict")
+    assert proc.returncode == 0, f"strict deny must exit 0; got {proc.returncode}, stderr={proc.stderr}"
+    assert '"permissionDecision": "deny"' in proc.stdout
+
+
+def test_hook_warn_advises_and_allows() -> None:
+    """Default (warn) mode emits an advisory, never a deny, and exits 0."""
+    proc = _run_hook(_BAD_TASK, "warn")
+    assert proc.returncode == 0
+    assert '"permissionDecision"' not in proc.stdout
+    assert "quality advisory" in proc.stdout
+
+
+def test_hook_strict_allows_compliant_dispatch() -> None:
+    """A compliant dispatch is not denied even under strict mode."""
+    proc = _run_hook(_GOOD_TASK, "strict")
+    assert proc.returncode == 0
+    assert '"permissionDecision": "deny"' not in proc.stdout
