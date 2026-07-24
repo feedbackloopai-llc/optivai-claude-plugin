@@ -18,9 +18,12 @@ from typing import Dict, Any, Optional
 # Cost per 1M tokens by model family (based on Anthropic public pricing)
 # Cache write = 1.25x input rate, cache read = 0.10x input rate
 COST_PER_MODEL = {
-    "claude-opus-4": {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
+    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_write": 12.50, "cache_read": 1.00},
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-opus-4": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
     "claude-sonnet-4": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
-    "claude-haiku-4": {"input": 0.80, "output": 4.0, "cache_write": 1.00, "cache_read": 0.08},
+    "claude-haiku-4": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.10},
     "default": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
 }
 
@@ -28,14 +31,25 @@ COST_PER_MODEL = {
 def get_model_family(model_id: str) -> str:
     """Extract model family from model ID for cost lookup.
 
+    Order matters: the newer generation must be matched before the bare family
+    name, or `claude-opus-5` falls through to the Opus 4 row (it was being
+    costed at the old $15/$75 Opus 4 rate, ~3x the real $5/$25).
+
     Examples:
+        claude-opus-5 -> claude-opus-5
         claude-opus-4-5-20251101 -> claude-opus-4
-        claude-sonnet-4-6 -> claude-sonnet-4
+        claude-sonnet-5 -> claude-sonnet-5
         claude-haiku-4-5-20251001 -> claude-haiku-4
     """
     model_lower = model_id.lower()
+    if "fable" in model_lower:
+        return "claude-fable-5"
+    if "opus-5" in model_lower or "opus5" in model_lower:
+        return "claude-opus-5"
     if "opus" in model_lower:
         return "claude-opus-4"
+    if "sonnet-5" in model_lower or "sonnet5" in model_lower:
+        return "claude-sonnet-5"
     if "sonnet" in model_lower:
         return "claude-sonnet-4"
     if "haiku" in model_lower:
